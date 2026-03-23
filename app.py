@@ -1,12 +1,12 @@
+import hashlib
+import html
 import json
 import os
 import re
-import smtplib
 import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -62,6 +62,11 @@ CORS(app, resources={r"/*": {"origins": allowed_origins}})
 
 DB_PATH = os.getenv("DB_PATH", "/tmp/payeeproof.db")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SEC", "15"))
+RESEND_API_BASE = os.getenv("RESEND_API_BASE", "https://api.resend.com").rstrip("/")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM = os.getenv("RESEND_FROM", "PayeeProof <alerts@notify.payeeproof.com>").strip()
+RESEND_TO = os.getenv("RESEND_TO", "hello@payeeproof.com").strip()
+
 
 
 def utc_now_iso() -> str:
@@ -326,6 +331,9 @@ def pilot_request():
     email = str(payload.get("email") or "").strip().lower()
     volume = str(payload.get("volume") or "").strip()
     notes = str(payload.get("notes") or payload.get("use_case") or "").strip()
+    source_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    user_agent = request.headers.get("User-Agent", "")
+    origin = request.headers.get("Origin", "")
 
     if not all([name, company, email, notes]):
         raise ApiError("name, company, email and notes are required.")
@@ -346,30 +354,67 @@ def pilot_request():
                 email,
                 volume,
                 notes,
-                request.headers.get("X-Forwarded-For", request.remote_addr),
-                request.headers.get("User-Agent", ""),
+                source_ip,
+                user_agent,
             ),
         )
         conn.commit()
     finally:
         conn.close()
 
-    email_status = send_pilot_notification({
+    email_result = send_pilot_notification({
         "created_at": created_at,
         "name": name,
         "company": company,
         "email": email,
         "volume": volume,
         "notes": notes,
+        "source_ip": source_ip or "",
+        "user_agent": user_agent or "",
+        "origin": origin or "",
     })
 
+    if email_result.get("status") == "sent":
+        return jsonify({
+            "ok": True,
+            "message": "Your request has been sent successfully.",
+            "stored": True,
+            "email_notification": "sent",
+            "email_id": email_result.get("email_id"),
+            "submitted_at": created_at,
+        })
+
+    if email_result.get("status") == "not_configured":
+        return jsonify({
+            "ok": False,
+            "error": "PILOT_EMAIL_NOT_CONFIGURED",
+            "message": "Pilot request email is not configured on the server yet.",
+            "stored": True,
+            "email_notification": "not_configured",
+            "submitted_at": created_at,
+        }), 500
+
     return jsonify({
-        "ok": True,
-        "message": "Pilot request received.",
+        "ok": False,
+        "error": "EMAIL_DELIVERY_FAILED",
+        "message": "Could not send your request right now. Please try again in a moment.",
         "stored": True,
-        "email_notification": email_status,
+        "email_notification": "failed",
         "submitted_at": created_at,
-    })
+        "debug_detail": email_result.get("debug_detail"),
+    }), 502
+
+
+def _pilot_payload_fingerprint(payload: Dict[str, str]) -> str:
+    canonical = "\n".join([
+        payload.get("name", ""),
+        payload.get("company", ""),
+        payload.get("email", ""),
+        payload.get("volume", ""),
+        payload.get("notes", ""),
+        payload.get("origin", ""),
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def is_valid_email(value: str) -> bool:
@@ -381,44 +426,98 @@ def is_personal_email(value: str) -> bool:
     return len(parts) == 2 and parts[1] in PERSONAL_EMAIL_DOMAINS
 
 
-def send_pilot_notification(payload: Dict[str, str]) -> str:
-    host = os.getenv("SMTP_HOST", "").strip()
-    port = int(os.getenv("SMTP_PORT", "587"))
-    username = os.getenv("SMTP_USER", "").strip()
-    password = os.getenv("SMTP_PASS", "").strip()
-    recipient = os.getenv("PILOT_TO_EMAIL", "hello@payeeproof.com").strip()
-    sender = os.getenv("SMTP_FROM", username or recipient).strip()
+def send_pilot_notification(payload: Dict[str, str]) -> Dict[str, Optional[str]]:
+    if not RESEND_API_KEY or not RESEND_FROM or not RESEND_TO:
+        return {"status": "not_configured", "email_id": None, "debug_detail": None}
 
-    if not host or not sender or not recipient:
-        return "not_configured"
+    subject = f"New PayeeProof pilot request — {payload['company']}"
+    notes_html = html.escape(payload["notes"]).replace("\n", "<br>")
+    text_body = "\n".join([
+        "New PayeeProof pilot request",
+        "",
+        f"Submitted at: {payload['created_at']}",
+        f"Name: {payload['name']}",
+        f"Company / team: {payload['company']}",
+        f"Work email: {payload['email']}",
+        f"Monthly payout volume: {payload['volume'] or 'Not provided'}",
+        "",
+        "Protected payout / verification flow:",
+        payload["notes"],
+        "",
+        f"Origin: {payload.get('origin') or 'Not provided'}",
+        f"IP: {payload.get('source_ip') or 'Not provided'}",
+        f"User-Agent: {payload.get('user_agent') or 'Not provided'}",
+    ])
+
+    html_body = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111">
+      <h2>New PayeeProof pilot request</h2>
+      <p><strong>Submitted at:</strong> {html.escape(payload['created_at'])}<br>
+      <strong>Name:</strong> {html.escape(payload['name'])}<br>
+      <strong>Company / team:</strong> {html.escape(payload['company'])}<br>
+      <strong>Work email:</strong> {html.escape(payload['email'])}<br>
+      <strong>Monthly payout volume:</strong> {html.escape(payload['volume'] or 'Not provided')}</p>
+      <p><strong>Protected payout / verification flow:</strong><br>{notes_html}</p>
+      <hr>
+      <p style="font-size:12px;color:#555">Origin: {html.escape(payload.get('origin') or 'Not provided')}<br>
+      IP: {html.escape(payload.get('source_ip') or 'Not provided')}<br>
+      User-Agent: {html.escape(payload.get('user_agent') or 'Not provided')}</p>
+    </div>
+    """.strip()
+
+    resend_payload = {
+        "from": RESEND_FROM,
+        "to": [RESEND_TO],
+        "subject": subject,
+        "reply_to": payload["email"],
+        "text": text_body,
+        "html": html_body,
+        "tags": [
+            {"name": "source", "value": "pilot_request"},
+            {"name": "product", "value": "payeeproof"},
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        "Idempotency-Key": f"pilot-{_pilot_payload_fingerprint(payload)}",
+    }
 
     try:
-        msg = EmailMessage()
-        msg["Subject"] = f"New PayeeProof pilot request — {payload['company']}"
-        msg["From"] = sender
-        msg["To"] = recipient
-        msg.set_content(
-            "\n".join([
-                "New pilot request received.",
-                "",
-                f"Submitted at: {payload['created_at']}",
-                f"Name: {payload['name']}",
-                f"Company: {payload['company']}",
-                f"Work email: {payload['email']}",
-                f"Monthly payout volume: {payload['volume'] or 'Not provided'}",
-                "",
-                "Use case:",
-                payload['notes'],
-            ])
+        response = requests.post(
+            f"{RESEND_API_BASE}/emails",
+            headers=headers,
+            json=resend_payload,
+            timeout=REQUEST_TIMEOUT,
         )
-        with smtplib.SMTP(host, port, timeout=20) as server:
-            server.starttls()
-            if username and password:
-                server.login(username, password)
-            server.send_message(msg)
-        return "sent"
-    except Exception:
-        return "failed"
+        raw_text = response.text[:1000]
+        if response.status_code < 200 or response.status_code >= 300:
+            return {
+                "status": "failed",
+                "email_id": None,
+                "debug_detail": f"RESEND_HTTP_{response.status_code}: {raw_text}",
+            }
+        data = response.json() if response.text else {}
+        return {
+            "status": "sent",
+            "email_id": data.get("id"),
+            "debug_detail": None,
+        }
+    except requests.RequestException as exc:
+        return {
+            "status": "failed",
+            "email_id": None,
+            "debug_detail": f"RESEND_REQUEST_ERROR: {exc}",
+        }
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "email_id": None,
+            "debug_detail": f"RESEND_JSON_ERROR: {exc}",
+        }
 
 
 def compare_addresses(expected_chain: str, expected_address: str, provided_chain: str, provided_address: str) -> bool:
