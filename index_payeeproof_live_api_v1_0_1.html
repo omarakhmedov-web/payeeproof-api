@@ -1,0 +1,921 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PayeeProof — live transfer safety for stablecoin payouts</title>
+  <meta name="description" content="PayeeProof adds a real pre-send verification layer and a real post-error recovery copilot for stablecoin transfers." />
+  <meta property="og:title" content="PayeeProof — live transfer safety for stablecoin payouts" />
+  <meta property="og:description" content="Pre-send verification and post-error recovery, backed by live chain lookups and tx/hash analysis." />
+  <meta property="og:type" content="website" />
+  <meta property="og:image" content="https://payeeproof.com/payeeproof-logo.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://payeeproof.com/payeeproof-logo.png" />
+  <meta name="theme-color" content="#06080d" />
+  <meta name="websitelaunches-verification" content="f5230d27a4535ac7ce5dc40ff1c1d3e7" />
+  <link rel="icon" type="image/png" sizes="32x32" href="./payeeproof-favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="192x192" href="./payeeproof-favicon-192.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./payeeproof-favicon-180.png" />
+  <link rel="shortcut icon" href="./payeeproof-favicon.ico" />
+  <style>
+    :root {
+      --bg: #06080d;
+      --panel: rgba(255,255,255,.05);
+      --panel-2: rgba(255,255,255,.03);
+      --line: rgba(255,255,255,.10);
+      --text: #f4f4f5;
+      --muted: #a1a1aa;
+      --white: #ffffff;
+      --ok: #86efac;
+      --warn: #fcd34d;
+      --bad: #fca5a5;
+      --ok-bg: rgba(16,185,129,.10);
+      --warn-bg: rgba(245,158,11,.10);
+      --bad-bg: rgba(239,68,68,.10);
+      --ok-line: rgba(16,185,129,.22);
+      --warn-line: rgba(245,158,11,.22);
+      --bad-line: rgba(239,68,68,.22);
+      --radius-xl: 28px;
+      --radius-lg: 24px;
+      --radius-md: 18px;
+      --shadow: 0 20px 60px rgba(0,0,0,.35);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.5;
+    }
+    a { color: inherit; text-decoration: none; }
+    .container { width: min(1200px, calc(100% - 32px)); margin: 0 auto; }
+    .section { padding: 84px 0; }
+    .section-sm { padding: 62px 0; }
+    .grid { display: grid; gap: 24px; }
+    .two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .three-col { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+    }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      border-bottom: 1px solid var(--line);
+      background: rgba(6,8,13,.82);
+      backdrop-filter: blur(16px);
+    }
+    .topbar-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 16px 0;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      width: 42px; height: 42px; border-radius: 14px; overflow: hidden;
+      border: 1px solid var(--line); background: var(--panel); flex: 0 0 42px;
+      display: grid; place-items: center;
+    }
+    .logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .brand-title { font-weight: 700; letter-spacing: -.02em; }
+    .brand-sub { font-size: 12px; color: #71717a; }
+    nav { display: flex; gap: 22px; }
+    nav a { color: var(--muted); font-size: 14px; }
+    nav a:hover { color: var(--white); }
+    .btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+      padding: 14px 18px; border-radius: 16px; border: 1px solid var(--line);
+      font-weight: 700; font-size: 14px; cursor: pointer; transition: .18s ease;
+      text-align: center;
+    }
+    .btn:hover { transform: translateY(-1px); }
+    .btn-primary { background: var(--white); color: #000; border-color: transparent; }
+    .btn-secondary { background: transparent; color: var(--text); }
+    .btn-ghost { background: rgba(255,255,255,.03); color: #d4d4d8; }
+    .btn[disabled] { opacity: .62; cursor: not-allowed; transform: none !important; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px; width: fit-content;
+      border: 1px solid var(--line); background: var(--panel); color: #e4e4e7;
+      padding: 9px 14px; border-radius: 999px; font-size: 12px; font-weight: 700;
+      letter-spacing: .08em; text-transform: uppercase;
+    }
+    .eyebrow { color: #a1a1aa; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .22em; margin-bottom: 12px; }
+    h1,h2,h3,p { margin: 0; }
+    h1 { font-size: clamp(40px, 7vw, 72px); line-height: .98; letter-spacing: -.04em; max-width: 980px; }
+    h2 { font-size: clamp(30px, 4vw, 46px); line-height: 1.04; letter-spacing: -.03em; }
+    h3 { font-size: 26px; line-height: 1.1; letter-spacing: -.02em; }
+    .lead {
+      font-size: clamp(18px, 2.15vw, 22px); color: var(--muted); max-width: 860px; line-height: 1.7;
+    }
+    .hero {
+      position: relative; overflow: hidden; border-bottom: 1px solid var(--line);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(255,255,255,.08), transparent 26%),
+        radial-gradient(circle at 86% 8%, rgba(59,130,246,.14), transparent 16%),
+        var(--bg);
+    }
+    .hero-grid {
+      display: grid; grid-template-columns: 1.05fr .95fr; gap: 32px; align-items: start;
+      min-height: 84vh; padding: 54px 0;
+    }
+    .hero-copy { display: grid; gap: 22px; align-content: center; }
+    .muted { color: var(--muted); }
+    .tag-row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .tag {
+      border: 1px solid var(--line); background: rgba(255,255,255,.03); color: #d4d4d8;
+      padding: 10px 14px; border-radius: 999px; font-size: 13px;
+    }
+    .status-strip {
+      display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px;
+    }
+    .status-chip {
+      padding: 10px 12px; border-radius: 14px; border: 1px solid var(--line);
+      background: rgba(255,255,255,.03); color: #d4d4d8; font-size: 13px;
+    }
+    .live-indicator { color: var(--ok); font-weight: 700; }
+    .offline-indicator { color: var(--bad); font-weight: 700; }
+    .hidden { display: none !important; }
+
+    .panel { padding: 24px; }
+    .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+    .panel-badge {
+      color: #cbd5e1; border: 1px solid var(--line); background: rgba(255,255,255,.04);
+      border-radius: 999px; padding: 8px 12px; font-size: 12px; font-weight: 700;
+    }
+    .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .field { display: grid; gap: 8px; }
+    .field.wide { grid-column: 1 / -1; }
+    .group {
+      padding: 16px; border: 1px solid var(--line); background: rgba(0,0,0,.18); border-radius: 18px;
+    }
+    .group h4 { margin: 0 0 14px 0; font-size: 14px; letter-spacing: .04em; color: #e4e4e7; }
+    label { font-size: 13px; color: var(--muted); }
+    input, textarea, select {
+      width: 100%; border: 1px solid var(--line); background: rgba(0,0,0,.22); color: var(--white);
+      border-radius: 14px; padding: 13px 14px; font: inherit; outline: none;
+    }
+    textarea { min-height: 124px; resize: vertical; }
+    input:focus, textarea:focus, select:focus {
+      border-color: rgba(255,255,255,.28); box-shadow: 0 0 0 4px rgba(255,255,255,.04);
+    }
+    .panel-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+    .note { font-size: 12px; color: #a1a1aa; }
+    .result {
+      margin-top: 16px; border-radius: 18px; padding: 18px;
+      border: 1px solid var(--warn-line); background: var(--warn-bg);
+    }
+    .result.ok { border-color: var(--ok-line); background: var(--ok-bg); }
+    .result.bad { border-color: var(--bad-line); background: var(--bad-bg); }
+    .result-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+    .result-status { font-size: 14px; font-weight: 700; color: #d4d4d8; }
+    .result-title { margin-top: 6px; font-size: 20px; font-weight: 700; }
+    .result-text { margin-top: 10px; font-size: 14px; color: #d4d4d8; }
+    .result-kv-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+    .result-kv {
+      border: 1px solid var(--line); background: rgba(0,0,0,.20); border-radius: 14px; padding: 12px;
+    }
+    .result-k { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: #a1a1aa; margin-bottom: 8px; }
+    .result-v { font-size: 13px; color: #f4f4f5; word-break: break-word; }
+    .list {
+      display: grid; gap: 10px; margin-top: 14px;
+    }
+    .list-item {
+      display: flex; gap: 12px; padding: 14px; border: 1px solid var(--line);
+      background: rgba(0,0,0,.20); border-radius: 16px; color: #d4d4d8;
+    }
+    .list-item strong { color: var(--white); }
+    .soft-section {
+      border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--panel-2);
+    }
+    .footer { border-top: 1px solid var(--line); padding: 26px 0; color: #71717a; font-size: 14px; }
+    .footer-inner { display: flex; justify-content: space-between; align-items: center; gap: 18px; flex-wrap: wrap; }
+    .footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
+    .footer-links a:hover { color: #d4d4d8; }
+
+    @media (max-width: 1020px) {
+      nav { display: none; }
+      .hero-grid, .two-col, .three-col { grid-template-columns: 1fr; }
+      .hero-grid { min-height: auto; }
+    }
+    @media (max-width: 720px) {
+      .field-grid, .result-kv-grid { grid-template-columns: 1fr; }
+      .section { padding: 68px 0; }
+      .panel-actions, .btn-row { flex-direction: column; align-items: stretch; }
+      .btn { width: 100%; }
+      .result-top { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <div class="logo"><img src="./payeeproof-favicon-192.png" alt="PayeeProof logo" /></div>
+        <div>
+          <div class="brand-title">PayeeProof</div>
+          <div class="brand-sub">Transfer safety for stablecoin payouts</div>
+        </div>
+      </div>
+      <nav>
+        <a href="#preflight">Pre-Send Check</a>
+        <a href="#recovery">Mistake Recovery</a>
+        <a href="#security">Security</a>
+        <a href="#api">API</a>
+        <a href="#contact">Pilot</a>
+      </nav>
+      <div class="btn-row">
+        <a class="btn btn-secondary" href="#preflight">Run live check</a>
+        <a class="btn btn-primary" href="#contact">Request pilot</a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <div class="pill">Real service · not a static mock</div>
+          <h1>Check before sending. Recover faster after mistakes.</h1>
+          <p class="lead">PayeeProof is moving from a pure landing page into a working service with two practical layers: <strong>Pre-Send Check</strong> for blocking preventable transfer mistakes, and <strong>Mistake Recovery Copilot</strong> for guiding users after a bad send using real tx/hash analysis.</p>
+          <div class="btn-row">
+            <a class="btn btn-primary" href="#preflight">Open Pre-Send Check →</a>
+            <a class="btn btn-secondary" href="#recovery">Open Recovery Copilot</a>
+          </div>
+          <div class="tag-row">
+            <div class="tag">Live on-chain destination checks</div>
+            <div class="tag">Real tx/hash lookup</div>
+            <div class="tag">Fail-closed decisions</div>
+            <div class="tag">No custody</div>
+          </div>
+          <div class="status-strip">
+            <div class="status-chip" id="apiStatus">API status: checking…</div>
+            <div class="status-chip" id="apiConfigured">RPC status: checking…</div>
+            <div class="status-chip" id="apiVersion">API build: checking…</div>
+          </div>
+        </div>
+
+        <div class="card panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-badge">Why this version matters</div>
+            </div>
+          </div>
+          <div class="list">
+            <div class="list-item"><strong>1.</strong><span>Partners can test a <strong>real working flow</strong>, not just read positioning copy.</span></div>
+            <div class="list-item"><strong>2.</strong><span>Users get value before and after a mistake: prevention first, recovery second.</span></div>
+            <div class="list-item"><strong>3.</strong><span>The same product story works for buyers, exchanges, ops teams, payroll flows, and treasury teams.</span></div>
+            <div class="list-item"><strong>4.</strong><span>The backend is modular: EVM + Solana now, deeper chain coverage and partner APIs next.</span></div>
+          </div>
+          <p class="note" style="margin-top:14px;">PayeeProof should look less like “we may build this” and more like “here is the control layer, try it.”</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="preflight" class="section">
+      <div class="container">
+        <div class="eyebrow">Window 1</div>
+        <h2>Pre-Send Check</h2>
+        <p class="lead" style="max-width:900px; margin-top:14px;">Use this before funds move. The service compares expected and provided transfer details, validates the address format, and performs a live on-chain destination classification.</p>
+
+        <div class="card panel" style="margin-top:32px;">
+          <div class="panel-head">
+            <div>
+              <h3 style="font-size:24px; margin-bottom:8px;">Run a live verification</h3>
+              <p class="muted">Expected vs provided chain, asset, address, and memo/tag. The result is built for blocking bad sends before approval.</p>
+            </div>
+            <div class="panel-badge">/api/preflight-check</div>
+          </div>
+
+          <div class="grid two-col">
+            <div class="group">
+              <h4>Expected by payer</h4>
+              <div class="field-grid">
+                <div class="field">
+                  <label for="pfExpectedChain">Network</label>
+                  <select id="pfExpectedChain">
+                    <option value="ethereum">Ethereum</option>
+                    <option value="arbitrum">Arbitrum</option>
+                    <option value="base">Base</option>
+                    <option value="polygon">Polygon</option>
+                    <option value="bsc">BNB Chain</option>
+                    <option value="solana">Solana</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pfExpectedAsset">Asset</label>
+                  <select id="pfExpectedAsset">
+                    <option value="USDC">USDC</option>
+                    <option value="USDT">USDT</option>
+                  </select>
+                </div>
+                <div class="field wide">
+                  <label for="pfExpectedAddress">Expected address</label>
+                  <input id="pfExpectedAddress" placeholder="0x... or Solana address" />
+                </div>
+                <div class="field wide">
+                  <label for="pfExpectedMemo">Expected memo / tag (optional)</label>
+                  <input id="pfExpectedMemo" placeholder="Optional memo or destination tag" />
+                </div>
+              </div>
+            </div>
+
+            <div class="group">
+              <h4>Provided by payee</h4>
+              <div class="field-grid">
+                <div class="field">
+                  <label for="pfProvidedChain">Network</label>
+                  <select id="pfProvidedChain">
+                    <option value="ethereum">Ethereum</option>
+                    <option value="arbitrum">Arbitrum</option>
+                    <option value="base">Base</option>
+                    <option value="polygon">Polygon</option>
+                    <option value="bsc">BNB Chain</option>
+                    <option value="solana">Solana</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pfProvidedAsset">Asset</label>
+                  <select id="pfProvidedAsset">
+                    <option value="USDC">USDC</option>
+                    <option value="USDT">USDT</option>
+                  </select>
+                </div>
+                <div class="field wide">
+                  <label for="pfProvidedAddress">Provided address</label>
+                  <input id="pfProvidedAddress" placeholder="0x... or Solana address" />
+                </div>
+                <div class="field wide">
+                  <label for="pfProvidedMemo">Provided memo / tag (optional)</label>
+                  <input id="pfProvidedMemo" placeholder="Optional memo or destination tag" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-actions">
+            <button class="btn btn-primary" id="pfRunBtn" type="button">Run live check</button>
+            <button class="btn btn-secondary" id="pfHappyBtn" type="button">Load happy path</button>
+            <button class="btn btn-ghost" id="pfMismatchBtn" type="button">Load mismatch</button>
+          </div>
+          <div class="note" id="pfState">Ready.</div>
+
+          <div class="result ok" id="pfResult">
+            <div class="result-top">
+              <div>
+                <div class="result-status" id="pfResultStatus">Verified</div>
+                <div class="result-title" id="pfResultTitle">All submitted payout details match.</div>
+                <div class="result-text" id="pfResultText">The destination passed structural matching and basic on-chain classification.</div>
+              </div>
+              <div class="panel-badge" id="pfReason">OK</div>
+            </div>
+            <div class="result-kv-grid">
+              <div class="result-kv"><div class="result-k">Next action</div><div class="result-v" id="pfNext">SAFE_TO_PROCEED</div></div>
+              <div class="result-kv"><div class="result-k">Risk flags</div><div class="result-v" id="pfFlags">None</div></div>
+              <div class="result-kv"><div class="result-k">Provided destination type</div><div class="result-v" id="pfDestType">unknown</div></div>
+              <div class="result-kv"><div class="result-k">Checks</div><div class="result-v" id="pfChecks">All green</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="recovery" class="section soft-section">
+      <div class="container">
+        <div class="eyebrow">Window 2</div>
+        <h2>Mistake Recovery Copilot</h2>
+        <p class="lead" style="max-width:900px; margin-top:14px;">Use this after something already went wrong. The service looks up the live transaction and returns practical recovery guidance based on chain, tx status, destination type, and issue type.</p>
+
+        <div class="card panel" style="margin-top:32px;">
+          <div class="panel-head">
+            <div>
+              <h3 style="font-size:24px; margin-bottom:8px;">Analyze a real tx/hash</h3>
+              <p class="muted">EVM chains: live transaction + receipt + token transfer extraction. Solana: live transaction lookup and parsed account view.</p>
+            </div>
+            <div class="panel-badge">/api/recovery-copilot</div>
+          </div>
+
+          <div class="grid two-col">
+            <div class="group">
+              <h4>Recovery input</h4>
+              <div class="field-grid">
+                <div class="field">
+                  <label for="rcChain">Network</label>
+                  <select id="rcChain">
+                    <option value="ethereum">Ethereum</option>
+                    <option value="arbitrum">Arbitrum</option>
+                    <option value="base">Base</option>
+                    <option value="polygon">Polygon</option>
+                    <option value="bsc">BNB Chain</option>
+                    <option value="solana">Solana</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="rcIssueType">Issue type</label>
+                  <select id="rcIssueType">
+                    <option value="wrong_network">Wrong network</option>
+                    <option value="wrong_address">Wrong address</option>
+                    <option value="sent_to_contract">Sent to contract / program</option>
+                    <option value="missing_memo">Missing memo / tag</option>
+                    <option value="unknown">General analysis</option>
+                  </select>
+                </div>
+                <div class="field wide">
+                  <label for="rcHash">Transaction hash / signature</label>
+                  <input id="rcHash" placeholder="0x... or Solana signature" />
+                </div>
+                <div class="field wide">
+                  <label for="rcIntendedAddress">Intended destination (optional)</label>
+                  <input id="rcIntendedAddress" placeholder="Original intended recipient" />
+                </div>
+                <div class="field wide">
+                  <label for="rcIntendedChain">Intended chain (optional)</label>
+                  <select id="rcIntendedChain">
+                    <option value="">Not specified</option>
+                    <option value="ethereum">Ethereum</option>
+                    <option value="arbitrum">Arbitrum</option>
+                    <option value="base">Base</option>
+                    <option value="polygon">Polygon</option>
+                    <option value="bsc">BNB Chain</option>
+                    <option value="solana">Solana</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div class="group">
+              <h4>What the copilot returns</h4>
+              <div class="list" style="margin-top:0;">
+                <div class="list-item"><strong>Status</strong><span>Found / failed / reverted / not found / unavailable</span></div>
+                <div class="list-item"><strong>Observed</strong><span>Chain, status, recipient, token transfer hints, contract/program classification</span></div>
+                <div class="list-item"><strong>Recoverability</strong><span>Possible / manual review / unlikely / depends</span></div>
+                <div class="list-item"><strong>Next actions</strong><span>Practical steps for the user or support team</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-actions">
+            <button class="btn btn-primary" id="rcRunBtn" type="button">Analyze tx/hash</button>
+            <button class="btn btn-secondary" id="rcClearBtn" type="button">Clear</button>
+          </div>
+          <div class="note" id="rcState">Ready.</div>
+
+          <div class="result" id="rcResult">
+            <div class="result-top">
+              <div>
+                <div class="result-status" id="rcResultStatus">Waiting</div>
+                <div class="result-title" id="rcResultTitle">No transaction analyzed yet.</div>
+                <div class="result-text" id="rcResultText">Paste a real tx/hash or Solana signature to get a live result.</div>
+              </div>
+              <div class="panel-badge" id="rcReason">—</div>
+            </div>
+            <div class="result-kv-grid">
+              <div class="result-kv"><div class="result-k">Recoverability</div><div class="result-v" id="rcRecoverability">—</div></div>
+              <div class="result-kv"><div class="result-k">Observed destination</div><div class="result-v" id="rcDestination">—</div></div>
+              <div class="result-kv"><div class="result-k">Observed status</div><div class="result-v" id="rcObservedStatus">—</div></div>
+              <div class="result-kv"><div class="result-k">Recommended next actions</div><div class="result-v" id="rcNextActions">—</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="security" class="section">
+      <div class="container">
+        <div class="eyebrow">Security model</div>
+        <h2>PayeeProof should be a control layer, not a new trust problem.</h2>
+        <div class="grid three-col" style="margin-top:34px;">
+          <article class="card panel">
+            <h3 style="font-size:22px; margin-bottom:12px;">No custody</h3>
+            <p class="muted">PayeeProof does not hold funds and does not execute transfers. It exists to verify or analyze, not to move money.</p>
+          </article>
+          <article class="card panel">
+            <h3 style="font-size:22px; margin-bottom:12px;">Fail-closed</h3>
+            <p class="muted">If details are invalid, mismatched, or suspicious, the safe answer is block, reverify, or escalate — not “probably fine.”</p>
+          </article>
+          <article class="card panel">
+            <h3 style="font-size:22px; margin-bottom:12px;">Live chain checks</h3>
+            <p class="muted">This version uses live RPC lookups for destination classification and transaction analysis instead of purely static form logic.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="api" class="section soft-section">
+      <div class="container">
+        <div class="eyebrow">API shape</div>
+        <h2>Two public-facing product surfaces. One backend.</h2>
+        <div class="grid two-col" style="margin-top:34px; grid-template-columns: .95fr 1.05fr;">
+          <div class="card panel">
+            <h3 style="font-size:24px; margin-bottom:14px;">What the backend now does</h3>
+            <div class="list" style="margin-top:0;">
+              <div class="list-item"><strong>Preflight</strong><span>Address validation, expected-vs-provided comparison, live on-chain destination classification.</span></div>
+              <div class="list-item"><strong>Recovery</strong><span>Transaction lookup, receipt/status analysis, destination-type checks, practical recovery guidance.</span></div>
+              <div class="list-item"><strong>Pilot leads</strong><span>Stores pilot requests in SQLite and can email them to hello@payeeproof.com.</span></div>
+            </div>
+            <p class="note" style="margin-top:16px;">Honest limitation: private exchange-account verification still requires exchange-side APIs or partnership access. This MVP solves the public-chain part for real.</p>
+          </div>
+          <div class="card panel" style="background: rgba(0,0,0,.22);">
+<pre style="margin:0; white-space:pre-wrap; color:#d4d4d8; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; line-height:1.7;">POST /api/preflight-check
+{
+  "expected": {
+    "network": "ethereum",
+    "asset": "USDC",
+    "address": "0x1111111111111111111111111111111111111111"
+  },
+  "provided": {
+    "network": "ethereum",
+    "asset": "USDC",
+    "address": "0x1111111111111111111111111111111111111111"
+  }
+}
+
+POST /api/recovery-copilot
+{
+  "chain": "polygon",
+  "tx_hash": "0x...",
+  "issue_type": "wrong_network",
+  "intended_chain": "ethereum"
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="contact" class="section">
+      <div class="container grid two-col" style="grid-template-columns: .92fr 1.08fr; align-items:start;">
+        <div>
+          <div class="eyebrow">Pilot</div>
+          <h2>Request a pilot review</h2>
+          <p class="lead" style="max-width:760px; margin-top:14px;">This version is designed to prove capability: real checks, real lookup logic, real product direction. Use the form to describe the payout or recovery flow you want to protect.</p>
+          <div class="list" style="margin-top:24px;">
+            <div class="list-item"><strong>Best fit</strong><span>Treasury teams, payroll flows, payout ops, exchanges, marketplaces, OTC desks.</span></div>
+            <div class="list-item"><strong>What you get</strong><span>A practical fit check and a clear next step for pilot scope.</span></div>
+            <div class="list-item"><strong>Business contact</strong><span><span style="text-decoration:underline;">hello@payeeproof.com</span></span></div>
+          </div>
+        </div>
+
+        <div class="card panel">
+          <h3 style="font-size:24px; margin-bottom:14px;">Request pilot review</h3>
+          <p class="muted" style="margin-bottom:18px;">Work email only. Personal mailboxes are blocked.</p>
+          <form class="grid" id="pilotForm" novalidate>
+            <div class="field-grid">
+              <div class="field"><input id="pilotName" placeholder="Full name" autocomplete="name" /></div>
+              <div class="field"><input id="pilotCompany" placeholder="Company / team" autocomplete="organization" /></div>
+              <div class="field"><input id="pilotEmail" type="email" placeholder="Work email" autocomplete="email" /></div>
+              <div class="field"><input id="pilotVolume" placeholder="Monthly payout volume (optional)" /></div>
+              <div class="field wide"><textarea id="pilotNotes" placeholder="What payout or recovery flow do you want to protect?"></textarea></div>
+            </div>
+            <div class="panel-actions">
+              <button class="btn btn-primary" id="pilotSubmitBtn" type="submit">Request pilot</button>
+              <button class="btn btn-secondary" id="pilotCopyBtn" type="button">Copy request</button>
+            </div>
+            <div class="note" id="pilotState">Ready.</div>
+            <div class="result hidden" id="pilotResult" aria-live="polite">
+              <div class="result-top">
+                <div>
+                  <div class="result-status" id="pilotResultStatus">Ready</div>
+                  <div class="result-title" id="pilotResultTitle">Your pilot request has not been sent yet.</div>
+                  <div class="result-text" id="pilotResultText">Complete the form and submit it to send a live request to the PayeeProof API.</div>
+                </div>
+                <div class="panel-badge" id="pilotResultBadge">—</div>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div class="brand">
+        <div class="logo"><img src="./payeeproof-favicon-192.png" alt="PayeeProof logo" /></div>
+        <div>© 2026 PayeeProof</div>
+      </div>
+      <div class="footer-links">
+        <a href="#preflight">Pre-Send Check</a>
+        <a href="#recovery">Mistake Recovery</a>
+        <a href="#security">Security</a>
+        <a href="#api">API</a>
+        <a href="#contact">Pilot</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    const API_BASE = window.PAYEEPROOF_API_BASE || 'https://payeeproof-api.onrender.com';
+    const PRECHECK_URL = `${API_BASE}/api/preflight-check`;
+    const RECOVERY_URL = `${API_BASE}/api/recovery-copilot`;
+    const PILOT_URL = `${API_BASE}/pilot-request`;
+    const HEALTH_URL = `${API_BASE}/health`;
+
+    class ApiRequestError extends Error {
+      constructor(message, status, data = {}) {
+        super(message);
+        this.name = 'ApiRequestError';
+        this.status = status;
+        this.data = data;
+      }
+    }
+
+    async function fetchJson(url, options = {}) {
+      const res = await fetch(url, {
+        cache: 'no-store',
+        credentials: 'omit',
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        ...options,
+      });
+      const text = await res.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch (e) {}
+      if (!res.ok) throw new ApiRequestError(data.message || data.error || `Request failed (${res.status})`, res.status, data);
+      return data;
+    }
+
+    function el(id) { return document.getElementById(id); }
+
+    function setResultBox(box, status) {
+      box.classList.remove('ok', 'bad');
+      if (status === 'verified' || status === 'found' || status === 'confirmed' || status === 'sent') box.classList.add('ok');
+      else if (status === 'blocked' || status === 'failed' || status === 'reverted' || status === 'not_found' || status === 'unavailable' || status === 'error') box.classList.add('bad');
+    }
+
+    function formatTimestamp(value) {
+      if (!value) return '';
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) return value;
+      return dt.toLocaleString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+        timeZoneName: 'short',
+      });
+    }
+
+    function setPilotBusy(isBusy) {
+      const submitBtn = el('pilotSubmitBtn');
+      const copyBtn = el('pilotCopyBtn');
+      submitBtn.disabled = isBusy;
+      copyBtn.disabled = isBusy;
+      submitBtn.textContent = isBusy ? 'Sending…' : 'Request pilot';
+    }
+
+    function showPilotResult(kind, title, text, badge = '—') {
+      const box = el('pilotResult');
+      box.classList.remove('hidden', 'ok', 'bad');
+      if (kind === 'ok') box.classList.add('ok');
+      else if (kind === 'bad') box.classList.add('bad');
+      el('pilotResultStatus').textContent = kind === 'ok' ? 'Sent' : kind === 'bad' ? 'Error' : 'Ready';
+      el('pilotResultTitle').textContent = title;
+      el('pilotResultText').textContent = text;
+      el('pilotResultBadge').textContent = badge;
+    }
+
+    async function checkHealth() {
+      try {
+        const data = await fetchJson(HEALTH_URL, { method: 'GET' });
+        el('apiStatus').innerHTML = `API status: <span class="live-indicator">live</span>`;
+        const configured = data.rpc_configured || {};
+        const ready = Object.entries(configured).filter(([,v]) => v).map(([k]) => k);
+        el('apiConfigured').textContent = ready.length ? `RPC status: ${ready.join(', ')}` : 'RPC status: no RPC configured';
+        el('apiVersion').textContent = `API build: ${data.version || 'unknown'}`;
+      } catch (err) {
+        el('apiStatus').innerHTML = `API status: <span class="offline-indicator">offline</span>`;
+        el('apiConfigured').textContent = 'RPC status: backend not reachable';
+        el('apiVersion').textContent = 'API build: unavailable';
+      }
+    }
+
+    function pfLoadHappy() {
+      el('pfExpectedChain').value = 'ethereum';
+      el('pfExpectedAsset').value = 'USDC';
+      el('pfExpectedAddress').value = '0x1111111111111111111111111111111111111111';
+      el('pfExpectedMemo').value = '';
+      el('pfProvidedChain').value = 'ethereum';
+      el('pfProvidedAsset').value = 'USDC';
+      el('pfProvidedAddress').value = '0x1111111111111111111111111111111111111111';
+      el('pfProvidedMemo').value = '';
+      el('pfState').textContent = 'Happy path loaded.';
+    }
+
+    function pfLoadMismatch() {
+      el('pfExpectedChain').value = 'ethereum';
+      el('pfExpectedAsset').value = 'USDC';
+      el('pfExpectedAddress').value = '0x1111111111111111111111111111111111111111';
+      el('pfExpectedMemo').value = '';
+      el('pfProvidedChain').value = 'polygon';
+      el('pfProvidedAsset').value = 'USDT';
+      el('pfProvidedAddress').value = '0x2222222222222222222222222222222222222222';
+      el('pfProvidedMemo').value = '';
+      el('pfState').textContent = 'Mismatch scenario loaded.';
+    }
+
+    async function runPreflight() {
+      el('pfState').textContent = 'Running live pre-send check…';
+      try {
+        const payload = {
+          expected: {
+            network: el('pfExpectedChain').value,
+            asset: el('pfExpectedAsset').value,
+            address: el('pfExpectedAddress').value.trim(),
+            memo: el('pfExpectedMemo').value.trim(),
+          },
+          provided: {
+            network: el('pfProvidedChain').value,
+            asset: el('pfProvidedAsset').value,
+            address: el('pfProvidedAddress').value.trim(),
+            memo: el('pfProvidedMemo').value.trim(),
+          },
+        };
+        const data = await fetchJson(PRECHECK_URL, { method: 'POST', body: JSON.stringify(payload) });
+        const box = el('pfResult');
+        setResultBox(box, data.status);
+        el('pfResultStatus').textContent = data.status;
+        el('pfResultTitle').textContent = data.summary || data.reason_code || 'Preflight result';
+        el('pfResultText').textContent = data.explanation || 'No explanation returned.';
+        el('pfReason').textContent = data.reason_code || '—';
+        el('pfNext').textContent = data.next_action || '—';
+        el('pfFlags').textContent = (data.risk_flags && data.risk_flags.length) ? data.risk_flags.join(', ') : 'None';
+        el('pfDestType').textContent = (((data.onchain || {}).provided || {}).address_type) || 'unknown';
+        const checks = data.checks || {};
+        el('pfChecks').textContent = Object.entries(checks).map(([k,v]) => `${k}:${v ? 'yes' : 'no'}`).join(' · ');
+        el('pfState').textContent = 'Pre-send check complete.';
+      } catch (err) {
+        const box = el('pfResult');
+        setResultBox(box, 'blocked');
+        el('pfResultStatus').textContent = 'error';
+        el('pfResultTitle').textContent = 'Pre-send check failed.';
+        el('pfResultText').textContent = err.message || 'Could not reach backend.';
+        el('pfReason').textContent = 'REQUEST_FAILED';
+        el('pfNext').textContent = 'CHECK_BACKEND';
+        el('pfFlags').textContent = '—';
+        el('pfDestType').textContent = '—';
+        el('pfChecks').textContent = '—';
+        el('pfState').textContent = 'Backend request failed.';
+      }
+    }
+
+    async function runRecovery() {
+      el('rcState').textContent = 'Analyzing transaction…';
+      try {
+        const payload = {
+          chain: el('rcChain').value,
+          tx_hash: el('rcHash').value.trim(),
+          issue_type: el('rcIssueType').value,
+          intended_address: el('rcIntendedAddress').value.trim(),
+          intended_chain: el('rcIntendedChain').value,
+        };
+        const data = await fetchJson(RECOVERY_URL, { method: 'POST', body: JSON.stringify(payload) });
+        const observed = data.observed || {};
+        const box = el('rcResult');
+        setResultBox(box, data.status);
+        el('rcResultStatus').textContent = data.status || 'found';
+        el('rcResultTitle').textContent = data.summary || 'Recovery analysis ready.';
+        el('rcResultText').textContent = `Reason code: ${data.reason_code || '—'}`;
+        el('rcReason').textContent = data.reason_code || '—';
+        el('rcRecoverability').textContent = data.recoverability || '—';
+        el('rcDestination').textContent = observed.destination ? `${observed.destination} (${observed.destination_type || 'unknown'})` : '—';
+        el('rcObservedStatus').textContent = observed.tx_status || data.status || '—';
+        el('rcNextActions').textContent = (data.next_actions || []).join(' | ') || '—';
+        el('rcState').textContent = 'Recovery analysis complete.';
+      } catch (err) {
+        const box = el('rcResult');
+        setResultBox(box, 'failed');
+        el('rcResultStatus').textContent = 'error';
+        el('rcResultTitle').textContent = 'Recovery analysis failed.';
+        el('rcResultText').textContent = err.message || 'Could not reach backend.';
+        el('rcReason').textContent = 'REQUEST_FAILED';
+        el('rcRecoverability').textContent = '—';
+        el('rcDestination').textContent = '—';
+        el('rcObservedStatus').textContent = '—';
+        el('rcNextActions').textContent = 'Check backend deployment and RPC configuration.';
+        el('rcState').textContent = 'Backend request failed.';
+      }
+    }
+
+    function clearRecovery() {
+      el('rcHash').value = '';
+      el('rcIntendedAddress').value = '';
+      el('rcIntendedChain').value = '';
+      const box = el('rcResult');
+      box.classList.remove('ok', 'bad');
+      el('rcResultStatus').textContent = 'Waiting';
+      el('rcResultTitle').textContent = 'No transaction analyzed yet.';
+      el('rcResultText').textContent = 'Paste a real tx/hash or Solana signature to get a live result.';
+      el('rcReason').textContent = '—';
+      el('rcRecoverability').textContent = '—';
+      el('rcDestination').textContent = '—';
+      el('rcObservedStatus').textContent = '—';
+      el('rcNextActions').textContent = '—';
+      el('rcState').textContent = 'Cleared.';
+    }
+
+    const PERSONAL_DOMAINS = new Set([
+      'gmail.com','googlemail.com','outlook.com','hotmail.com','live.com','msn.com','yahoo.com','ymail.com','rocketmail.com',
+      'icloud.com','me.com','mac.com','proton.me','protonmail.com','pm.me','mail.com','aol.com','gmx.com','yandex.ru','yandex.com','ya.ru','bk.ru','inbox.ru','list.ru','mail.ru'
+    ]);
+
+    function validEmail(value) {
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim().toLowerCase());
+    }
+    function personalEmail(value) {
+      const parts = String(value || '').trim().toLowerCase().split('@');
+      return parts.length === 2 && PERSONAL_DOMAINS.has(parts[1]);
+    }
+
+    function buildPilotPayload() {
+      const payload = {
+        name: el('pilotName').value.trim(),
+        company: el('pilotCompany').value.trim(),
+        email: el('pilotEmail').value.trim(),
+        volume: el('pilotVolume').value.trim(),
+        notes: el('pilotNotes').value.trim(),
+      };
+      if (!payload.name || !payload.company || !payload.email || !payload.notes) throw new Error('Complete name, company, work email, and use case first.');
+      if (!validEmail(payload.email)) throw new Error('Please enter a valid work email.');
+      if (personalEmail(payload.email)) throw new Error('Please use a work email. Personal email domains are blocked.');
+      return payload;
+    }
+
+    let pilotSubmitLocked = false;
+
+    async function submitPilot(event) {
+      event.preventDefault();
+      if (pilotSubmitLocked) return;
+      pilotSubmitLocked = true;
+      setPilotBusy(true);
+      try {
+        const payload = buildPilotPayload();
+        el('pilotState').textContent = 'Sending pilot request…';
+        const data = await fetchJson(PILOT_URL, { method: 'POST', body: JSON.stringify(payload) });
+        const submittedAt = formatTimestamp(data.submitted_at);
+        const deliveryText = data.email_notification === 'sent'
+          ? 'Your request was stored and emailed successfully.'
+          : 'Your request was stored successfully.';
+        const finalText = submittedAt ? `${deliveryText} Submitted at ${submittedAt}.` : deliveryText;
+        showPilotResult('ok', 'Pilot request received.', finalText, data.email_notification || 'stored');
+        el('pilotState').textContent = 'Thanks. We will review it and reply to your work email.';
+        event.target.reset();
+      } catch (err) {
+        const backendMessage = err instanceof ApiRequestError ? (err.data.message || err.data.error || err.message) : (err.message || 'Pilot request failed.');
+        let friendly = backendMessage;
+        if (err instanceof ApiRequestError && err.status >= 500) {
+          friendly = 'Temporary backend issue. Please try again in a moment or email hello@payeeproof.com.';
+        }
+        showPilotResult('bad', 'Could not send pilot request.', friendly, err instanceof ApiRequestError ? `HTTP ${err.status}` : 'error');
+        el('pilotState').textContent = friendly;
+      } finally {
+        setPilotBusy(false);
+        pilotSubmitLocked = false;
+      }
+    }
+
+    async function copyPilot() {
+      try {
+        const payload = buildPilotPayload();
+        const text = [
+          'PayeeProof pilot request',
+          '',
+          `Name: ${payload.name}`,
+          `Company: ${payload.company}`,
+          `Work email: ${payload.email}`,
+          `Monthly payout volume: ${payload.volume || 'Not provided'}`,
+          '',
+          'Use case:',
+          payload.notes,
+        ].join('\n');
+        await navigator.clipboard.writeText(text);
+        el('pilotState').textContent = 'Pilot request copied to clipboard.';
+      } catch (err) {
+        el('pilotState').textContent = err.message || 'Clipboard copy failed.';
+      }
+    }
+
+    el('pfRunBtn').addEventListener('click', runPreflight);
+    el('pfHappyBtn').addEventListener('click', pfLoadHappy);
+    el('pfMismatchBtn').addEventListener('click', pfLoadMismatch);
+    el('rcRunBtn').addEventListener('click', runRecovery);
+    el('rcClearBtn').addEventListener('click', clearRecovery);
+    el('pilotForm').addEventListener('submit', submitPilot);
+    el('pilotCopyBtn').addEventListener('click', copyPilot);
+
+    pfLoadHappy();
+    clearRecovery();
+    showPilotResult('ready', 'Your pilot request has not been sent yet.', 'Complete the form and submit it to send a live request to the PayeeProof API.', 'ready');
+    el('pilotResult').classList.add('hidden');
+    checkHealth();
+  </script>
+</body>
+</html>
