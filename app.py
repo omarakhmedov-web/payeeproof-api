@@ -13,7 +13,7 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.0.0-real-mvp"
+APP_VERSION = "1.0.1-real-mvp-resend-idemfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -405,15 +405,8 @@ def pilot_request():
     }), 502
 
 
-def _pilot_payload_fingerprint(payload: Dict[str, str]) -> str:
-    canonical = "\n".join([
-        payload.get("name", ""),
-        payload.get("company", ""),
-        payload.get("email", ""),
-        payload.get("volume", ""),
-        payload.get("notes", ""),
-        payload.get("origin", ""),
-    ])
+def _pilot_payload_fingerprint(payload: Dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -483,7 +476,7 @@ def send_pilot_notification(payload: Dict[str, str]) -> Dict[str, Optional[str]]
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
-        "Idempotency-Key": f"pilot-{_pilot_payload_fingerprint(payload)}",
+        "Idempotency-Key": f"pilot-{_pilot_payload_fingerprint(resend_payload)}",
     }
 
     try:
