@@ -14,7 +14,7 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.1.0-enterprise-verdicts"
+APP_VERSION = "1.1.1-fast-preflight"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -102,7 +102,10 @@ allowed_origins = [x.strip() for x in os.getenv(
 CORS(app, resources={r"/*": {"origins": allowed_origins}})
 
 DB_PATH = os.getenv("DB_PATH", "/tmp/payeeproof.db")
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SEC", "15"))
+RPC_TIMEOUT = float(os.getenv("RPC_TIMEOUT_SEC", os.getenv("REQUEST_TIMEOUT_SEC", "3.5")))
+EMAIL_TIMEOUT = float(os.getenv("EMAIL_TIMEOUT_SEC", "10"))
+ADDRESS_CACHE_TTL_SEC = int(os.getenv("ADDRESS_CACHE_TTL_SEC", "600"))
+_ADDRESS_CLASSIFY_CACHE: Dict[str, Dict[str, Any]] = {}
 RESEND_API_BASE = os.getenv("RESEND_API_BASE", "https://api.resend.com").rstrip("/")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 RESEND_FROM = os.getenv("RESEND_FROM", "PayeeProof <alerts@notify.payeeproof.com>").strip()
@@ -559,19 +562,6 @@ def preflight_check():
     expected_valid, expected_validation_note = validate_address(expected_chain, expected_address)
     provided_valid, provided_validation_note = validate_address(provided_chain, provided_address)
 
-    expected_onchain = classify_address(expected_chain, expected_address) if expected_valid else {
-        "chain": expected_chain,
-        "address_type": "invalid",
-        "rpc_used": False,
-        "details": expected_validation_note,
-    }
-    provided_onchain = classify_address(provided_chain, provided_address) if provided_valid else {
-        "chain": provided_chain,
-        "address_type": "invalid",
-        "rpc_used": False,
-        "details": provided_validation_note,
-    }
-
     checks = {
         "network_match": expected_chain == provided_chain,
         "asset_match": expected_asset == provided_asset,
@@ -584,6 +574,48 @@ def preflight_check():
         "expected_asset_supported": is_supported_asset_for_chain(expected_chain, expected_asset),
         "provided_asset_supported": is_supported_asset_for_chain(provided_chain, provided_asset),
     }
+
+    if expected_valid:
+        expected_onchain = skipped_expected_onchain(
+            expected_chain,
+            "Skipped for performance. Expected destination classification is not required for the pre-send verdict.",
+        )
+    else:
+        expected_onchain = {
+            "chain": expected_chain,
+            "address_type": "invalid",
+            "rpc_used": False,
+            "details": expected_validation_note,
+        }
+
+    if not provided_valid:
+        provided_onchain = {
+            "chain": provided_chain,
+            "address_type": "invalid",
+            "rpc_used": False,
+            "details": provided_validation_note,
+        }
+    elif not checks["provided_network_supported"]:
+        provided_onchain = {
+            "chain": provided_chain,
+            "address_type": "unsupported",
+            "rpc_used": False,
+            "details": f"Unsupported chain: {provided_chain}",
+        }
+    elif not checks["provided_asset_supported"]:
+        provided_onchain = skipped_expected_onchain(
+            provided_chain,
+            f"Skipped live lookup because {provided_asset or 'asset'} is not currently supported on {provided_chain}.",
+        )
+    elif provided_chain in EVM_CHAINS and provided_address.lower() == ZERO_EVM:
+        provided_onchain = {
+            "chain": provided_chain,
+            "address_type": "invalid",
+            "rpc_used": False,
+            "details": "Zero address blocked before live lookup.",
+        }
+    else:
+        provided_onchain = classify_address(provided_chain, provided_address)
 
     risk_flags: List[str] = []
     if not checks["network_match"]:
@@ -898,7 +930,7 @@ def send_pilot_notification(payload: Dict[str, str]) -> Dict[str, Optional[str]]
             f"{RESEND_API_BASE}/emails",
             headers=headers,
             json=resend_payload,
-            timeout=REQUEST_TIMEOUT,
+            timeout=EMAIL_TIMEOUT,
         )
         raw_text = response.text[:1000]
         if response.status_code < 200 or response.status_code >= 300:
@@ -974,19 +1006,70 @@ def b58decode(value: str) -> bytes:
     return bytes([0] * pad) + bytes(result)
 
 
+def _address_cache_key(chain: str, address: str) -> str:
+    normalized = str(address or "").strip()
+    if chain in EVM_CHAINS:
+        normalized = normalized.lower()
+    return f"{chain}:{normalized}"
+
+
+def get_cached_classification(chain: str, address: str) -> Optional[Dict[str, Any]]:
+    key = _address_cache_key(chain, address)
+    if not key:
+        return None
+    cached = _ADDRESS_CLASSIFY_CACHE.get(key)
+    if not cached:
+        return None
+    cached_at = float(cached.get("cached_at") or 0)
+    if (time.time() - cached_at) > ADDRESS_CACHE_TTL_SEC:
+        _ADDRESS_CLASSIFY_CACHE.pop(key, None)
+        return None
+    value = cached.get("value")
+    return dict(value) if isinstance(value, dict) else None
+
+
+def set_cached_classification(chain: str, address: str, value: Dict[str, Any]) -> None:
+    if not isinstance(value, dict):
+        return
+    if not value.get("rpc_used"):
+        return
+    key = _address_cache_key(chain, address)
+    if not key:
+        return
+    _ADDRESS_CLASSIFY_CACHE[key] = {
+        "cached_at": time.time(),
+        "value": dict(value),
+    }
+
+
+def skipped_expected_onchain(chain: str, details: str) -> Dict[str, Any]:
+    return {
+        "chain": chain,
+        "address_type": "not_checked",
+        "rpc_used": False,
+        "details": details,
+    }
+
+
 def classify_address(chain: str, address: str) -> Dict[str, Any]:
+    cached = get_cached_classification(chain, address)
+    if cached is not None:
+        return cached
+
     if chain in EVM_CHAINS:
         rpc = rpc_call(chain, "eth_getCode", [address, "latest"])
         if not rpc.ok:
             return {"chain": chain, "address_type": "unknown", "rpc_used": False, "details": rpc.error}
         code = str(rpc.result or "0x")
         address_type = "contract" if code not in {"0x", "0x0", ""} else "eoa"
-        return {
+        result = {
             "chain": chain,
             "address_type": address_type,
             "rpc_used": True,
             "code_present": address_type == "contract",
         }
+        set_cached_classification(chain, address, result)
+        return result
 
     if chain == "solana":
         rpc = rpc_call(chain, "getAccountInfo", [address, {"encoding": "jsonParsed", "commitment": "confirmed"}])
@@ -994,11 +1077,13 @@ def classify_address(chain: str, address: str) -> Dict[str, Any]:
             return {"chain": chain, "address_type": "unknown", "rpc_used": False, "details": rpc.error}
         value = (rpc.result or {}).get("value") if isinstance(rpc.result, dict) else None
         if value is None:
-            return {"chain": chain, "address_type": "not_found", "rpc_used": True, "exists": False}
+            result = {"chain": chain, "address_type": "not_found", "rpc_used": True, "exists": False}
+            set_cached_classification(chain, address, result)
+            return result
         owner = value.get("owner")
         executable = bool(value.get("executable"))
         address_type = "executable" if executable else "account"
-        return {
+        result = {
             "chain": chain,
             "address_type": address_type,
             "rpc_used": True,
@@ -1007,6 +1092,8 @@ def classify_address(chain: str, address: str) -> Dict[str, Any]:
             "lamports": value.get("lamports"),
             "executable": executable,
         }
+        set_cached_classification(chain, address, result)
+        return result
 
     return {"chain": chain, "address_type": "unsupported", "rpc_used": False}
 
@@ -1061,7 +1148,7 @@ def rpc_call(chain: str, method: str, params: List[Any]) -> RpcResult:
         return RpcResult(ok=False, error=f"RPC not configured for chain: {chain}")
     body = {"jsonrpc": "2.0", "id": int(time.time() * 1000), "method": method, "params": params}
     try:
-        response = requests.post(url, json=body, timeout=REQUEST_TIMEOUT)
+        response = requests.post(url, json=body, timeout=RPC_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         if "error" in data:
