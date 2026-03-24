@@ -7,13 +7,14 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.0.1-real-mvp-resend-idemfix"
+APP_VERSION = "1.1.0-enterprise-verdicts"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -49,6 +50,46 @@ DEFAULT_RPC_URLS = {
     "polygon": os.getenv("POLYGON_RPC_URL", ""),
     "bsc": os.getenv("BSC_RPC_URL", ""),
     "solana": os.getenv("SOLANA_RPC_URL", ""),
+}
+
+SUPPORTED_ASSETS_BY_CHAIN = {
+    "ethereum": {"USDC", "USDT", "DAI", "USDS", "PYUSD"},
+    "arbitrum": {"USDC", "USDT", "DAI", "USDS"},
+    "base": {"USDC", "USDT"},
+    "polygon": {"USDC", "USDT"},
+    "bsc": {"USDC", "USDT"},
+    "solana": {"USDC", "USDT"},
+}
+
+DESTINATION_PROFILE_MAP = {
+    "personal_wallet": {
+        "label": "Personal wallet",
+        "explanation": "Looks like a self-custody style wallet address.",
+    },
+    "contract_or_app": {
+        "label": "Contract or app",
+        "explanation": "Funds may arrive, but recovery depends on contract logic and ownership.",
+    },
+    "exchange_like_deposit": {
+        "label": "Exchange-like deposit",
+        "explanation": "Confirm the exact venue, network, asset, and memo or tag before sending.",
+    },
+    "bridge_router": {
+        "label": "Bridge / router",
+        "explanation": "Infrastructure address. Use a small test first unless this destination is explicitly expected.",
+    },
+    "invalid": {
+        "label": "Invalid address",
+        "explanation": "The address format does not match the selected network.",
+    },
+    "not_found": {
+        "label": "Not found on-chain",
+        "explanation": "No live account data was found for this destination.",
+    },
+    "unknown": {
+        "label": "Unknown",
+        "explanation": "Public signals were not strong enough to classify this destination.",
+    },
 }
 
 app = Flask(__name__)
@@ -92,7 +133,317 @@ def load_rpc_urls() -> Dict[str, str]:
     return out
 
 
+def load_known_destinations() -> Dict[str, Dict[str, Dict[str, str]]]:
+    raw = os.getenv("KNOWN_DESTINATIONS_JSON", "").strip()
+    candidates: List[Any] = []
+    if raw:
+        candidates.append(raw)
+    file_path = Path(__file__).with_name("known_destinations.json")
+    if file_path.exists():
+        try:
+            candidates.append(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    normalized: Dict[str, Dict[str, Dict[str, str]]] = {}
+    for item in candidates:
+        try:
+            parsed = json.loads(item)
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for chain_key, chain_values in parsed.items():
+            chain = normalize_chain(chain_key)
+            if not isinstance(chain_values, dict):
+                continue
+            bucket = normalized.setdefault(chain, {})
+            for address, meta in chain_values.items():
+                if not isinstance(meta, dict):
+                    continue
+                bucket[str(address).lower()] = {
+                    "classification": str(meta.get("classification") or "unknown").strip().lower(),
+                    "label": str(meta.get("label") or "").strip(),
+                    "explanation": str(meta.get("explanation") or "").strip(),
+                }
+    return normalized
+
+
 RPC_URLS = load_rpc_urls()
+KNOWN_DESTINATIONS = load_known_destinations()
+
+
+def is_supported_chain(chain: str) -> bool:
+    return chain in SUPPORTED_ASSETS_BY_CHAIN
+
+
+def is_supported_asset_for_chain(chain: str, asset: str) -> bool:
+    if not is_supported_chain(chain):
+        return False
+    return str(asset or "").strip().upper() in SUPPORTED_ASSETS_BY_CHAIN.get(chain, set())
+
+
+def lookup_known_destination(chain: str, address: str) -> Optional[Dict[str, str]]:
+    if not chain or not address:
+        return None
+    chain_map = KNOWN_DESTINATIONS.get(chain, {})
+    return chain_map.get(str(address).lower())
+
+
+def normalize_destination_classification(raw_type: str) -> str:
+    raw = str(raw_type or "unknown").strip().lower()
+    if raw in {"eoa", "wallet", "personal_wallet", "externally_owned_account", "account"}:
+        return "personal_wallet"
+    if raw in {"contract", "program", "executable", "contract_or_app", "smart_contract"}:
+        return "contract_or_app"
+    if raw in {"exchange_like_deposit", "exchange_deposit", "deposit_address"}:
+        return "exchange_like_deposit"
+    if raw in {"bridge_router", "bridge", "router", "bridge_or_router"}:
+        return "bridge_router"
+    if raw in {"invalid"}:
+        return "invalid"
+    if raw in {"not_found"}:
+        return "not_found"
+    return "unknown"
+
+
+def build_destination_profile(chain: str, address: str, onchain: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    onchain = onchain or {}
+    known = lookup_known_destination(chain, address)
+    classification = normalize_destination_classification((known or {}).get("classification") or onchain.get("address_type"))
+    profile_meta = DESTINATION_PROFILE_MAP.get(classification, DESTINATION_PROFILE_MAP["unknown"])
+    label = (known or {}).get("label") or profile_meta["label"]
+    explanation = (known or {}).get("explanation") or profile_meta["explanation"]
+
+    if classification == "unknown" and not onchain.get("rpc_used") and onchain.get("details"):
+        explanation = "Live destination lookup is unavailable right now. Retry or route this transfer for manual review."
+    if classification == "not_found" and onchain.get("details"):
+        explanation = str(onchain.get("details"))
+
+    return {
+        "classification": classification,
+        "label": label,
+        "explanation": explanation,
+        "address": address,
+        "raw_type": onchain.get("address_type", "unknown"),
+        "rpc_used": bool(onchain.get("rpc_used")),
+        "source": "mapping" if known else ("rpc" if onchain.get("rpc_used") else "unavailable"),
+    }
+
+
+def preflight_next_step_label(action: str) -> str:
+    labels = {
+        "SAFE_TO_PROCEED": "Proceed with the payment",
+        "BLOCK_AND_REVERIFY": "Stop and re-check the details",
+        "RECHECK_MEMO_OR_TAG": "Re-check the memo or destination tag",
+        "TEST_FIRST": "Send a small test first",
+        "CHECK_BACKEND": "Retry when the live service is available",
+        "MANUAL_REVIEW": "Escalate for manual review",
+        "DO_NOT_SEND": "Do not send",
+        "REVIEW_REQUEST_TEMPLATE": "Correct the approved payout instructions",
+    }
+    return labels.get(str(action or "").upper(), str(action or "").replace("_", " ").title() or "Review required")
+
+
+def derive_preflight_outcome(
+    *,
+    checks: Dict[str, bool],
+    expected_chain: str,
+    provided_chain: str,
+    expected_asset: str,
+    provided_asset: str,
+    expected_address: str,
+    provided_address: str,
+    expected_valid: bool,
+    provided_valid: bool,
+    provided_destination: Dict[str, Any],
+    risk_flags: List[str],
+) -> Dict[str, str]:
+    mismatch_reason = None
+    for code, is_failed in [
+        ("NETWORK_MISMATCH", not checks.get("network_match", False)),
+        ("ASSET_MISMATCH", not checks.get("asset_match", False)),
+        ("ADDRESS_MISMATCH", not checks.get("address_match", False)),
+        ("MEMO_MISMATCH", not checks.get("memo_match", False)),
+    ]:
+        if is_failed:
+            mismatch_reason = code
+            break
+
+    if not is_supported_chain(expected_chain) or not is_supported_chain(provided_chain):
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": "UNSUPPORTED_NETWORK",
+            "next_action": "BLOCK_AND_REVERIFY",
+            "confidence": "High",
+            "summary": "The selected network is outside the current supported scope.",
+            "why": "This transfer cannot be verified reliably on the selected network yet. Route it for manual review or use a supported network.",
+        }
+
+    if not is_supported_asset_for_chain(expected_chain, expected_asset) or not is_supported_asset_for_chain(provided_chain, provided_asset):
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": "UNSUPPORTED_ASSET_OR_NETWORK",
+            "next_action": "BLOCK_AND_REVERIFY",
+            "confidence": "High",
+            "summary": "The asset and network combination is outside the current supported scope.",
+            "why": "The product could not validate this asset and network combination with enough confidence. Re-check the routing details before funds move.",
+        }
+
+    if not provided_valid or not expected_valid:
+        invalid_side = "provided" if not provided_valid else "expected"
+        next_action = "DO_NOT_SEND" if invalid_side == "provided" else "REVIEW_REQUEST_TEMPLATE"
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": "INVALID_ADDRESS",
+            "next_action": next_action,
+            "confidence": "High",
+            "summary": "At least one address is invalid for the selected network.",
+            "why": "The address format itself failed validation. This should be blocked before any transfer is attempted.",
+        }
+
+    if provided_chain in EVM_CHAINS and provided_address.lower() == ZERO_EVM:
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": "ZERO_ADDRESS",
+            "next_action": "DO_NOT_SEND",
+            "confidence": "High",
+            "summary": "The provided destination is the zero address.",
+            "why": "The zero address is not a valid payout destination. Sending there would be a hard operational error.",
+        }
+
+    if mismatch_reason:
+        why_map = {
+            "NETWORK_MISMATCH": "The submitted destination is on a different chain than the approved request. This is the classic wrong-network mistake.",
+            "ASSET_MISMATCH": "The payout asset in the submitted details does not match the approved instructions.",
+            "ADDRESS_MISMATCH": "The provided payout address does not match the approved destination.",
+            "MEMO_MISMATCH": "Memo or tag values differ. For custodial destinations, that can prevent credit even when the transfer lands on-chain.",
+        }
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": mismatch_reason,
+            "next_action": "BLOCK_AND_REVERIFY",
+            "confidence": "High",
+            "summary": "The submitted payout details do not match the approved instructions.",
+            "why": why_map.get(mismatch_reason, "The submitted payout details do not match the approved instructions."),
+        }
+
+    destination_class = provided_destination.get("classification")
+    if destination_class == "bridge_router":
+        return {
+            "status": "review_required",
+            "verdict": "TEST FIRST",
+            "reason_code": "DESTINATION_IS_BRIDGE_ROUTER",
+            "next_action": "TEST_FIRST",
+            "confidence": "Medium",
+            "summary": "The details match, but the destination looks like bridge or router infrastructure.",
+            "why": "Infrastructure destinations can be valid, but they behave differently from a personal wallet. A small test first is safer than a full send.",
+        }
+
+    if destination_class == "contract_or_app":
+        return {
+            "status": "review_required",
+            "verdict": "TEST FIRST",
+            "reason_code": "DESTINATION_IS_CONTRACT_OR_APP",
+            "next_action": "TEST_FIRST",
+            "confidence": "Medium",
+            "summary": "The details match, but the destination looks like a contract or app.",
+            "why": "Contract destinations can accept funds differently from a personal wallet. A small test first reduces irreversible mistakes.",
+        }
+
+    if destination_class == "exchange_like_deposit":
+        return {
+            "status": "review_required",
+            "verdict": "REVERIFY",
+            "reason_code": "DESTINATION_REQUIRES_MEMO_OR_VENUE_CHECK",
+            "next_action": "RECHECK_MEMO_OR_TAG",
+            "confidence": "Medium",
+            "summary": "The details match, but the destination looks like a deposit-style address.",
+            "why": "Deposit-style destinations often depend on the exact venue, network, asset, and memo or tag. Re-verify all of them before sending.",
+        }
+
+    if provided_destination.get("source") == "unavailable":
+        return {
+            "status": "unavailable",
+            "verdict": "UNAVAILABLE",
+            "reason_code": "DESTINATION_LOOKUP_UNAVAILABLE",
+            "next_action": "CHECK_BACKEND",
+            "confidence": "Limited",
+            "summary": "Live destination lookup is currently unavailable.",
+            "why": "The service could compare the transfer fields, but the live destination classification step did not complete. Retry or review manually.",
+        }
+
+    if destination_class in {"unknown", "not_found"}:
+        return {
+            "status": "review_required",
+            "verdict": "REVERIFY",
+            "reason_code": "DESTINATION_NOT_CLASSIFIED",
+            "next_action": "BLOCK_AND_REVERIFY",
+            "confidence": "Medium",
+            "summary": "Core details match, but the destination could not be classified confidently.",
+            "why": "The network, asset, address, and memo checks matched, but the destination does not yet look confidently like a known personal wallet flow.",
+        }
+
+    return {
+        "status": "verified",
+        "verdict": "SAFE",
+        "reason_code": "OK",
+        "next_action": "SAFE_TO_PROCEED",
+        "confidence": "High",
+        "summary": "Core details match and the destination looks like a personal wallet.",
+        "why": "Network, asset, address, and memo or tag checks matched cleanly, and the destination looks like a normal wallet rather than infrastructure.",
+    }
+
+
+def derive_recovery_outcome(status: str, observed_status: str) -> str:
+    status = str(status or "").lower()
+    observed_status = str(observed_status or "").lower()
+    if status == "not_found":
+        return "NOT FOUND"
+    if status in {"error", "unavailable"}:
+        return "UNAVAILABLE"
+    if status in {"failed", "reverted"} or observed_status in {"failed", "reverted"}:
+        return "FAILED ON-CHAIN"
+    return "RESULT READY"
+
+
+def derive_recovery_confidence(status: str, observed_status: str) -> str:
+    status = str(status or "").lower()
+    observed_status = str(observed_status or "").lower()
+    if status == "not_found":
+        return "High"
+    if status in {"error", "unavailable"}:
+        return "Limited"
+    if observed_status in {"confirmed", "failed", "reverted"} or status in {"found", "failed", "reverted"}:
+        return "High"
+    if observed_status in {"pending", "pending_or_unknown"}:
+        return "Medium"
+    return "Medium"
+
+
+def build_recovery_explanation(analysis: Dict[str, Any], destination_profile: Dict[str, Any]) -> str:
+    reason_code = str(analysis.get("reason_code") or "").upper()
+    if reason_code == "TX_NOT_FOUND":
+        return "No matching transaction was found on the selected network. Re-check the transaction hash and the network before assuming funds moved."
+    if reason_code == "RPC_UNAVAILABLE":
+        return "The live chain lookup did not complete, so this result should be treated as unavailable rather than final guidance."
+    if reason_code in {"TX_REVERTED", "TX_FAILED"}:
+        return "The transaction failed on-chain. Funds were not delivered, but fees may have been spent, so the next step is to understand the failure before retrying."
+    if reason_code == "WRONG_NETWORK_CONFIRMED":
+        return "The transaction exists on a different network than intended. Recovery depends on whether the recipient controls the address on that chain or can assist manually."
+    if reason_code == "WRONG_ADDRESS_CONFIRMED":
+        return "Funds reached a different address than intended. Recovery is generally unlikely unless that destination is controlled by you or by a platform that can help."
+    if reason_code in {"DESTINATION_IS_CONTRACT", "DESTINATION_IS_PROGRAM"}:
+        return "The destination looks like application infrastructure rather than a normal wallet. Recovery depends on contract or program design and operator access."
+    base = str(analysis.get("summary") or "").strip()
+    if destination_profile.get("classification") in {"contract_or_app", "bridge_router"}:
+        return f"{base} The destination also looks like infrastructure rather than a personal wallet.".strip()
+    return base or "Recovery guidance is ready."
 
 
 def get_db() -> sqlite3.Connection:
@@ -156,12 +507,15 @@ def handle_unexpected_error(err: Exception):
 @app.get("/health")
 def health():
     configured = {k: bool(v) for k, v in RPC_URLS.items()}
+    live_networks = [k for k, v in configured.items() if v]
     return jsonify({
         "ok": True,
         "service": "payeeproof-api",
         "version": APP_VERSION,
         "time": utc_now_iso(),
         "rpc_configured": configured,
+        "configured_networks": live_networks,
+        "api_status": "live",
     })
 
 
@@ -225,6 +579,10 @@ def preflight_check():
         "memo_match": expected_memo == provided_memo if (expected_memo or provided_memo) else True,
         "expected_address_valid": expected_valid,
         "provided_address_valid": provided_valid,
+        "expected_network_supported": is_supported_chain(expected_chain),
+        "provided_network_supported": is_supported_chain(provided_chain),
+        "expected_asset_supported": is_supported_asset_for_chain(expected_chain, expected_asset),
+        "provided_asset_supported": is_supported_asset_for_chain(provided_chain, provided_asset),
     }
 
     risk_flags: List[str] = []
@@ -236,43 +594,68 @@ def preflight_check():
         risk_flags.append("ADDRESS_MISMATCH")
     if not checks["memo_match"]:
         risk_flags.append("MEMO_MISMATCH")
-    if not checks["expected_address_valid"]:
-        risk_flags.append("EXPECTED_ADDRESS_INVALID")
-    if not checks["provided_address_valid"]:
-        risk_flags.append("PROVIDED_ADDRESS_INVALID")
-    if provided_onchain.get("address_type") in {"contract", "program", "executable"}:
-        risk_flags.append("DESTINATION_IS_CONTRACT_OR_PROGRAM")
+    if not checks["expected_address_valid"] or not checks["provided_address_valid"]:
+        risk_flags.append("INVALID_ADDRESS")
+    if not checks["expected_network_supported"] or not checks["provided_network_supported"]:
+        risk_flags.append("UNSUPPORTED_NETWORK")
+    if not checks["expected_asset_supported"] or not checks["provided_asset_supported"]:
+        risk_flags.append("UNSUPPORTED_ASSET_OR_NETWORK")
     if provided_chain in EVM_CHAINS and provided_address.lower() == ZERO_EVM:
         risk_flags.append("ZERO_ADDRESS")
 
-    if not provided_valid:
-        status = "blocked"
-        reason_code = "PROVIDED_ADDRESS_INVALID"
-        next_action = "DO_NOT_SEND"
-    elif not expected_valid:
-        status = "blocked"
-        reason_code = "EXPECTED_ADDRESS_INVALID"
-        next_action = "REVIEW_REQUEST_TEMPLATE"
-    elif risk_flags:
-        status = "mismatch_detected" if any(x.endswith("MISMATCH") for x in risk_flags) else "review_required"
-        reason_code = risk_flags[0]
-        next_action = decide_preflight_next_action(risk_flags)
-    else:
-        status = "verified"
-        reason_code = "OK"
-        next_action = "SAFE_TO_PROCEED"
+    provided_destination = build_destination_profile(provided_chain, provided_address, provided_onchain)
+    expected_destination = build_destination_profile(expected_chain, expected_address, expected_onchain)
 
+    if provided_destination.get("classification") == "contract_or_app":
+        risk_flags.append("DESTINATION_IS_CONTRACT_OR_APP")
+    elif provided_destination.get("classification") == "exchange_like_deposit":
+        risk_flags.append("DESTINATION_REQUIRES_MEMO_OR_VENUE_CHECK")
+    elif provided_destination.get("classification") == "bridge_router":
+        risk_flags.append("DESTINATION_IS_BRIDGE_ROUTER")
+    elif provided_destination.get("source") == "unavailable":
+        risk_flags.append("DESTINATION_LOOKUP_UNAVAILABLE")
+    elif provided_destination.get("classification") in {"unknown", "not_found"}:
+        risk_flags.append("DESTINATION_NOT_CLASSIFIED")
+
+    outcome = derive_preflight_outcome(
+        checks=checks,
+        expected_chain=expected_chain,
+        provided_chain=provided_chain,
+        expected_asset=expected_asset,
+        provided_asset=provided_asset,
+        expected_address=expected_address,
+        provided_address=provided_address,
+        expected_valid=expected_valid,
+        provided_valid=provided_valid,
+        provided_destination=provided_destination,
+        risk_flags=risk_flags,
+    )
+
+    checked_at = utc_now_iso()
     return jsonify({
         "ok": True,
         "service": "preflight-check",
         "version": APP_VERSION,
-        "checked_at": utc_now_iso(),
-        "status": status,
-        "reason_code": reason_code,
-        "next_action": next_action,
-        "summary": summarize_preflight(status, reason_code, provided_onchain),
-        "risk_flags": risk_flags,
+        "checked_at": checked_at,
+        "status": outcome["status"],
+        "verdict": outcome["verdict"],
+        "reason_code": outcome["reason_code"],
+        "next_action": outcome["next_action"],
+        "next_action_label": preflight_next_step_label(outcome["next_action"]),
+        "confidence": outcome["confidence"],
+        "summary": outcome["summary"],
+        "why_this_verdict": outcome["why"],
+        "explanation": outcome["why"],
+        "risk_flags": sorted(set(risk_flags)),
         "checks": checks,
+        "proof": {
+            "checked_at": checked_at,
+            "verdict": outcome["verdict"],
+            "confidence": outcome["confidence"],
+            "reason_code": outcome["reason_code"],
+            "next_action": outcome["next_action"],
+            "next_action_label": preflight_next_step_label(outcome["next_action"]),
+        },
         "expected": {
             "network": expected_chain,
             "asset": expected_asset,
@@ -285,11 +668,21 @@ def preflight_check():
             "address": provided_address,
             "memo": provided_memo,
         },
+        "destination": provided_destination,
         "onchain": {
             "expected": expected_onchain,
             "provided": provided_onchain,
         },
-        "explanation": build_preflight_explanation(status, reason_code, risk_flags, expected_onchain, provided_onchain),
+        "classification": {
+            "expected": expected_destination,
+            "provided": provided_destination,
+        },
+        "supported_scope": {
+            "expected_network_supported": checks["expected_network_supported"],
+            "provided_network_supported": checks["provided_network_supported"],
+            "expected_asset_supported": checks["expected_asset_supported"],
+            "provided_asset_supported": checks["provided_asset_supported"],
+        },
     })
 
 
@@ -314,11 +707,32 @@ def recovery_copilot():
     else:
         raise ApiError(f"Unsupported chain: {chain}")
 
+    observed = analysis.get("observed") or {}
+    destination_profile = build_destination_profile(chain, str(observed.get("destination") or ""), {
+        "address_type": observed.get("destination_type") or "unknown",
+        "rpc_used": bool(observed.get("destination") and analysis.get("status") not in {"unavailable", "not_found"}),
+    })
+    outcome = derive_recovery_outcome(analysis.get("status"), observed.get("tx_status"))
+    confidence = derive_recovery_confidence(analysis.get("status"), observed.get("tx_status"))
+    why = build_recovery_explanation(analysis, destination_profile)
+    checked_at = utc_now_iso()
+
     return jsonify({
         "ok": True,
         "service": "recovery-copilot",
         "version": APP_VERSION,
-        "checked_at": utc_now_iso(),
+        "checked_at": checked_at,
+        "outcome": outcome,
+        "confidence": confidence,
+        "why_this_result": why,
+        "explanation": why,
+        "destination": destination_profile,
+        "proof": {
+            "checked_at": checked_at,
+            "outcome": outcome,
+            "confidence": confidence,
+            "reason_code": analysis.get("reason_code"),
+        },
         **analysis,
     })
 
