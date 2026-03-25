@@ -2,16 +2,20 @@ services:
   - type: web
     name: payeeproof-api
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120
+    disk:
+      name: payeeproof-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
       - key: ALLOWED_ORIGINS
         value: https://payeeproof.com
       - key: DB_PATH
-        value: /tmp/payeeproof.db
+        value: /var/data/payeeproof.db
       - key: RPC_TIMEOUT_SEC
         value: 3.5
       - key: EMAIL_TIMEOUT_SEC
