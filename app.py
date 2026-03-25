@@ -10,12 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from threading import Lock
+from urllib.parse import urlparse
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.2.2-recovery-auto-network-fix"
+APP_VERSION = "1.3.0-api-keys-rate-limit"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -113,7 +116,186 @@ RESEND_API_BASE = os.getenv("RESEND_API_BASE", "https://api.resend.com").rstrip(
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 RESEND_FROM = os.getenv("RESEND_FROM", "PayeeProof <alerts@notify.payeeproof.com>").strip()
 RESEND_TO = os.getenv("RESEND_TO", "hello@payeeproof.com").strip()
+PUBLIC_DEMO_ORIGINS = os.getenv("PUBLIC_DEMO_ORIGINS", ",".join(allowed_origins)).strip()
+API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
+ANON_API_RATE_LIMIT = int(os.getenv("ANON_API_RATE_LIMIT", "20"))
+ANON_API_RATE_WINDOW_SEC = int(os.getenv("ANON_API_RATE_WINDOW_SEC", "300"))
+KEYED_API_RATE_LIMIT = int(os.getenv("KEYED_API_RATE_LIMIT", "180"))
+KEYED_API_RATE_WINDOW_SEC = int(os.getenv("KEYED_API_RATE_WINDOW_SEC", "300"))
+PILOT_RATE_LIMIT = int(os.getenv("PILOT_RATE_LIMIT", "4"))
+PILOT_RATE_WINDOW_SEC = int(os.getenv("PILOT_RATE_WINDOW_SEC", "3600"))
+PILOT_DUPLICATE_TTL_SEC = int(os.getenv("PILOT_DUPLICATE_TTL_SEC", "43200"))
+PILOT_MIN_FILL_SEC = int(os.getenv("PILOT_MIN_FILL_SEC", "3"))
+PILOT_MAX_NOTES_LEN = int(os.getenv("PILOT_MAX_NOTES_LEN", "2500"))
+MAX_CONTENT_LENGTH_BYTES = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", "32768"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_BYTES
 
+RATE_LIMIT_BUCKETS: Dict[str, deque] = {}
+RATE_LIMIT_LOCK = Lock()
+PILOT_DEDUP_CACHE: Dict[str, float] = {}
+PILOT_DEDUP_LOCK = Lock()
+API_SCOPE_BY_PATH = {
+    "/api/preflight-check": "preflight",
+    "/api/recovery-copilot": "recovery",
+}
+
+
+def _extract_host(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    candidate = text if "://" in text else f"https://{text}"
+    parsed = urlparse(candidate)
+    return (parsed.hostname or text.split(":")[0]).strip().lower()
+
+
+def _split_origin_hosts(value: str) -> List[str]:
+    hosts: List[str] = []
+    for item in str(value or "").split(","):
+        host = _extract_host(item)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def load_api_keys() -> Dict[str, Dict[str, Any]]:
+    raw = API_KEYS_JSON
+    loaded: Dict[str, Dict[str, Any]] = {}
+    if not raw:
+        return loaded
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return loaded
+
+    items: List[Dict[str, Any]] = []
+    if isinstance(parsed, list):
+        items = [item for item in parsed if isinstance(item, dict)]
+    elif isinstance(parsed, dict):
+        if all(isinstance(v, dict) for v in parsed.values()):
+            items = [{**meta, "key": key} for key, meta in parsed.items() if isinstance(meta, dict)]
+        else:
+            items = [parsed]
+
+    for item in items:
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        scopes_raw = item.get("scopes") or ["preflight", "recovery"]
+        if isinstance(scopes_raw, str):
+            scopes = {scope.strip().lower() for scope in scopes_raw.split(",") if scope.strip()}
+        else:
+            scopes = {str(scope).strip().lower() for scope in scopes_raw if str(scope).strip()}
+        loaded[key] = {
+            "client": str(item.get("client") or item.get("client_name") or "unknown-client").strip(),
+            "active": bool(item.get("active", True)),
+            "scopes": scopes or {"preflight", "recovery"},
+            "label": str(item.get("label") or "").strip(),
+        }
+    return loaded
+
+
+PUBLIC_DEMO_HOSTS = _split_origin_hosts(PUBLIC_DEMO_ORIGINS)
+API_KEYS = load_api_keys()
+
+
+def get_client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return (request.remote_addr or "unknown").strip()
+
+
+def extract_api_key() -> str:
+    direct = str(request.headers.get("X-API-Key") or "").strip()
+    if direct:
+        return direct
+    auth = str(request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return ""
+
+
+def is_allowed_public_demo_request() -> bool:
+    origin_host = _extract_host(request.headers.get("Origin", ""))
+    referer_host = _extract_host(request.headers.get("Referer", ""))
+    return bool(origin_host and origin_host in PUBLIC_DEMO_HOSTS) or bool(referer_host and referer_host in PUBLIC_DEMO_HOSTS)
+
+
+def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
+    api_key = extract_api_key()
+    if api_key:
+        record = API_KEYS.get(api_key)
+        if not record or not record.get("active"):
+            raise ApiError("Invalid API key.", 401)
+        scopes = set(record.get("scopes") or set())
+        if required_scope not in scopes and "*" not in scopes:
+            raise ApiError("API key is not allowed for this endpoint.", 403)
+        return {
+            "mode": "api_key",
+            "scope": required_scope,
+            "client": record.get("client") or "unknown-client",
+            "label": record.get("label") or "",
+        }
+
+    if is_allowed_public_demo_request():
+        return {
+            "mode": "public_demo",
+            "scope": required_scope,
+            "client": "website-demo",
+            "label": "Public website demo",
+        }
+
+    raise ApiError("API key required for direct API access.", 401)
+
+
+def consume_rate_limit(bucket: str, limit: int, window_sec: int) -> Tuple[bool, Dict[str, int]]:
+    now = time.time()
+    with RATE_LIMIT_LOCK:
+        queue = RATE_LIMIT_BUCKETS.setdefault(bucket, deque())
+        while queue and queue[0] <= now - window_sec:
+            queue.popleft()
+        if len(queue) >= limit:
+            retry_after = max(1, int(window_sec - (now - queue[0])))
+            return False, {
+                "limit": limit,
+                "remaining": 0,
+                "retry_after": retry_after,
+                "window_sec": window_sec,
+            }
+        queue.append(now)
+        remaining = max(0, limit - len(queue))
+        return True, {
+            "limit": limit,
+            "remaining": remaining,
+            "retry_after": 0,
+            "window_sec": window_sec,
+        }
+
+
+def mark_pilot_fingerprint(fingerprint: str, ttl_sec: int) -> bool:
+    now = time.time()
+    with PILOT_DEDUP_LOCK:
+        expired = [key for key, expires_at in PILOT_DEDUP_CACHE.items() if expires_at <= now]
+        for key in expired:
+            PILOT_DEDUP_CACHE.pop(key, None)
+        expires_at = PILOT_DEDUP_CACHE.get(fingerprint, 0)
+        if expires_at > now:
+            return False
+        PILOT_DEDUP_CACHE[fingerprint] = now + ttl_sec
+        return True
+
+
+def pilot_ack_response(message: str, submitted_at: Optional[str] = None, stored: bool = False, email_notification: str = "skipped", status_code: int = 200):
+    payload = {
+        "ok": True,
+        "message": message,
+        "stored": stored,
+        "email_notification": email_notification,
+    }
+    if submitted_at:
+        payload["submitted_at"] = submitted_at
+    return jsonify(payload), status_code
 
 
 def utc_now_iso() -> str:
@@ -660,12 +842,90 @@ def ensure_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_access_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT NOT NULL,
+              path TEXT NOT NULL,
+              access_mode TEXT NOT NULL,
+              client_label TEXT NOT NULL,
+              source_ip TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
 
 
 ensure_db()
+
+
+@app.before_request
+def apply_access_controls():
+    if request.method == "OPTIONS":
+        return None
+
+    path = request.path.rstrip("/") or "/"
+    if path in API_SCOPE_BY_PATH:
+        scope = API_SCOPE_BY_PATH[path]
+        access = authenticate_api_request(scope)
+        g.api_access = access
+        if access["mode"] == "api_key":
+            bucket = f"api:key:{access['client']}:{scope}"
+            allowed, meta = consume_rate_limit(bucket, KEYED_API_RATE_LIMIT, KEYED_API_RATE_WINDOW_SEC)
+        else:
+            bucket = f"api:anon:{get_client_ip()}:{scope}"
+            allowed, meta = consume_rate_limit(bucket, ANON_API_RATE_LIMIT, ANON_API_RATE_WINDOW_SEC)
+        g.rate_limit_meta = meta
+        if not allowed:
+            response = jsonify({
+                "ok": False,
+                "error": "RATE_LIMITED",
+                "message": "Too many requests. Retry later.",
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(meta["retry_after"])
+            response.headers["X-RateLimit-Limit"] = str(meta["limit"])
+            response.headers["X-RateLimit-Remaining"] = str(meta["remaining"])
+            response.headers["X-RateLimit-Window"] = str(meta["window_sec"])
+            return response
+    elif path == "/pilot-request" and request.method == "POST":
+        bucket = f"pilot:{get_client_ip()}"
+        allowed, meta = consume_rate_limit(bucket, PILOT_RATE_LIMIT, PILOT_RATE_WINDOW_SEC)
+        g.rate_limit_meta = meta
+        if not allowed:
+            response = jsonify({
+                "ok": False,
+                "error": "RATE_LIMITED",
+                "message": "Too many pilot requests from this source. Retry later.",
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(meta["retry_after"])
+            response.headers["X-RateLimit-Limit"] = str(meta["limit"])
+            response.headers["X-RateLimit-Remaining"] = str(meta["remaining"])
+            response.headers["X-RateLimit-Window"] = str(meta["window_sec"])
+            return response
+
+    return None
+
+
+@app.after_request
+def attach_response_headers(response):
+    response.headers.setdefault("Cache-Control", "no-store")
+    meta = getattr(g, "rate_limit_meta", None)
+    if meta:
+        response.headers.setdefault("X-RateLimit-Limit", str(meta.get("limit", 0)))
+        response.headers.setdefault("X-RateLimit-Remaining", str(meta.get("remaining", 0)))
+        response.headers.setdefault("X-RateLimit-Window", str(meta.get("window_sec", 0)))
+        retry_after = int(meta.get("retry_after", 0) or 0)
+        if retry_after > 0:
+            response.headers.setdefault("Retry-After", str(retry_after))
+    access = getattr(g, "api_access", None)
+    if access:
+        response.headers.setdefault("X-API-Access-Mode", str(access.get("mode") or ""))
+    return response
 
 
 @dataclass
@@ -849,6 +1109,7 @@ def preflight_check():
     )
 
     checked_at = utc_now_iso()
+    log_api_access("/api/preflight-check")
     return jsonify({
         "ok": True,
         "service": "preflight-check",
@@ -1063,6 +1324,7 @@ def recovery_copilot():
     confidence = derive_recovery_confidence(analysis.get("status"), observed.get("tx_status"))
     why = build_recovery_explanation(analysis, destination_profile)
     checked_at = utc_now_iso()
+    log_api_access("/api/recovery-copilot")
     support_packet = build_recovery_support_packet(
         chain=effective_chain,
         tx_hash=tx_hash,
@@ -1106,21 +1368,50 @@ def recovery_copilot():
 @app.post("/pilot-request")
 def pilot_request():
     payload = request.get_json(silent=True) or {}
+    honeypot_value = str(payload.get("website") or payload.get("company_website") or "").strip()
+    form_started_at_raw = payload.get("form_started_at")
+
+    if honeypot_value:
+        return pilot_ack_response("Your request has been sent successfully.", stored=False, email_notification="filtered")
+
+    if form_started_at_raw not in (None, ""):
+        try:
+            started_at_value = float(form_started_at_raw)
+            if started_at_value > 10_000_000_000:
+                started_at_value = started_at_value / 1000.0
+            age_sec = time.time() - started_at_value
+            if 0 <= age_sec < PILOT_MIN_FILL_SEC:
+                return pilot_ack_response("Your request has been sent successfully.", stored=False, email_notification="filtered")
+        except Exception:
+            pass
+
     name = str(payload.get("name") or "").strip()
     company = str(payload.get("company") or "").strip()
     email = str(payload.get("email") or "").strip().lower()
     volume = str(payload.get("volume") or "").strip()
     notes = str(payload.get("notes") or payload.get("use_case") or "").strip()
-    source_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    source_ip = get_client_ip()
     user_agent = request.headers.get("User-Agent", "")
     origin = request.headers.get("Origin", "")
 
     if not all([name, company, email, notes]):
         raise ApiError("name, company, email and notes are required.")
+    if len(notes) > PILOT_MAX_NOTES_LEN:
+        raise ApiError(f"notes is too long. Max {PILOT_MAX_NOTES_LEN} characters.")
     if not is_valid_email(email):
         raise ApiError("Please enter a valid work email address.")
     if is_personal_email(email):
         raise ApiError("Please use your work email. Personal email domains are not accepted.")
+
+    fingerprint_payload = {
+        "name": name.lower(),
+        "company": company.lower(),
+        "email": email.lower(),
+        "notes": " ".join(notes.lower().split()),
+    }
+    fingerprint = _pilot_payload_fingerprint(fingerprint_payload)
+    if not mark_pilot_fingerprint(fingerprint, PILOT_DUPLICATE_TTL_SEC):
+        return pilot_ack_response("This pilot request is already in review.", stored=False, email_notification="deduplicated")
 
     created_at = utc_now_iso()
     conn = get_db()
@@ -1291,6 +1582,29 @@ def send_pilot_notification(payload: Dict[str, str]) -> Dict[str, Optional[str]]
             "email_id": None,
             "debug_detail": f"RESEND_JSON_ERROR: {exc}",
         }
+
+
+def log_api_access(path: str) -> None:
+    access = getattr(g, "api_access", None) or {}
+    if not access:
+        return
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO api_access_log(created_at, path, access_mode, client_label, source_ip) VALUES (?, ?, ?, ?, ?)",
+            (
+                utc_now_iso(),
+                path,
+                str(access.get("mode") or "unknown"),
+                str(access.get("client") or "unknown-client"),
+                get_client_ip(),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
 
 def compare_addresses(expected_chain: str, expected_address: str, provided_chain: str, provided_address: str) -> bool:
