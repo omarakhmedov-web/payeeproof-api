@@ -14,7 +14,7 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.1.1-fast-preflight"
+APP_VERSION = "1.2.0-recovery-packet"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -449,6 +449,158 @@ def build_recovery_explanation(analysis: Dict[str, Any], destination_profile: Di
     return base or "Recovery guidance is ready."
 
 
+
+
+def recovery_verdict_label(recoverability: str, status: str, reason_code: str) -> str:
+    recoverability = str(recoverability or "").lower()
+    status = str(status or "").lower()
+    reason_code = str(reason_code or "").upper()
+
+    if status == "not_found" or reason_code == "TX_NOT_FOUND":
+        return "No on-chain match yet"
+    if status in {"unavailable", "error"} or reason_code == "RPC_UNAVAILABLE":
+        return "Live lookup unavailable"
+    if recoverability == "likely":
+        return "Likely recoverable"
+    if recoverability == "possible":
+        return "Possible with support"
+    if recoverability in {"manual_review", "depends"}:
+        return "Depends on platform or operator"
+    if recoverability == "unlikely":
+        return "Recovery unlikely"
+    return "Needs review"
+
+
+def recovery_contact_target(destination_profile: Dict[str, Any], issue_type: str, status: str, reason_code: str) -> str:
+    classification = str(destination_profile.get("classification") or "").lower()
+    issue_type = str(issue_type or "").lower()
+    status = str(status or "").lower()
+    reason_code = str(reason_code or "").upper()
+
+    if status == "not_found" or reason_code == "TX_NOT_FOUND":
+        return "Sender or exchange support"
+    if issue_type == "missing_memo" or classification == "exchange_like_deposit":
+        return "Destination platform support"
+    if classification in {"contract_or_app", "bridge_router"} or issue_type == "sent_to_contract":
+        return "App, protocol, or contract operator"
+    if issue_type == "wrong_address" and classification == "personal_wallet":
+        return "Owner of the receiving wallet"
+    if issue_type == "wrong_network":
+        return "Recipient or platform support"
+    if classification == "personal_wallet":
+        return "Recipient or wallet owner"
+    return "Recipient or platform support"
+
+
+def recovery_best_next_step(destination_profile: Dict[str, Any], analysis: Dict[str, Any], issue_type: str) -> str:
+    classification = str(destination_profile.get("classification") or "").lower()
+    status = str(analysis.get("status") or "").lower()
+    reason_code = str(analysis.get("reason_code") or "").upper()
+    issue_type = str(issue_type or "").lower()
+
+    if status == "not_found" or reason_code == "TX_NOT_FOUND":
+        return "Verify the chain and transaction hash before doing anything else."
+    if reason_code in {"TX_REVERTED", "TX_FAILED"}:
+        return "Do not resend. Find the failure reason first."
+    if issue_type == "missing_memo" or classification == "exchange_like_deposit":
+        return "Open a support ticket with the destination platform and include the full transaction record."
+    if classification in {"contract_or_app", "bridge_router"} or issue_type == "sent_to_contract":
+        return "Contact the app or protocol and ask whether a rescue path exists for this transfer."
+    if issue_type == "wrong_network":
+        return "Check whether the recipient controls the same address on the chain where funds actually arrived."
+    if issue_type == "wrong_address":
+        return "Confirm whether the receiving address belongs to you, your team, or a platform that can help."
+    return "Use the tx hash as the anchor and contact the party that controls the destination."
+
+
+def recovery_asset_hint(observed: Dict[str, Any]) -> str:
+    token_transfer = observed.get("token_transfer") or {}
+    token_contract = str(token_transfer.get("token_contract") or "").strip()
+    native_value = observed.get("native_value_wei")
+    if token_contract:
+        return f"Token transfer via contract {token_contract}"
+    if native_value not in (None, "", 0, "0"):
+        return "Native token transfer"
+    token_balances = observed.get("token_balances") or {}
+    if token_balances.get("post") or token_balances.get("pre"):
+        return "Token movement observed"
+    return "Asset type not fully classified"
+
+
+def build_recovery_support_packet(
+    *,
+    chain: str,
+    tx_hash: str,
+    issue_type: str,
+    analysis: Dict[str, Any],
+    destination_profile: Dict[str, Any],
+    checked_at: str,
+    outcome: str,
+    confidence: str,
+    why: str,
+) -> Dict[str, Any]:
+    observed = analysis.get("observed") or {}
+    contact_target = recovery_contact_target(destination_profile, issue_type, analysis.get("status"), analysis.get("reason_code"))
+    best_next_step = recovery_best_next_step(destination_profile, analysis, issue_type)
+    verdict_label = recovery_verdict_label(analysis.get("recoverability"), analysis.get("status"), analysis.get("reason_code"))
+
+    packet = {
+        "checked_at": checked_at,
+        "verdict": verdict_label,
+        "outcome": outcome,
+        "confidence": confidence,
+        "chain": chain,
+        "tx_hash": tx_hash,
+        "issue_type": issue_type or "unknown",
+        "reason_code": analysis.get("reason_code"),
+        "summary": analysis.get("summary"),
+        "explanation": why,
+        "recoverability": analysis.get("recoverability"),
+        "best_next_step": best_next_step,
+        "contact_target": contact_target,
+        "tx_status": observed.get("tx_status"),
+        "sender": observed.get("from") or observed.get("signer"),
+        "destination": observed.get("destination") or observed.get("to"),
+        "destination_type": destination_profile.get("label"),
+        "asset_hint": recovery_asset_hint(observed),
+        "token_contract": (observed.get("token_transfer") or {}).get("token_contract"),
+        "next_actions": analysis.get("next_actions") or [],
+    }
+    return packet
+
+
+def build_recovery_support_message(packet: Dict[str, Any]) -> str:
+    lines = [
+        "Hello,",
+        "",
+        "I need help reviewing a crypto transfer that may have been sent incorrectly.",
+        "",
+        f"Transaction hash: {packet.get('tx_hash') or 'Not provided'}",
+        f"Network: {packet.get('chain') or 'Not provided'}",
+        f"Issue type: {str(packet.get('issue_type') or 'unknown').replace('_', ' ').title()}",
+        f"Observed transaction status: {packet.get('tx_status') or 'Unknown'}",
+        f"Destination: {packet.get('destination') or 'Unknown'}",
+        f"Destination type: {packet.get('destination_type') or 'Unknown'}",
+        f"Asset hint: {packet.get('asset_hint') or 'Unknown'}",
+    ]
+    if packet.get("sender"):
+        lines.append(f"Sender: {packet.get('sender')}")
+    lines.extend([
+        "",
+        "PayeeProof live analysis summary:",
+        str(packet.get("summary") or "No summary returned."),
+        "",
+        "Why this result:",
+        str(packet.get("explanation") or "No explanation returned."),
+        "",
+        "Please confirm:",
+        "1) whether this destination is controlled by your platform, team, or application;",
+        "2) whether manual recovery or credit is possible for this transfer;",
+        "3) what exact information or steps you need from me next.",
+    ])
+    return "\n".join(lines)
+
+
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -748,6 +900,18 @@ def recovery_copilot():
     confidence = derive_recovery_confidence(analysis.get("status"), observed.get("tx_status"))
     why = build_recovery_explanation(analysis, destination_profile)
     checked_at = utc_now_iso()
+    support_packet = build_recovery_support_packet(
+        chain=chain,
+        tx_hash=tx_hash,
+        issue_type=issue_type,
+        analysis=analysis,
+        destination_profile=destination_profile,
+        checked_at=checked_at,
+        outcome=outcome,
+        confidence=confidence,
+        why=why,
+    )
+    support_message = build_recovery_support_message(support_packet)
 
     return jsonify({
         "ok": True,
@@ -759,6 +923,11 @@ def recovery_copilot():
         "why_this_result": why,
         "explanation": why,
         "destination": destination_profile,
+        "recovery_verdict": support_packet.get("verdict"),
+        "best_next_step": support_packet.get("best_next_step"),
+        "contact_target": support_packet.get("contact_target"),
+        "support_packet": support_packet,
+        "support_message": support_message,
         "proof": {
             "checked_at": checked_at,
             "outcome": outcome,
