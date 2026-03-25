@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import html
 import json
 import os
@@ -20,14 +21,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
-from threading import Lock
+from threading import Lock, Thread
 from urllib.parse import urlparse
 
 import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "1.6.0-observability-funnel"
+APP_VERSION = "1.7.0-webhooks-records"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -167,6 +168,15 @@ OBSERVABILITY_MIN_REQUESTS = int(os.getenv("OBSERVABILITY_MIN_REQUESTS", "8"))
 ALERT_ERROR_RATE_THRESHOLD = float(os.getenv("ALERT_ERROR_RATE_THRESHOLD", "0.35"))
 ALERT_TIMEOUT_RATE_THRESHOLD = float(os.getenv("ALERT_TIMEOUT_RATE_THRESHOLD", "0.20"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "600"))
+PUBLIC_API_BASE = os.getenv("PUBLIC_API_BASE", "https://payeeproof-api.onrender.com").rstrip("/")
+WEBHOOK_DELIVERY_TIMEOUT_SEC = float(os.getenv("WEBHOOK_DELIVERY_TIMEOUT_SEC", "10"))
+WEBHOOK_RETRY_SCHEDULE_SEC = [
+    max(1, int(part.strip()))
+    for part in str(os.getenv("WEBHOOK_RETRY_SCHEDULE_SEC", "60,300,1800,7200")).split(",")
+    if part.strip()
+]
+WEBHOOK_PROCESS_BATCH_SIZE = int(os.getenv("WEBHOOK_PROCESS_BATCH_SIZE", "5"))
+WEBHOOK_PROCESS_MIN_INTERVAL_SEC = float(os.getenv("WEBHOOK_PROCESS_MIN_INTERVAL_SEC", "5"))
 
 RATE_LIMIT_BUCKETS: Dict[str, deque] = {}
 RATE_LIMIT_LOCK = Lock()
@@ -174,6 +184,8 @@ PILOT_DEDUP_CACHE: Dict[str, float] = {}
 PILOT_DEDUP_LOCK = Lock()
 ALERT_STATE: Dict[str, float] = {}
 ALERT_LOCK = Lock()
+WEBHOOK_PROCESS_LOCK = Lock()
+WEBHOOK_PROCESS_STATE: Dict[str, Any] = {"running": False, "last_started_at": 0.0}
 logger = logging.getLogger("payeeproof")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -185,6 +197,15 @@ API_SCOPE_BY_PATH = {
     "/api/preflight-check": "preflight",
     "/api/recovery-copilot": "recovery",
 }
+
+
+def resolve_required_api_scope(path: str) -> str:
+    normalized = path.rstrip("/") or "/"
+    if normalized in API_SCOPE_BY_PATH:
+        return API_SCOPE_BY_PATH[normalized]
+    if normalized == "/api/verification-records" or normalized.startswith("/api/verification-records/"):
+        return "records"
+    return ""
 
 
 def _extract_host(value: str) -> str:
@@ -233,11 +254,20 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
             scopes = {scope.strip().lower() for scope in scopes_raw.split(",") if scope.strip()}
         else:
             scopes = {str(scope).strip().lower() for scope in scopes_raw if str(scope).strip()}
+        webhook_events_raw = item.get("webhook_events") or ["preflight_run", "recovery_run"]
+        if isinstance(webhook_events_raw, str):
+            webhook_events = [evt.strip() for evt in webhook_events_raw.split(",") if evt.strip()]
+        else:
+            webhook_events = [str(evt).strip() for evt in webhook_events_raw if str(evt).strip()]
         loaded[key] = {
             "client": str(item.get("client") or item.get("client_name") or "unknown-client").strip(),
             "active": bool(item.get("active", True)),
-            "scopes": scopes or {"preflight", "recovery"},
+            "scopes": scopes or {"preflight", "recovery", "records"},
             "label": str(item.get("label") or "").strip(),
+            "webhook_url": str(item.get("webhook_url") or "").strip(),
+            "webhook_secret": str(item.get("webhook_secret") or "").strip(),
+            "webhook_active": bool(item.get("webhook_active", True)),
+            "webhook_events": webhook_events,
         }
     return loaded
 
@@ -582,6 +612,10 @@ def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
             "scope": required_scope,
             "client": record.get("client") or "unknown-client",
             "label": record.get("label") or "",
+            "webhook_url": record.get("webhook_url") or "",
+            "webhook_secret": record.get("webhook_secret") or "",
+            "webhook_active": bool(record.get("webhook_active", True)),
+            "webhook_events": list(record.get("webhook_events") or []),
         }
 
     if is_allowed_public_demo_request():
@@ -1262,6 +1296,628 @@ def build_recovery_support_message(packet: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def now_epoch() -> float:
+    return time.time()
+
+
+def iso_from_epoch(ts: float) -> str:
+    return datetime.fromtimestamp(max(0, ts), tz=timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_iso_to_epoch(value: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def safe_json_loads(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
+
+def normalize_text(value: Any, max_len: int = 300) -> str:
+    return str(value or "").strip()[:max_len]
+
+
+def row_to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    keys = getattr(row, "keys", None)
+    if callable(keys):
+        try:
+            return {key: row[key] for key in row.keys()}
+        except Exception:
+            pass
+    return {}
+
+
+def build_record_search_text(parts: List[Any]) -> str:
+    joined = " | ".join(str(part or "").strip() for part in parts if str(part or "").strip())
+    return joined[:2000]
+
+
+def verification_record_id() -> str:
+    return f"vrf_{uuid.uuid4().hex[:20]}"
+
+
+def webhook_delivery_id() -> str:
+    return f"whd_{uuid.uuid4().hex[:20]}"
+
+
+def webhook_ack_token() -> str:
+    return f"ack_{uuid.uuid4().hex}{uuid.uuid4().hex[:8]}"
+
+
+def build_public_api_url(path: str) -> str:
+    suffix = "/" + str(path or "").lstrip("/")
+    return f"{PUBLIC_API_BASE}{suffix}"
+
+
+def extract_record_filters(args: Any) -> Dict[str, Any]:
+    limit = max(1, min(100, int(str(args.get("limit") or "20"))))
+    offset = max(0, int(str(args.get("offset") or "0")))
+    return {
+        "service": normalize_text(args.get("service"), 80),
+        "network": normalize_text(args.get("network"), 80),
+        "reason_code": normalize_text(args.get("reason_code"), 120),
+        "status": normalize_text(args.get("status"), 80),
+        "request_id": normalize_text(args.get("request_id"), 120),
+        "reference_id": normalize_text(args.get("reference_id"), 120),
+        "record_id": normalize_text(args.get("record_id"), 120),
+        "address": normalize_text(args.get("address"), 160),
+        "tx_hash": normalize_text(args.get("tx_hash"), 180),
+        "q": normalize_text(args.get("q"), 200),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+def build_record_where_sql(filters: Dict[str, Any], client_label: str) -> Tuple[str, List[Any]]:
+    clauses = ["vr.client_label = ?"]
+    params: List[Any] = [client_label]
+    mapping = {
+        "service": "vr.service",
+        "network": "vr.network",
+        "reason_code": "vr.reason_code",
+        "status": "vr.status",
+        "request_id": "vr.request_id",
+        "reference_id": "vr.reference_id",
+        "record_id": "vr.record_id",
+        "address": "vr.address",
+        "tx_hash": "vr.tx_hash",
+    }
+    for key, column in mapping.items():
+        value = str(filters.get(key) or "").strip()
+        if value:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    q = str(filters.get("q") or "").strip()
+    if q:
+        clauses.append("vr.search_text LIKE ?")
+        params.append(f"%{q}%")
+    return " AND ".join(clauses), params
+
+
+def summarize_record_row(row: Any) -> Dict[str, Any]:
+    item = dict(row) if isinstance(row, dict) else {
+        "record_id": row[0],
+        "created_at": row[1],
+        "service": row[2],
+        "network": row[3],
+        "status": row[4],
+        "reason_code": row[5],
+        "request_id": row[6],
+        "reference_id": row[7],
+        "address": row[8],
+        "tx_hash": row[9],
+        "webhook_delivery_status": row[10],
+        "webhook_attempt_count": row[11],
+        "webhook_delivered_at": row[12],
+        "webhook_acknowledged_at": row[13],
+    }
+    return item
+
+
+def store_verification_record(*, service: str, event_name: str, payload: Dict[str, Any], response_payload: Dict[str, Any], network: str, status: str, reason_code: str, access: Dict[str, Any]) -> str:
+    record_id = verification_record_id()
+    client_label = str(access.get("client") or "website-demo")
+    access_mode = str(access.get("mode") or "public_demo")
+    reference_id = ""
+    address = ""
+    counterparty_address = ""
+    tx_hash = ""
+    verdict = ""
+    search_parts: List[Any] = [service, network, reason_code, client_label]
+    if service == "preflight-check":
+        context = payload.get("context") or {}
+        expected = payload.get("expected") or {}
+        provided = payload.get("provided") or {}
+        reference_id = normalize_text(context.get("reference_id"), 120)
+        address = normalize_text(provided.get("address"), 180)
+        counterparty_address = normalize_text(expected.get("address"), 180)
+        verdict = normalize_text(response_payload.get("verdict"), 80)
+        search_parts.extend([reference_id, address, counterparty_address, expected.get("asset"), provided.get("asset")])
+    else:
+        reference_id = normalize_text((payload.get("context") or {}).get("reference_id"), 120)
+        tx_hash = normalize_text(payload.get("tx_hash") or payload.get("hash"), 180)
+        address = normalize_text((response_payload.get("support_packet") or {}).get("destination"), 180)
+        verdict = normalize_text(response_payload.get("outcome") or response_payload.get("recovery_verdict"), 80)
+        search_parts.extend([reference_id, tx_hash, address, payload.get("issue_type")])
+
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            INSERT INTO verification_records(
+                record_id, created_at, request_id, service, event_name, client_label, access_mode, source_ip,
+                reference_id, network, status, verdict, reason_code, address, counterparty_address, tx_hash,
+                search_text, payload_json, response_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_id,
+                utc_now_iso(),
+                current_request_id(),
+                service,
+                event_name,
+                client_label,
+                access_mode,
+                get_client_ip(),
+                reference_id,
+                normalize_text(network, 80),
+                normalize_text(status, 80),
+                verdict,
+                normalize_text(reason_code, 120),
+                address,
+                counterparty_address,
+                tx_hash,
+                build_record_search_text(search_parts),
+                json_dumps_safe(payload),
+                json_dumps_safe(response_payload),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return record_id
+
+
+def get_record_row_by_id(record_id: str, client_label: str) -> Optional[Any]:
+    conn = get_db()
+    try:
+        return db_fetchone(
+            conn,
+            """
+            SELECT *
+            FROM verification_records
+            WHERE record_id = ? AND client_label = ?
+            LIMIT 1
+            """,
+            (record_id, client_label),
+        )
+    finally:
+        conn.close()
+
+
+def fetch_record_detail(record_id: str, client_label: str) -> Optional[Dict[str, Any]]:
+    row = get_record_row_by_id(record_id, client_label)
+    if not row:
+        return None
+    record = row_to_dict(row)
+    record["payload"] = safe_json_loads(record.get("payload_json"), {})
+    record["response"] = safe_json_loads(record.get("response_json"), {})
+    deliveries = list_webhook_deliveries_for_record(record_id)
+    record["webhook_deliveries"] = deliveries
+    record.pop("payload_json", None)
+    record.pop("response_json", None)
+    return record
+
+
+def search_verification_records(filters: Dict[str, Any], client_label: str) -> Dict[str, Any]:
+    where_sql, params = build_record_where_sql(filters, client_label)
+    conn = get_db()
+    try:
+        rows = db_fetchall(
+            conn,
+            f"""
+            SELECT
+                vr.record_id, vr.created_at, vr.service, vr.network, vr.status, vr.reason_code,
+                vr.request_id, vr.reference_id, vr.address, vr.tx_hash,
+                wd.delivery_status AS webhook_delivery_status,
+                wd.attempt_count AS webhook_attempt_count,
+                wd.delivered_at AS webhook_delivered_at,
+                wd.acknowledged_at AS webhook_acknowledged_at
+            FROM verification_records vr
+            LEFT JOIN webhook_deliveries wd ON wd.record_id = vr.record_id
+            WHERE {where_sql}
+            ORDER BY vr.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [int(filters.get("limit") or 20), int(filters.get("offset") or 0)]),
+        )
+        count_row = db_fetchone(conn, f"SELECT COUNT(*) AS total_count FROM verification_records vr WHERE {where_sql}", tuple(params))
+        total = int((count_row.get("total_count") if isinstance(count_row, dict) else count_row[0]) or 0) if count_row else 0
+    finally:
+        conn.close()
+    return {
+        "items": [summarize_record_row(row) for row in rows],
+        "total": total,
+        "limit": int(filters.get("limit") or 20),
+        "offset": int(filters.get("offset") or 0),
+    }
+
+
+def list_webhook_deliveries_for_record(record_id: str) -> List[Dict[str, Any]]:
+    conn = get_db()
+    try:
+        rows = db_fetchall(
+            conn,
+            """
+            SELECT delivery_id, event_name, delivery_status, ack_status, attempt_count, max_attempts,
+                   next_attempt_at, last_attempt_at, delivered_at, acknowledged_at,
+                   last_response_code, last_response_excerpt, last_error
+            FROM webhook_deliveries
+            WHERE record_id = ?
+            ORDER BY id DESC
+            """,
+            (record_id,),
+        )
+    finally:
+        conn.close()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        row_dict = row_to_dict(row)
+        if row_dict:
+            result.append(row_dict)
+            continue
+        result.append({
+            "delivery_id": row[0],
+            "event_name": row[1],
+            "delivery_status": row[2],
+            "ack_status": row[3],
+            "attempt_count": row[4],
+            "max_attempts": row[5],
+            "next_attempt_at": row[6],
+            "last_attempt_at": row[7],
+            "delivered_at": row[8],
+            "acknowledged_at": row[9],
+            "last_response_code": row[10],
+            "last_response_excerpt": row[11],
+            "last_error": row[12],
+        })
+    return result
+
+
+def create_webhook_delivery_for_record(record_id: str, event_name: str, access: Dict[str, Any]) -> Optional[str]:
+    webhook_url = str(access.get("webhook_url") or "").strip()
+    webhook_secret = str(access.get("webhook_secret") or "").strip()
+    webhook_events = set(access.get("webhook_events") or [])
+    if access.get("mode") != "api_key":
+        return None
+    if not bool(access.get("webhook_active", True)):
+        return None
+    if not webhook_url or not webhook_secret or (webhook_events and event_name not in webhook_events):
+        return None
+    delivery_id = webhook_delivery_id()
+    ack_token = webhook_ack_token()
+    schedule = WEBHOOK_RETRY_SCHEDULE_SEC or [60, 300, 1800]
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            INSERT INTO webhook_deliveries(
+                delivery_id, record_id, created_at, updated_at, client_label, event_name, webhook_url, webhook_secret,
+                delivery_status, ack_status, attempt_count, max_attempts, next_attempt_at, ack_token
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                delivery_id,
+                record_id,
+                utc_now_iso(),
+                utc_now_iso(),
+                str(access.get("client") or "unknown-client"),
+                event_name,
+                webhook_url,
+                webhook_secret,
+                "pending",
+                "pending",
+                0,
+                len(schedule) + 1,
+                utc_now_iso(),
+                ack_token,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return delivery_id
+
+
+def build_webhook_signature(secret: str, timestamp: str, raw_body: str) -> str:
+    signed = f"{timestamp}.{raw_body}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def build_webhook_payload(record: Dict[str, Any], delivery: Dict[str, Any]) -> Dict[str, Any]:
+    response_payload = safe_json_loads(record.get("response_json"), {})
+    return {
+        "delivery_id": delivery.get("delivery_id"),
+        "event": delivery.get("event_name"),
+        "record_id": record.get("record_id"),
+        "request_id": record.get("request_id"),
+        "created_at": delivery.get("created_at") or utc_now_iso(),
+        "service": record.get("service"),
+        "network": record.get("network"),
+        "status": record.get("status"),
+        "reason_code": record.get("reason_code"),
+        "client_label": record.get("client_label"),
+        "verification": response_payload,
+        "ack": {
+            "url": build_public_api_url("/api/webhooks/ack"),
+            "delivery_id": delivery.get("delivery_id"),
+            "token": delivery.get("ack_token"),
+        },
+    }
+
+
+def update_webhook_delivery_result(delivery_id: str, *, delivery_status: str, ack_status: Optional[str] = None,
+                                   next_attempt_at: str = "", last_response_code: Optional[int] = None,
+                                   last_response_excerpt: str = "", last_error: str = "", delivered_at: str = "",
+                                   increment_attempt: bool = False) -> None:
+    conn = get_db()
+    try:
+        row = db_fetchone(conn, "SELECT attempt_count FROM webhook_deliveries WHERE delivery_id = ? LIMIT 1", (delivery_id,))
+        current_attempts = int((row.get("attempt_count") if isinstance(row, dict) else row[0]) or 0) if row else 0
+        new_attempts = current_attempts + 1 if increment_attempt else current_attempts
+        db_execute(
+            conn,
+            """
+            UPDATE webhook_deliveries
+            SET updated_at = ?,
+                delivery_status = ?,
+                ack_status = COALESCE(?, ack_status),
+                attempt_count = ?,
+                next_attempt_at = ?,
+                last_attempt_at = ?,
+                delivered_at = COALESCE(?, delivered_at),
+                last_response_code = ?,
+                last_response_excerpt = ?,
+                last_error = ?
+            WHERE delivery_id = ?
+            """,
+            (
+                utc_now_iso(),
+                delivery_status,
+                ack_status,
+                new_attempts,
+                next_attempt_at,
+                utc_now_iso(),
+                delivered_at or None,
+                last_response_code,
+                normalize_text(last_response_excerpt, 500),
+                normalize_text(last_error, 500),
+                delivery_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_pending_webhook_deliveries(limit: int) -> List[Dict[str, Any]]:
+    now_iso = utc_now_iso()
+    conn = get_db()
+    try:
+        rows = db_fetchall(
+            conn,
+            """
+            SELECT wd.*, vr.response_json, vr.request_id, vr.service, vr.network, vr.status, vr.reason_code, vr.client_label, vr.record_id
+            FROM webhook_deliveries wd
+            JOIN verification_records vr ON vr.record_id = wd.record_id
+            WHERE wd.delivery_status IN ('pending', 'retry_scheduled')
+              AND (wd.next_attempt_at IS NULL OR wd.next_attempt_at = '' OR wd.next_attempt_at <= ?)
+            ORDER BY wd.created_at ASC
+            LIMIT ?
+            """,
+            (now_iso, int(limit)),
+        )
+    finally:
+        conn.close()
+    return [row_to_dict(row) for row in rows]
+
+
+def fetch_next_pending_webhook_due_epoch() -> float:
+    conn = get_db()
+    try:
+        row = db_fetchone(
+            conn,
+            """
+            SELECT next_attempt_at
+            FROM webhook_deliveries
+            WHERE delivery_status IN ('pending', 'retry_scheduled')
+            ORDER BY CASE WHEN next_attempt_at IS NULL OR next_attempt_at = '' THEN 0 ELSE 1 END, next_attempt_at ASC
+            LIMIT 1
+            """,
+        )
+    finally:
+        conn.close()
+    if not row:
+        return 0.0
+    value = (row.get("next_attempt_at") if isinstance(row, dict) else row[0]) or ""
+    if not str(value).strip():
+        return now_epoch()
+    return parse_iso_to_epoch(str(value))
+
+
+def compute_retry_schedule(attempt_count: int) -> Tuple[bool, str]:
+    schedule = WEBHOOK_RETRY_SCHEDULE_SEC or [60, 300, 1800]
+    if attempt_count <= len(schedule):
+        delay = int(schedule[max(0, attempt_count - 1)])
+        return True, iso_from_epoch(now_epoch() + delay)
+    return False, ""
+
+
+def attempt_webhook_delivery(delivery: Dict[str, Any]) -> None:
+    delivery_id = str(delivery.get("delivery_id") or "")
+    record_id = str(delivery.get("record_id") or "")
+    if not delivery_id or not record_id:
+        return
+    payload = build_webhook_payload(delivery, delivery)
+    raw_body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    timestamp = utc_now_iso()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "PayeeProof-Webhooks/1.0",
+        "X-PayeeProof-Event": str(delivery.get("event_name") or ""),
+        "X-PayeeProof-Delivery-ID": delivery_id,
+        "X-PayeeProof-Record-ID": record_id,
+        "X-PayeeProof-Timestamp": timestamp,
+        "X-PayeeProof-Signature": build_webhook_signature(str(delivery.get("webhook_secret") or ""), timestamp, raw_body),
+    }
+    try:
+        response = requests.post(
+            str(delivery.get("webhook_url") or ""),
+            data=raw_body.encode("utf-8"),
+            headers=headers,
+            timeout=WEBHOOK_DELIVERY_TIMEOUT_SEC,
+        )
+        excerpt = normalize_text(response.text, 500)
+        if 200 <= int(response.status_code) < 300:
+            update_webhook_delivery_result(
+                delivery_id,
+                delivery_status="delivered",
+                ack_status="http_accepted",
+                last_response_code=int(response.status_code),
+                last_response_excerpt=excerpt,
+                last_error="",
+                delivered_at=utc_now_iso(),
+                increment_attempt=True,
+            )
+            emit_structured_log("webhook_delivery_succeeded", event_name=delivery.get("event_name"), delivery_id=delivery_id, record_id=record_id, status_code=int(response.status_code))
+            return
+        should_retry, next_attempt_at = compute_retry_schedule(int(delivery.get("attempt_count") or 0) + 1)
+        update_webhook_delivery_result(
+            delivery_id,
+            delivery_status="retry_scheduled" if should_retry else "failed",
+            ack_status="pending",
+            next_attempt_at=next_attempt_at,
+            last_response_code=int(response.status_code),
+            last_response_excerpt=excerpt,
+            last_error=f"HTTP {response.status_code}",
+            increment_attempt=True,
+        )
+        emit_structured_log("webhook_delivery_failed", level="warning", event_name=delivery.get("event_name"), delivery_id=delivery_id, record_id=record_id, status_code=int(response.status_code), retry=should_retry)
+    except Exception as exc:
+        should_retry, next_attempt_at = compute_retry_schedule(int(delivery.get("attempt_count") or 0) + 1)
+        update_webhook_delivery_result(
+            delivery_id,
+            delivery_status="retry_scheduled" if should_retry else "failed",
+            ack_status="pending",
+            next_attempt_at=next_attempt_at,
+            last_error=str(exc),
+            increment_attempt=True,
+        )
+        emit_structured_log("webhook_delivery_exception", level="warning", event_name=delivery.get("event_name"), delivery_id=delivery_id, record_id=record_id, retry=should_retry, error=str(exc))
+
+
+def process_pending_webhooks(batch_size: int = WEBHOOK_PROCESS_BATCH_SIZE) -> None:
+    deliveries = fetch_pending_webhook_deliveries(batch_size)
+    for delivery in deliveries:
+        attempt_webhook_delivery(delivery)
+
+
+def _run_webhook_processor() -> None:
+    try:
+        idle_cycles = 0
+        while True:
+            deliveries = fetch_pending_webhook_deliveries(WEBHOOK_PROCESS_BATCH_SIZE)
+            if deliveries:
+                idle_cycles = 0
+                for delivery in deliveries:
+                    attempt_webhook_delivery(delivery)
+                continue
+            next_due_epoch = fetch_next_pending_webhook_due_epoch()
+            if not next_due_epoch:
+                break
+            sleep_for = max(0.0, next_due_epoch - now_epoch())
+            if sleep_for <= 0.25:
+                idle_cycles += 1
+                if idle_cycles > 2:
+                    break
+                time.sleep(0.25)
+                continue
+            if sleep_for > 120:
+                break
+            time.sleep(min(sleep_for, 30.0))
+    finally:
+        with WEBHOOK_PROCESS_LOCK:
+            WEBHOOK_PROCESS_STATE["running"] = False
+            WEBHOOK_PROCESS_STATE["last_started_at"] = now_epoch()
+
+
+def kick_webhook_processor(force: bool = False) -> None:
+    with WEBHOOK_PROCESS_LOCK:
+        if WEBHOOK_PROCESS_STATE.get("running"):
+            return
+        last_started_at = float(WEBHOOK_PROCESS_STATE.get("last_started_at") or 0.0)
+        if not force and (now_epoch() - last_started_at) < WEBHOOK_PROCESS_MIN_INTERVAL_SEC:
+            return
+        WEBHOOK_PROCESS_STATE["running"] = True
+        WEBHOOK_PROCESS_STATE["last_started_at"] = now_epoch()
+    Thread(target=_run_webhook_processor, daemon=True).start()
+
+
+def acknowledge_webhook_delivery(delivery_id: str, ack_token: str, status: str, detail: str, payload: Dict[str, Any]) -> bool:
+    conn = get_db()
+    try:
+        row = db_fetchone(conn, "SELECT delivery_id, ack_token FROM webhook_deliveries WHERE delivery_id = ? LIMIT 1", (delivery_id,))
+        if not row:
+            return False
+        stored_token = str((row.get("ack_token") if isinstance(row, dict) else row[1]) or "")
+        if not stored_token or stored_token != ack_token:
+            return False
+        db_execute(
+            conn,
+            """
+            UPDATE webhook_deliveries
+            SET updated_at = ?,
+                ack_status = ?,
+                acknowledged_at = ?,
+                last_response_excerpt = ?,
+                ack_payload_json = ?
+            WHERE delivery_id = ?
+            """,
+            (
+                utc_now_iso(),
+                normalize_text(status or "confirmed", 80),
+                utc_now_iso(),
+                normalize_text(detail, 500),
+                json_dumps_safe(payload),
+                delivery_id,
+            ),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 def get_db() -> Any:
     if db_is_postgres():
         if psycopg2 is None:
@@ -1431,12 +2087,172 @@ def ensure_db() -> None:
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_created_at ON event_log(created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_event_name_created_at ON event_log(event_name, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_network_created_at ON event_log(network, created_at)")
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS verification_records (
+                  id BIGSERIAL PRIMARY KEY,
+                  record_id TEXT,
+                  created_at TEXT NOT NULL,
+                  request_id TEXT,
+                  service TEXT NOT NULL,
+                  event_name TEXT NOT NULL,
+                  client_label TEXT NOT NULL,
+                  access_mode TEXT NOT NULL,
+                  source_ip TEXT,
+                  reference_id TEXT,
+                  network TEXT,
+                  status TEXT,
+                  verdict TEXT,
+                  reason_code TEXT,
+                  address TEXT,
+                  counterparty_address TEXT,
+                  tx_hash TEXT,
+                  search_text TEXT,
+                  payload_json TEXT,
+                  response_json TEXT
+                )
+                """
+            )
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                  id BIGSERIAL PRIMARY KEY,
+                  delivery_id TEXT,
+                  record_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  client_label TEXT NOT NULL,
+                  event_name TEXT NOT NULL,
+                  webhook_url TEXT NOT NULL,
+                  webhook_secret TEXT NOT NULL,
+                  delivery_status TEXT NOT NULL,
+                  ack_status TEXT NOT NULL DEFAULT 'pending',
+                  attempt_count INTEGER NOT NULL DEFAULT 0,
+                  max_attempts INTEGER NOT NULL DEFAULT 0,
+                  next_attempt_at TEXT,
+                  last_attempt_at TEXT,
+                  delivered_at TEXT,
+                  acknowledged_at TEXT,
+                  last_response_code INTEGER,
+                  last_response_excerpt TEXT,
+                  last_error TEXT,
+                  ack_token TEXT,
+                  ack_payload_json TEXT
+                )
+                """
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS verification_records (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  record_id TEXT,
+                  created_at TEXT NOT NULL,
+                  request_id TEXT,
+                  service TEXT NOT NULL,
+                  event_name TEXT NOT NULL,
+                  client_label TEXT NOT NULL,
+                  access_mode TEXT NOT NULL,
+                  source_ip TEXT,
+                  reference_id TEXT,
+                  network TEXT,
+                  status TEXT,
+                  verdict TEXT,
+                  reason_code TEXT,
+                  address TEXT,
+                  counterparty_address TEXT,
+                  tx_hash TEXT,
+                  search_text TEXT,
+                  payload_json TEXT,
+                  response_json TEXT
+                )
+                """
+            )
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  delivery_id TEXT,
+                  record_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  client_label TEXT NOT NULL,
+                  event_name TEXT NOT NULL,
+                  webhook_url TEXT NOT NULL,
+                  webhook_secret TEXT NOT NULL,
+                  delivery_status TEXT NOT NULL,
+                  ack_status TEXT NOT NULL DEFAULT 'pending',
+                  attempt_count INTEGER NOT NULL DEFAULT 0,
+                  max_attempts INTEGER NOT NULL DEFAULT 0,
+                  next_attempt_at TEXT,
+                  last_attempt_at TEXT,
+                  delivered_at TEXT,
+                  acknowledged_at TEXT,
+                  last_response_code INTEGER,
+                  last_response_excerpt TEXT,
+                  last_error TEXT,
+                  ack_token TEXT,
+                  ack_payload_json TEXT
+                )
+                """
+            )
+        ensure_column(conn, "verification_records", "record_id", "TEXT")
+        ensure_column(conn, "verification_records", "request_id", "TEXT")
+        ensure_column(conn, "verification_records", "service", "TEXT")
+        ensure_column(conn, "verification_records", "event_name", "TEXT")
+        ensure_column(conn, "verification_records", "client_label", "TEXT")
+        ensure_column(conn, "verification_records", "access_mode", "TEXT")
+        ensure_column(conn, "verification_records", "source_ip", "TEXT")
+        ensure_column(conn, "verification_records", "reference_id", "TEXT")
+        ensure_column(conn, "verification_records", "network", "TEXT")
+        ensure_column(conn, "verification_records", "status", "TEXT")
+        ensure_column(conn, "verification_records", "verdict", "TEXT")
+        ensure_column(conn, "verification_records", "reason_code", "TEXT")
+        ensure_column(conn, "verification_records", "address", "TEXT")
+        ensure_column(conn, "verification_records", "counterparty_address", "TEXT")
+        ensure_column(conn, "verification_records", "tx_hash", "TEXT")
+        ensure_column(conn, "verification_records", "search_text", "TEXT")
+        ensure_column(conn, "verification_records", "payload_json", "TEXT")
+        ensure_column(conn, "verification_records", "response_json", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "delivery_id", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "record_id", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "client_label", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "event_name", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "webhook_url", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "webhook_secret", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "delivery_status", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "ack_status", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "attempt_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "webhook_deliveries", "max_attempts", "INTEGER DEFAULT 0")
+        ensure_column(conn, "webhook_deliveries", "next_attempt_at", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "last_attempt_at", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "delivered_at", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "acknowledged_at", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "last_response_code", "INTEGER")
+        ensure_column(conn, "webhook_deliveries", "last_response_excerpt", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "last_error", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "ack_token", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "ack_payload_json", "TEXT")
+        db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_records_record_id ON verification_records(record_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_client_created_at ON verification_records(client_label, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_service_created_at ON verification_records(service, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_request_id ON verification_records(request_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_reference_id ON verification_records(reference_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_delivery_id ON webhook_deliveries(delivery_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_record_id ON webhook_deliveries(record_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_next_attempt ON webhook_deliveries(delivery_status, next_attempt_at)")
         conn.commit()
     finally:
         conn.close()
 
 
 ensure_db()
+kick_webhook_processor(force=True)
 
 
 @app.before_request
@@ -1448,8 +2264,8 @@ def apply_access_controls():
         return None
 
     path = request.path.rstrip("/") or "/"
-    if path in API_SCOPE_BY_PATH:
-        scope = API_SCOPE_BY_PATH[path]
+    scope = resolve_required_api_scope(path)
+    if scope:
         access = authenticate_api_request(scope)
         g.api_access = access
         if access["mode"] == "api_key":
@@ -1507,6 +2323,7 @@ def attach_response_headers(response):
     access = getattr(g, "api_access", None)
     if access:
         response.headers.setdefault("X-API-Access-Mode", str(access.get("mode") or ""))
+    kick_webhook_processor()
     return response
 
 
@@ -1576,7 +2393,60 @@ def root():
             "/api/preflight-check",
             "/api/recovery-copilot",
             "/pilot-request",
+            "/api/verification-records",
+            "/api/webhooks/ack",
         ]
+    })
+
+
+@app.get("/api/verification-records")
+def verification_records_history():
+    access = getattr(g, "api_access", None) or {}
+    if access.get("mode") != "api_key":
+        raise ApiError("API key required for verification history.", 401)
+    filters = extract_record_filters(request.args)
+    result = search_verification_records(filters, str(access.get("client") or ""))
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "filters": {k: v for k, v in filters.items() if k not in {"limit", "offset"} and v},
+        **result,
+    })
+
+
+@app.get("/api/verification-records/<record_id>")
+def verification_record_detail(record_id: str):
+    access = getattr(g, "api_access", None) or {}
+    if access.get("mode") != "api_key":
+        raise ApiError("API key required for verification history.", 401)
+    record = fetch_record_detail(record_id, str(access.get("client") or ""))
+    if not record:
+        raise ApiError("Verification record not found.", 404)
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "record": record,
+    })
+
+
+@app.post("/api/webhooks/ack")
+def webhook_ack():
+    payload = request.get_json(silent=True) or {}
+    delivery_id = normalize_text(payload.get("delivery_id"), 120)
+    ack_token = normalize_text(payload.get("token") or payload.get("ack_token"), 200)
+    status = normalize_text(payload.get("status") or "confirmed", 80)
+    detail = normalize_text(payload.get("detail") or payload.get("message"), 500)
+    if not delivery_id or not ack_token:
+        raise ApiError("delivery_id and token are required.", 400)
+    ok = acknowledge_webhook_delivery(delivery_id, ack_token, status, detail, payload)
+    if not ok:
+        raise ApiError("Webhook acknowledgement not accepted.", 403)
+    return jsonify({
+        "ok": True,
+        "delivery_id": delivery_id,
+        "status": status,
+        "acknowledged_at": utc_now_iso(),
+        "trace_id": current_request_id(),
     })
 
 
@@ -1722,7 +2592,7 @@ def preflight_check():
             "risk_flags": sorted(set(risk_flags)),
         },
     )
-    return jsonify({
+    response_payload = {
         "ok": True,
         "service": "preflight-check",
         "version": APP_VERSION,
@@ -1777,7 +2647,29 @@ def preflight_check():
             "expected_asset_supported": checks["expected_asset_supported"],
             "provided_asset_supported": checks["provided_asset_supported"],
         },
-    })
+    }
+    access = getattr(g, "api_access", None) or {}
+    record_id = store_verification_record(
+        service="preflight-check",
+        event_name="preflight_run",
+        payload=payload,
+        response_payload=response_payload,
+        network=provided_chain,
+        status=outcome["status"],
+        reason_code=outcome["reason_code"],
+        access=access,
+    )
+    response_payload["record_id"] = record_id
+    response_payload["history_url"] = f"/api/verification-records/{record_id}"
+    delivery_id = create_webhook_delivery_for_record(record_id, "preflight_run", access)
+    if delivery_id:
+        response_payload["webhook"] = {
+            "queued": True,
+            "delivery_id": delivery_id,
+            "event": "preflight_run",
+        }
+        kick_webhook_processor(force=True)
+    return jsonify(response_payload)
 
 
 def is_likely_evm_tx_hash(value: str) -> bool:
@@ -1966,7 +2858,7 @@ def recovery_copilot():
         },
     )
 
-    return jsonify({
+    response_payload = {
         "ok": True,
         "service": "recovery-copilot",
         "version": APP_VERSION,
@@ -1992,7 +2884,29 @@ def recovery_copilot():
             "reason_code": analysis.get("reason_code"),
         },
         **analysis,
-    })
+    }
+    access = getattr(g, "api_access", None) or {}
+    record_id = store_verification_record(
+        service="recovery-copilot",
+        event_name="recovery_run",
+        payload=payload,
+        response_payload=response_payload,
+        network=effective_chain,
+        status=str(analysis.get("status") or outcome),
+        reason_code=str(analysis.get("reason_code") or ""),
+        access=access,
+    )
+    response_payload["record_id"] = record_id
+    response_payload["history_url"] = f"/api/verification-records/{record_id}"
+    delivery_id = create_webhook_delivery_for_record(record_id, "recovery_run", access)
+    if delivery_id:
+        response_payload["webhook"] = {
+            "queued": True,
+            "delivery_id": delivery_id,
+            "event": "recovery_run",
+        }
+        kick_webhook_processor(force=True)
+    return jsonify(response_payload)
 
 
 @app.post("/pilot-request")
