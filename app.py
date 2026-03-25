@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ import requests
 from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.3.0-api-keys-rate-limit"
+APP_VERSION = "1.4.0-pilot-persistence"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -107,7 +108,24 @@ allowed_origins = [x.strip() for x in os.getenv(
 ).split(",") if x.strip()]
 CORS(app, resources={r"/*": {"origins": allowed_origins}})
 
-DB_PATH = os.getenv("DB_PATH", "/tmp/payeeproof.db")
+def resolve_db_path() -> str:
+    explicit = str(os.getenv("DB_PATH", "")).strip()
+    if explicit:
+        return explicit
+    if os.getenv("RENDER") or os.path.isdir("/var/data"):
+        return "/var/data/payeeproof.db"
+    return "/tmp/payeeproof.db"
+
+
+def ensure_parent_dir(path_value: str) -> None:
+    try:
+        Path(path_value).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+DB_PATH = resolve_db_path()
+ensure_parent_dir(DB_PATH)
 RPC_TIMEOUT = float(os.getenv("RPC_TIMEOUT_SEC", os.getenv("REQUEST_TIMEOUT_SEC", "3.5")))
 EMAIL_TIMEOUT = float(os.getenv("EMAIL_TIMEOUT_SEC", "10"))
 ADDRESS_CACHE_TTL_SEC = int(os.getenv("ADDRESS_CACHE_TTL_SEC", "600"))
@@ -273,20 +291,68 @@ def consume_rate_limit(bucket: str, limit: int, window_sec: int) -> Tuple[bool, 
         }
 
 
-def mark_pilot_fingerprint(fingerprint: str, ttl_sec: int) -> bool:
-    now = time.time()
-    with PILOT_DEDUP_LOCK:
-        expired = [key for key, expires_at in PILOT_DEDUP_CACHE.items() if expires_at <= now]
-        for key in expired:
-            PILOT_DEDUP_CACHE.pop(key, None)
-        expires_at = PILOT_DEDUP_CACHE.get(fingerprint, 0)
-        if expires_at > now:
-            return False
-        PILOT_DEDUP_CACHE[fingerprint] = now + ttl_sec
-        return True
+def pilot_request_id() -> str:
+    return f"ppf_{uuid.uuid4().hex[:16]}"
 
 
-def pilot_ack_response(message: str, submitted_at: Optional[str] = None, stored: bool = False, email_notification: str = "skipped", status_code: int = 200):
+def get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
+    if column_name not in get_table_columns(conn, table_name):
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+
+
+def find_recent_duplicate_request(conn: sqlite3.Connection, fingerprint: str, ttl_sec: int) -> Optional[sqlite3.Row]:
+    cutoff = datetime.fromtimestamp(max(0, time.time() - ttl_sec), tz=timezone.utc).replace(microsecond=0).isoformat()
+    return conn.execute(
+        """
+        SELECT request_id, created_at, email_status
+        FROM pilot_requests
+        WHERE fingerprint = ? AND created_at >= ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (fingerprint, cutoff),
+    ).fetchone()
+
+
+def update_pilot_delivery_status(request_id: str, email_result: Dict[str, Optional[str]]) -> None:
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            UPDATE pilot_requests
+            SET email_status = ?,
+                email_id = ?,
+                email_error = ?,
+                email_last_attempt_at = ?
+            WHERE request_id = ?
+            """,
+            (
+                str(email_result.get("status") or "unknown"),
+                email_result.get("email_id"),
+                email_result.get("debug_detail"),
+                utc_now_iso(),
+                request_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def pilot_ack_response(
+    message: str,
+    submitted_at: Optional[str] = None,
+    stored: bool = False,
+    email_notification: str = "skipped",
+    status_code: int = 200,
+    request_id: Optional[str] = None,
+    persisted: Optional[bool] = None,
+):
     payload = {
         "ok": True,
         "message": message,
@@ -295,6 +361,10 @@ def pilot_ack_response(message: str, submitted_at: Optional[str] = None, stored:
     }
     if submitted_at:
         payload["submitted_at"] = submitted_at
+    if request_id:
+        payload["request_id"] = request_id
+    if persisted is not None:
+        payload["persisted"] = persisted
     return jsonify(payload), status_code
 
 
@@ -831,6 +901,8 @@ def ensure_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS pilot_requests (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
+              request_id TEXT,
+              fingerprint TEXT,
               created_at TEXT NOT NULL,
               name TEXT NOT NULL,
               company TEXT NOT NULL,
@@ -838,8 +910,29 @@ def ensure_db() -> None:
               volume TEXT,
               notes TEXT NOT NULL,
               source_ip TEXT,
-              user_agent TEXT
+              user_agent TEXT,
+              origin TEXT,
+              email_status TEXT DEFAULT 'pending',
+              email_id TEXT,
+              email_error TEXT,
+              email_last_attempt_at TEXT
             )
+            """
+        )
+        ensure_column(conn, "pilot_requests", "request_id", "TEXT")
+        ensure_column(conn, "pilot_requests", "fingerprint", "TEXT")
+        ensure_column(conn, "pilot_requests", "origin", "TEXT")
+        ensure_column(conn, "pilot_requests", "email_status", "TEXT DEFAULT 'pending'")
+        ensure_column(conn, "pilot_requests", "email_id", "TEXT")
+        ensure_column(conn, "pilot_requests", "email_error", "TEXT")
+        ensure_column(conn, "pilot_requests", "email_last_attempt_at", "TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pilot_requests_request_id ON pilot_requests(request_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pilot_requests_fingerprint_created_at ON pilot_requests(fingerprint, created_at)")
+        conn.execute(
+            """
+            UPDATE pilot_requests
+            SET request_id = COALESCE(request_id, 'ppf_' || lower(hex(randomblob(8))))
+            WHERE request_id IS NULL OR trim(request_id) = ''
             """
         )
         conn.execute(
@@ -1372,7 +1465,12 @@ def pilot_request():
     form_started_at_raw = payload.get("form_started_at")
 
     if honeypot_value:
-        return pilot_ack_response("Your request has been sent successfully.", stored=False, email_notification="filtered")
+        return pilot_ack_response(
+            "Your request has been sent successfully.",
+            stored=False,
+            persisted=False,
+            email_notification="filtered",
+        )
 
     if form_started_at_raw not in (None, ""):
         try:
@@ -1381,7 +1479,12 @@ def pilot_request():
                 started_at_value = started_at_value / 1000.0
             age_sec = time.time() - started_at_value
             if 0 <= age_sec < PILOT_MIN_FILL_SEC:
-                return pilot_ack_response("Your request has been sent successfully.", stored=False, email_notification="filtered")
+                return pilot_ack_response(
+                    "Your request has been sent successfully.",
+                    stored=False,
+                    persisted=False,
+                    email_notification="filtered",
+                )
         except Exception:
             pass
 
@@ -1410,15 +1513,32 @@ def pilot_request():
         "notes": " ".join(notes.lower().split()),
     }
     fingerprint = _pilot_payload_fingerprint(fingerprint_payload)
-    if not mark_pilot_fingerprint(fingerprint, PILOT_DUPLICATE_TTL_SEC):
-        return pilot_ack_response("This pilot request is already in review.", stored=False, email_notification="deduplicated")
-
     created_at = utc_now_iso()
+    request_id = pilot_request_id()
+
     conn = get_db()
     try:
+        duplicate = find_recent_duplicate_request(conn, fingerprint, PILOT_DUPLICATE_TTL_SEC)
+        if duplicate:
+            return pilot_ack_response(
+                "This pilot request is already in review.",
+                submitted_at=str(duplicate["created_at"]),
+                stored=True,
+                persisted=True,
+                email_notification="deduplicated",
+                request_id=str(duplicate["request_id"]),
+            )
+
         conn.execute(
-            "INSERT INTO pilot_requests(created_at, name, company, email, volume, notes, source_ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO pilot_requests(
+                request_id, fingerprint, created_at, name, company, email, volume, notes,
+                source_ip, user_agent, origin, email_status, email_last_attempt_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
+                request_id,
+                fingerprint,
                 created_at,
                 name,
                 company,
@@ -1427,6 +1547,9 @@ def pilot_request():
                 notes,
                 source_ip,
                 user_agent,
+                origin,
+                "pending",
+                None,
             ),
         )
         conn.commit()
@@ -1434,6 +1557,7 @@ def pilot_request():
         conn.close()
 
     email_result = send_pilot_notification({
+        "request_id": request_id,
         "created_at": created_at,
         "name": name,
         "company": company,
@@ -1444,12 +1568,15 @@ def pilot_request():
         "user_agent": user_agent or "",
         "origin": origin or "",
     })
+    update_pilot_delivery_status(request_id, email_result)
 
     if email_result.get("status") == "sent":
         return jsonify({
             "ok": True,
-            "message": "Your request has been sent successfully.",
+            "message": "Your request was recorded successfully.",
             "stored": True,
+            "persisted": True,
+            "request_id": request_id,
             "email_notification": "sent",
             "email_id": email_result.get("email_id"),
             "submitted_at": created_at,
@@ -1457,23 +1584,25 @@ def pilot_request():
 
     if email_result.get("status") == "not_configured":
         return jsonify({
-            "ok": False,
-            "error": "PILOT_EMAIL_NOT_CONFIGURED",
-            "message": "Pilot request email is not configured on the server yet.",
+            "ok": True,
+            "message": "Your request was recorded successfully, but email forwarding is not configured yet.",
             "stored": True,
+            "persisted": True,
+            "request_id": request_id,
             "email_notification": "not_configured",
             "submitted_at": created_at,
-        }), 500
+        }), 200
 
     return jsonify({
-        "ok": False,
-        "error": "EMAIL_DELIVERY_FAILED",
-        "message": "Could not send your request right now. Please try again in a moment.",
+        "ok": True,
+        "message": "Your request was recorded successfully, but email forwarding is delayed right now.",
         "stored": True,
+        "persisted": True,
+        "request_id": request_id,
         "email_notification": "failed",
         "submitted_at": created_at,
         "debug_detail": email_result.get("debug_detail"),
-    }), 502
+    }), 200
 
 
 def _pilot_payload_fingerprint(payload: Dict[str, Any]) -> str:
@@ -1494,11 +1623,12 @@ def send_pilot_notification(payload: Dict[str, str]) -> Dict[str, Optional[str]]
     if not RESEND_API_KEY or not RESEND_FROM or not RESEND_TO:
         return {"status": "not_configured", "email_id": None, "debug_detail": None}
 
-    subject = f"New PayeeProof pilot request — {payload['company']}"
+    subject = f"New PayeeProof pilot request — {payload['company']} ({payload.get('request_id') or 'pending-id'})"
     notes_html = html.escape(payload["notes"]).replace("\n", "<br>")
     text_body = "\n".join([
         "New PayeeProof pilot request",
         "",
+        f"Request ID: {payload.get('request_id') or 'Not assigned'}",
         f"Submitted at: {payload['created_at']}",
         f"Name: {payload['name']}",
         f"Company / team: {payload['company']}",
@@ -1516,7 +1646,8 @@ def send_pilot_notification(payload: Dict[str, str]) -> Dict[str, Optional[str]]
     html_body = f"""
     <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111">
       <h2>New PayeeProof pilot request</h2>
-      <p><strong>Submitted at:</strong> {html.escape(payload['created_at'])}<br>
+      <p><strong>Request ID:</strong> {html.escape(payload.get('request_id') or 'Not assigned')}<br>
+      <strong>Submitted at:</strong> {html.escape(payload['created_at'])}<br>
       <strong>Name:</strong> {html.escape(payload['name'])}<br>
       <strong>Company / team:</strong> {html.escape(payload['company'])}<br>
       <strong>Work email:</strong> {html.escape(payload['email'])}<br>
