@@ -14,7 +14,7 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.2.0-recovery-packet"
+APP_VERSION = "1.2.1-recovery-auto"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -120,6 +120,34 @@ def utc_now_iso() -> str:
 def normalize_chain(value: str) -> str:
     raw = str(value or "").strip().lower()
     return CHAIN_ALIASES.get(raw, raw)
+
+def normalize_issue_type(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "": "auto",
+        "unknown": "auto",
+        "general": "auto",
+        "general_analysis": "auto",
+        "auto_detect": "auto",
+        "auto-detect": "auto",
+        "auto": "auto",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    if raw in {"wrong_network", "wrong_address", "sent_to_contract", "missing_memo"}:
+        return raw
+    return "auto"
+
+
+def issue_type_label(value: str) -> str:
+    labels = {
+        "auto": "Auto-detect / not specified",
+        "wrong_network": "Wrong network",
+        "wrong_address": "Wrong address",
+        "sent_to_contract": "Sent to smart contract / app",
+        "missing_memo": "Missing memo / tag",
+    }
+    return labels.get(normalize_issue_type(value), str(value or "").replace("_", " ").title() or "Auto-detect / not specified")
 
 
 def load_rpc_urls() -> Dict[str, str]:
@@ -551,7 +579,8 @@ def build_recovery_support_packet(
         "confidence": confidence,
         "chain": chain,
         "tx_hash": tx_hash,
-        "issue_type": issue_type or "unknown",
+        "issue_type": issue_type or "auto",
+        "issue_type_label": issue_type_label(issue_type),
         "reason_code": analysis.get("reason_code"),
         "summary": analysis.get("summary"),
         "explanation": why,
@@ -577,7 +606,7 @@ def build_recovery_support_message(packet: Dict[str, Any]) -> str:
         "",
         f"Transaction hash: {packet.get('tx_hash') or 'Not provided'}",
         f"Network: {packet.get('chain') or 'Not provided'}",
-        f"Issue type: {str(packet.get('issue_type') or 'unknown').replace('_', ' ').title()}",
+        f"Issue type: {packet.get('issue_type_label') or issue_type_label(packet.get('issue_type'))}",
         f"Observed transaction status: {packet.get('tx_status') or 'Unknown'}",
         f"Destination: {packet.get('destination') or 'Unknown'}",
         f"Destination type: {packet.get('destination_type') or 'Unknown'}",
@@ -875,7 +904,7 @@ def recovery_copilot():
     payload = request.get_json(silent=True) or {}
     chain = normalize_chain(payload.get("network") or payload.get("chain"))
     tx_hash = str(payload.get("tx_hash") or payload.get("hash") or "").strip()
-    issue_type = str(payload.get("issue_type") or "unknown").strip().lower()
+    issue_type = normalize_issue_type(payload.get("issue_type"))
     intended_address = str(payload.get("intended_address") or "").strip()
     intended_chain = normalize_chain(payload.get("intended_chain") or "") if payload.get("intended_chain") else ""
 
@@ -1425,6 +1454,44 @@ def build_evm_recovery_guidance(
     tx_status: str,
 ) -> Tuple[str, str, List[str], str]:
     same_destination = bool(intended_address and destination and intended_address.lower() == destination.lower())
+    issue_type = normalize_issue_type(issue_type)
+    auto_mode = issue_type == "auto"
+
+    if auto_mode and intended_chain and intended_chain != chain:
+        return (
+            f"The transaction exists on {chain}, while the intended destination chain was {intended_chain}. This points to a likely wrong-network send.",
+            "possible",
+            [
+                "Confirm whether the recipient controls the same address on the intended chain.",
+                "If the destination belongs to an exchange or custodial platform, open a support case with the tx hash, asset, amount, and both chain names.",
+                "Do not resend until the recipient confirms the supported network for this asset."
+            ],
+            "WRONG_NETWORK_DETECTED",
+        )
+
+    if auto_mode and intended_address and destination and not same_destination:
+        return (
+            "The on-chain destination differs from the intended address that was provided. This points to a likely wrong-address send.",
+            "unlikely",
+            [
+                "Verify whether the receiving address belongs to you, your team, or the expected platform.",
+                "If the destination belongs to a custodial service, contact support immediately with the tx hash and amount.",
+                "If it is an unknown self-custody address, recovery is usually not possible."
+            ],
+            "WRONG_ADDRESS_DETECTED",
+        )
+
+    if auto_mode and destination_kind.get("address_type") == "contract":
+        return (
+            "The destination resolves to a smart contract or app. Recovery depends on whether that contract exposes a withdrawal, sweep, or rescue path.",
+            "manual_review",
+            [
+                "Identify the contract owner, protocol team, or application operator.",
+                "Check whether the contract has a documented recovery or administrative withdrawal path.",
+                "Do not resend until the contract behavior is understood."
+            ],
+            "DESTINATION_IS_CONTRACT",
+        )
 
     if issue_type == "wrong_network":
         if intended_chain and intended_chain != chain:
@@ -1549,6 +1616,7 @@ def extract_erc20_transfer(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def analyze_solana_transaction(tx_hash: str, issue_type: str, intended_address: str, intended_chain: str) -> Dict[str, Any]:
+    issue_type = normalize_issue_type(issue_type)
     rpc = rpc_call("solana", "getTransaction", [
         tx_hash,
         {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
@@ -1614,6 +1682,50 @@ def analyze_solana_transaction(tx_hash: str, issue_type: str, intended_address: 
             "next_actions": [
                 "Do not resend until the failure reason is understood.",
                 "Check the program error and destination account assumptions."
+            ],
+            "observed": observed,
+        }
+
+    auto_mode = issue_type == "auto"
+
+    if auto_mode and intended_chain and intended_chain != "solana":
+        return {
+            "status": "found",
+            "reason_code": "WRONG_NETWORK_DETECTED",
+            "summary": f"The transfer exists on Solana, while the intended chain was {intended_chain}. This points to a likely wrong-network send.",
+            "recoverability": "possible",
+            "next_actions": [
+                "Confirm whether the recipient supports Solana for this asset.",
+                "If this was a custodial destination, contact platform support with the signature, asset, amount, and both chain names.",
+                "Do not resend until the supported network is confirmed."
+            ],
+            "observed": observed,
+        }
+
+    if auto_mode and intended_address and destination and intended_address != destination:
+        return {
+            "status": "found",
+            "reason_code": "WRONG_ADDRESS_DETECTED",
+            "summary": "The on-chain destination differs from the intended address that was provided. This points to a likely wrong-address send.",
+            "recoverability": "unlikely",
+            "next_actions": [
+                "Check whether the destination belongs to the expected platform or to you.",
+                "If it belongs to a custodial service, contact support immediately with the signature and amount.",
+                "If it is an unknown self-custody address, recovery is usually not possible."
+            ],
+            "observed": observed,
+        }
+
+    if auto_mode and destination_kind.get("address_type") == "executable":
+        return {
+            "status": "found",
+            "reason_code": "DESTINATION_IS_PROGRAM",
+            "summary": "The destination resolves to an executable Solana program account. Recovery depends on program design and operator access.",
+            "recoverability": "manual_review",
+            "next_actions": [
+                "Identify the protocol or application that owns the program.",
+                "Check whether there is a documented recovery path for mistaken deposits.",
+                "Do not resend until the operator confirms the destination behavior."
             ],
             "observed": observed,
         }
