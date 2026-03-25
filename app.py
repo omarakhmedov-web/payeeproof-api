@@ -6,6 +6,13 @@ import re
 import sqlite3
 import time
 import uuid
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except Exception:
+    psycopg2 = None
+    RealDictCursor = None
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +26,7 @@ import requests
 from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.4.0-pilot-persistence"
+APP_VERSION = "1.5.0-postgres-pilot-storage"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -108,12 +115,17 @@ allowed_origins = [x.strip() for x in os.getenv(
 ).split(",") if x.strip()]
 CORS(app, resources={r"/*": {"origins": allowed_origins}})
 
+DATABASE_URL = str(os.getenv("DATABASE_URL", "")).strip()
+
+
+def resolve_db_backend() -> str:
+    return "postgres" if DATABASE_URL else "sqlite"
+
+
 def resolve_db_path() -> str:
     explicit = str(os.getenv("DB_PATH", "")).strip()
     if explicit:
         return explicit
-    if os.getenv("RENDER") or os.path.isdir("/var/data"):
-        return "/var/data/payeeproof.db"
     return "/tmp/payeeproof.db"
 
 
@@ -124,8 +136,10 @@ def ensure_parent_dir(path_value: str) -> None:
         pass
 
 
+DB_BACKEND = resolve_db_backend()
 DB_PATH = resolve_db_path()
-ensure_parent_dir(DB_PATH)
+if DB_BACKEND == "sqlite":
+    ensure_parent_dir(DB_PATH)
 RPC_TIMEOUT = float(os.getenv("RPC_TIMEOUT_SEC", os.getenv("REQUEST_TIMEOUT_SEC", "3.5")))
 EMAIL_TIMEOUT = float(os.getenv("EMAIL_TIMEOUT_SEC", "10"))
 ADDRESS_CACHE_TTL_SEC = int(os.getenv("ADDRESS_CACHE_TTL_SEC", "600"))
@@ -295,19 +309,65 @@ def pilot_request_id() -> str:
     return f"ppf_{uuid.uuid4().hex[:16]}"
 
 
-def get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+def db_is_postgres() -> bool:
+    return DB_BACKEND == "postgres"
+
+
+def db_sql(sql: str) -> str:
+    if db_is_postgres():
+        return sql.replace("?", "%s")
+    return sql
+
+
+def db_execute(conn: Any, sql: str, params: Tuple[Any, ...] = ()) -> None:
+    if db_is_postgres():
+        with conn.cursor() as cur:
+            cur.execute(db_sql(sql), params)
+        return
+    conn.execute(sql, params)
+
+
+def db_fetchone(conn: Any, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Any]:
+    if db_is_postgres():
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(db_sql(sql), params)
+            return cur.fetchone()
+    return conn.execute(sql, params).fetchone()
+
+
+def db_fetchall(conn: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Any]:
+    if db_is_postgres():
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(db_sql(sql), params)
+            return list(cur.fetchall())
+    return conn.execute(sql, params).fetchall()
+
+
+def get_table_columns(conn: Any, table_name: str) -> set[str]:
+    if db_is_postgres():
+        rows = db_fetchall(
+            conn,
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = ?
+            """,
+            (table_name,),
+        )
+        return {str(row["column_name"]) for row in rows}
     rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     return {str(row[1]) for row in rows}
 
 
-def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
+def ensure_column(conn: Any, table_name: str, column_name: str, ddl: str) -> None:
     if column_name not in get_table_columns(conn, table_name):
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+        db_execute(conn, f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
 
-def find_recent_duplicate_request(conn: sqlite3.Connection, fingerprint: str, ttl_sec: int) -> Optional[sqlite3.Row]:
+def find_recent_duplicate_request(conn: Any, fingerprint: str, ttl_sec: int) -> Optional[Any]:
     cutoff = datetime.fromtimestamp(max(0, time.time() - ttl_sec), tz=timezone.utc).replace(microsecond=0).isoformat()
-    return conn.execute(
+    return db_fetchone(
+        conn,
         """
         SELECT request_id, created_at, email_status
         FROM pilot_requests
@@ -316,13 +376,14 @@ def find_recent_duplicate_request(conn: sqlite3.Connection, fingerprint: str, tt
         LIMIT 1
         """,
         (fingerprint, cutoff),
-    ).fetchone()
+    )
 
 
 def update_pilot_delivery_status(request_id: str, email_result: Dict[str, Optional[str]]) -> None:
     conn = get_db()
     try:
-        conn.execute(
+        db_execute(
+            conn,
             """
             UPDATE pilot_requests
             SET email_status = ?,
@@ -886,7 +947,11 @@ def build_recovery_support_message(packet: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def get_db() -> sqlite3.Connection:
+def get_db() -> Any:
+    if db_is_postgres():
+        if psycopg2 is None:
+            raise RuntimeError("Postgres backend requested but psycopg2-binary is not installed.")
+        return psycopg2.connect(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -897,28 +962,54 @@ def get_db() -> sqlite3.Connection:
 def ensure_db() -> None:
     conn = get_db()
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pilot_requests (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              request_id TEXT,
-              fingerprint TEXT,
-              created_at TEXT NOT NULL,
-              name TEXT NOT NULL,
-              company TEXT NOT NULL,
-              email TEXT NOT NULL,
-              volume TEXT,
-              notes TEXT NOT NULL,
-              source_ip TEXT,
-              user_agent TEXT,
-              origin TEXT,
-              email_status TEXT DEFAULT 'pending',
-              email_id TEXT,
-              email_error TEXT,
-              email_last_attempt_at TEXT
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS pilot_requests (
+                  id BIGSERIAL PRIMARY KEY,
+                  request_id TEXT,
+                  fingerprint TEXT,
+                  created_at TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  company TEXT NOT NULL,
+                  email TEXT NOT NULL,
+                  volume TEXT,
+                  notes TEXT NOT NULL,
+                  source_ip TEXT,
+                  user_agent TEXT,
+                  origin TEXT,
+                  email_status TEXT DEFAULT 'pending',
+                  email_id TEXT,
+                  email_error TEXT,
+                  email_last_attempt_at TEXT
+                )
+                """
             )
-            """
-        )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS pilot_requests (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  request_id TEXT,
+                  fingerprint TEXT,
+                  created_at TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  company TEXT NOT NULL,
+                  email TEXT NOT NULL,
+                  volume TEXT,
+                  notes TEXT NOT NULL,
+                  source_ip TEXT,
+                  user_agent TEXT,
+                  origin TEXT,
+                  email_status TEXT DEFAULT 'pending',
+                  email_id TEXT,
+                  email_error TEXT,
+                  email_last_attempt_at TEXT
+                )
+                """
+            )
         ensure_column(conn, "pilot_requests", "request_id", "TEXT")
         ensure_column(conn, "pilot_requests", "fingerprint", "TEXT")
         ensure_column(conn, "pilot_requests", "origin", "TEXT")
@@ -926,27 +1017,54 @@ def ensure_db() -> None:
         ensure_column(conn, "pilot_requests", "email_id", "TEXT")
         ensure_column(conn, "pilot_requests", "email_error", "TEXT")
         ensure_column(conn, "pilot_requests", "email_last_attempt_at", "TEXT")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pilot_requests_request_id ON pilot_requests(request_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pilot_requests_fingerprint_created_at ON pilot_requests(fingerprint, created_at)")
-        conn.execute(
-            """
-            UPDATE pilot_requests
-            SET request_id = COALESCE(request_id, 'ppf_' || lower(hex(randomblob(8))))
-            WHERE request_id IS NULL OR trim(request_id) = ''
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS api_access_log (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              created_at TEXT NOT NULL,
-              path TEXT NOT NULL,
-              access_mode TEXT NOT NULL,
-              client_label TEXT NOT NULL,
-              source_ip TEXT NOT NULL
+        db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_pilot_requests_request_id ON pilot_requests(request_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_pilot_requests_fingerprint_created_at ON pilot_requests(fingerprint, created_at)")
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                UPDATE pilot_requests
+                SET request_id = 'ppf_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)
+                WHERE request_id IS NULL OR trim(request_id) = ''
+                """
             )
-            """
-        )
+        else:
+            db_execute(
+                conn,
+                """
+                UPDATE pilot_requests
+                SET request_id = COALESCE(request_id, 'ppf_' || lower(hex(randomblob(8))))
+                WHERE request_id IS NULL OR trim(request_id) = ''
+                """
+            )
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS api_access_log (
+                  id BIGSERIAL PRIMARY KEY,
+                  created_at TEXT NOT NULL,
+                  path TEXT NOT NULL,
+                  access_mode TEXT NOT NULL,
+                  client_label TEXT NOT NULL,
+                  source_ip TEXT NOT NULL
+                )
+                """
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS api_access_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at TEXT NOT NULL,
+                  path TEXT NOT NULL,
+                  access_mode TEXT NOT NULL,
+                  client_label TEXT NOT NULL,
+                  source_ip TEXT NOT NULL
+                )
+                """
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1057,6 +1175,7 @@ def health():
         "rpc_configured": configured,
         "configured_networks": live_networks,
         "api_status": "live",
+        "db_backend": DB_BACKEND,
     })
 
 
@@ -1529,7 +1648,8 @@ def pilot_request():
                 request_id=str(duplicate["request_id"]),
             )
 
-        conn.execute(
+        db_execute(
+            conn,
             """
             INSERT INTO pilot_requests(
                 request_id, fingerprint, created_at, name, company, email, volume, notes,
@@ -1721,7 +1841,8 @@ def log_api_access(path: str) -> None:
         return
     conn = get_db()
     try:
-        conn.execute(
+        db_execute(
+            conn,
             "INSERT INTO api_access_log(created_at, path, access_mode, client_label, source_ip) VALUES (?, ?, ?, ?, ?)",
             (
                 utc_now_iso(),
