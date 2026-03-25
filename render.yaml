@@ -22,3 +22,10 @@ services:
         value: 10
       - key: ADDRESS_CACHE_TTL_SEC
         value: 600
+
+      - key: PUBLIC_API_BASE
+        value: https://payeeproof-api.onrender.com
+      - key: WEBHOOK_RETRY_SCHEDULE_SEC
+        value: 60,300,1800,7200
+      - key: WEBHOOK_PROCESS_BATCH_SIZE
+        value: 5
