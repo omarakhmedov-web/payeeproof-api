@@ -15,7 +15,7 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-APP_VERSION = "1.2.1-recovery-auto"
+APP_VERSION = "1.2.2-recovery-auto-network-fix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -577,7 +577,7 @@ def build_recovery_support_packet(
 
     packet = {
         "checked_at": checked_at,
-        "chain": effective_chain,
+        "chain": chain,
         "verdict": verdict_label,
         "outcome": outcome,
         "confidence": confidence,
@@ -854,7 +854,7 @@ def preflight_check():
         "service": "preflight-check",
         "version": APP_VERSION,
         "checked_at": checked_at,
-        "chain": effective_chain,
+        "chain": provided_chain,
         "status": outcome["status"],
         "verdict": outcome["verdict"],
         "reason_code": outcome["reason_code"],
@@ -868,7 +868,7 @@ def preflight_check():
         "checks": checks,
         "proof": {
             "checked_at": checked_at,
-        "chain": effective_chain,
+            "chain": provided_chain,
             "verdict": outcome["verdict"],
             "confidence": outcome["confidence"],
             "reason_code": outcome["reason_code"],
@@ -1559,7 +1559,7 @@ def analyze_evm_transaction(chain: str, tx_hash: str, issue_type: str, intended_
         }
 
     summary, recoverability, next_actions, reason_code = build_evm_recovery_guidance(
-        chain=effective_chain,
+        chain=chain,
         issue_type=issue_type,
         intended_address=intended_address,
         intended_chain=intended_chain,
