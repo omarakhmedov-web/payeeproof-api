@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, jsonify, request
@@ -36,6 +37,8 @@ CHAIN_ALIASES = {
 }
 
 EVM_CHAINS = {"ethereum", "arbitrum", "base", "polygon", "bsc"}
+EVM_CHAIN_ORDER = ["ethereum", "arbitrum", "base", "polygon", "bsc"]
+SOLANA_SIG_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{43,100}$")
 PERSONAL_EMAIL_DOMAINS = {
     "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com",
     "yahoo.com", "ymail.com", "rocketmail.com", "icloud.com", "me.com", "mac.com",
@@ -574,6 +577,7 @@ def build_recovery_support_packet(
 
     packet = {
         "checked_at": checked_at,
+        "chain": effective_chain,
         "verdict": verdict_label,
         "outcome": outcome,
         "confidence": confidence,
@@ -850,6 +854,7 @@ def preflight_check():
         "service": "preflight-check",
         "version": APP_VERSION,
         "checked_at": checked_at,
+        "chain": effective_chain,
         "status": outcome["status"],
         "verdict": outcome["verdict"],
         "reason_code": outcome["reason_code"],
@@ -863,6 +868,7 @@ def preflight_check():
         "checks": checks,
         "proof": {
             "checked_at": checked_at,
+        "chain": effective_chain,
             "verdict": outcome["verdict"],
             "confidence": outcome["confidence"],
             "reason_code": outcome["reason_code"],
@@ -899,6 +905,135 @@ def preflight_check():
     })
 
 
+def is_likely_evm_tx_hash(value: str) -> bool:
+    text = str(value or '').strip()
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{64}", text))
+
+
+def is_likely_solana_signature(value: str) -> bool:
+    text = str(value or '').strip()
+    return bool(SOLANA_SIG_RE.fullmatch(text))
+
+
+def ordered_candidates(candidates: List[str], preferred: str = '') -> List[str]:
+    out: List[str] = []
+    preferred = normalize_chain(preferred)
+    if preferred and preferred in candidates:
+        out.append(preferred)
+    for item in candidates:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def analyze_transaction_on_chain(chain: str, tx_hash: str, issue_type: str, intended_address: str, intended_chain: str) -> Dict[str, Any]:
+    if chain in EVM_CHAINS:
+        return analyze_evm_transaction(chain, tx_hash, issue_type, intended_address, intended_chain)
+    if chain == 'solana':
+        return analyze_solana_transaction(tx_hash, issue_type, intended_address, intended_chain)
+    return {
+        'status': 'unavailable',
+        'reason_code': 'UNSUPPORTED_CHAIN',
+        'summary': f'Unsupported chain: {chain}',
+        'recoverability': 'unknown',
+        'next_actions': ['Choose a supported network and try again.'],
+        'observed': {'chain': chain, 'tx_hash': tx_hash},
+    }
+
+
+def auto_detect_recovery_chain(tx_hash: str, issue_type: str, intended_address: str, intended_chain: str) -> Tuple[str, Dict[str, Any]]:
+    if is_likely_evm_tx_hash(tx_hash):
+        candidates = ordered_candidates(EVM_CHAIN_ORDER, intended_chain)
+    elif is_likely_solana_signature(tx_hash):
+        candidates = ['solana']
+    else:
+        candidates = ordered_candidates(EVM_CHAIN_ORDER + ['solana'], intended_chain)
+
+    results: Dict[str, Dict[str, Any]] = {}
+    max_workers = min(len(candidates), 5) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(analyze_transaction_on_chain, chain, tx_hash, issue_type, intended_address, intended_chain): chain
+            for chain in candidates
+        }
+        for future in as_completed(future_map):
+            chain = future_map[future]
+            try:
+                result = future.result() or {}
+            except Exception as exc:
+                result = {
+                    'status': 'unavailable',
+                    'reason_code': 'AUTO_DETECT_ERROR',
+                    'summary': f'Auto-detect error on {chain}: {exc}',
+                    'recoverability': 'unknown',
+                    'next_actions': ['Retry the lookup or choose the exact network manually.'],
+                    'observed': {'chain': chain, 'tx_hash': tx_hash},
+                }
+            result['auto_detected'] = True
+            result['candidate_chain'] = chain
+            results[chain] = result
+
+    found_chains = [chain for chain in candidates if str((results.get(chain) or {}).get('status')) in {'found', 'reverted'}]
+    if found_chains:
+        selected_chain = found_chains[0]
+        selected = dict(results[selected_chain])
+        observed = dict(selected.get('observed') or {})
+        observed['chain'] = selected_chain
+        selected['observed'] = observed
+        selected['auto_detected'] = True
+        selected['auto_detect_scope'] = candidates
+        selected['auto_detect_summary'] = f'Network auto-detected as {selected_chain}.'
+        return selected_chain, selected
+
+    not_found_chains = [chain for chain in candidates if str((results.get(chain) or {}).get('status')) == 'not_found']
+    unavailable_chains = [chain for chain in candidates if str((results.get(chain) or {}).get('status')) == 'unavailable']
+
+    if len(not_found_chains) == len(candidates):
+        return 'auto', {
+            'status': 'not_found',
+            'reason_code': 'TX_NOT_FOUND_ANY_SUPPORTED_CHAIN',
+            'summary': 'Transaction was not found across the supported auto-detect network scope.',
+            'recoverability': 'unknown',
+            'next_actions': [
+                'Verify the transaction hash carefully.',
+                'If you know the network, select it manually and retry.',
+                'If this came from an exchange or wallet app, ask them which network the transfer used.'
+            ],
+            'observed': {'chain': 'auto', 'tx_hash': tx_hash},
+            'auto_detected': True,
+            'auto_detect_scope': candidates,
+        }
+
+    if unavailable_chains and not found_chains:
+        return 'auto', {
+            'status': 'unavailable',
+            'reason_code': 'AUTO_DETECT_INCONCLUSIVE',
+            'summary': 'Auto-detect could not confirm the network because one or more chain lookups were unavailable.',
+            'recoverability': 'unknown',
+            'next_actions': [
+                'Retry once in a moment.',
+                'If you know the network, select it manually for a narrower lookup.',
+                'If the sender used an exchange or wallet app, ask them which network the transfer used.'
+            ],
+            'observed': {'chain': 'auto', 'tx_hash': tx_hash},
+            'auto_detected': True,
+            'auto_detect_scope': candidates,
+            'auto_detect_results': {chain: {
+                'status': (results.get(chain) or {}).get('status'),
+                'reason_code': (results.get(chain) or {}).get('reason_code'),
+            } for chain in candidates},
+        }
+
+    fallback_chain = candidates[0] if candidates else 'auto'
+    fallback = dict(results.get(fallback_chain) or {})
+    observed = dict(fallback.get('observed') or {})
+    observed['chain'] = fallback_chain
+    fallback['observed'] = observed
+    fallback['auto_detected'] = True
+    fallback['auto_detect_scope'] = candidates
+    return fallback_chain, fallback
+
+
 @app.post("/api/recovery-copilot")
 def recovery_copilot():
     payload = request.get_json(silent=True) or {}
@@ -908,20 +1043,19 @@ def recovery_copilot():
     intended_address = str(payload.get("intended_address") or "").strip()
     intended_chain = normalize_chain(payload.get("intended_chain") or "") if payload.get("intended_chain") else ""
 
-    if not chain:
-        raise ApiError("chain is required.")
     if not tx_hash:
         raise ApiError("tx_hash is required.")
 
-    if chain in EVM_CHAINS:
-        analysis = analyze_evm_transaction(chain, tx_hash, issue_type, intended_address, intended_chain)
-    elif chain == "solana":
-        analysis = analyze_solana_transaction(tx_hash, issue_type, intended_address, intended_chain)
+    if not chain or chain == "auto":
+        chain, analysis = auto_detect_recovery_chain(tx_hash, issue_type, intended_address, intended_chain)
+    elif chain in EVM_CHAINS or chain == "solana":
+        analysis = analyze_transaction_on_chain(chain, tx_hash, issue_type, intended_address, intended_chain)
     else:
         raise ApiError(f"Unsupported chain: {chain}")
 
     observed = analysis.get("observed") or {}
-    destination_profile = build_destination_profile(chain, str(observed.get("destination") or ""), {
+    effective_chain = normalize_chain(str(observed.get("chain") or chain or "")) or chain or "auto"
+    destination_profile = build_destination_profile(effective_chain if effective_chain != 'auto' else '', str(observed.get("destination") or ""), {
         "address_type": observed.get("destination_type") or "unknown",
         "rpc_used": bool(observed.get("destination") and analysis.get("status") not in {"unavailable", "not_found"}),
     })
@@ -930,7 +1064,7 @@ def recovery_copilot():
     why = build_recovery_explanation(analysis, destination_profile)
     checked_at = utc_now_iso()
     support_packet = build_recovery_support_packet(
-        chain=chain,
+        chain=effective_chain,
         tx_hash=tx_hash,
         issue_type=issue_type,
         analysis=analysis,
@@ -947,6 +1081,7 @@ def recovery_copilot():
         "service": "recovery-copilot",
         "version": APP_VERSION,
         "checked_at": checked_at,
+        "chain": effective_chain,
         "outcome": outcome,
         "confidence": confidence,
         "why_this_result": why,
@@ -959,6 +1094,7 @@ def recovery_copilot():
         "support_message": support_message,
         "proof": {
             "checked_at": checked_at,
+        "chain": effective_chain,
             "outcome": outcome,
             "confidence": confidence,
             "reason_code": analysis.get("reason_code"),
@@ -1423,7 +1559,7 @@ def analyze_evm_transaction(chain: str, tx_hash: str, issue_type: str, intended_
         }
 
     summary, recoverability, next_actions, reason_code = build_evm_recovery_guidance(
-        chain=chain,
+        chain=effective_chain,
         issue_type=issue_type,
         intended_address=intended_address,
         intended_chain=intended_chain,
