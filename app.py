@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 import uuid
+import logging
 
 try:
     import psycopg2
@@ -23,10 +24,10 @@ from threading import Lock
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, g, jsonify, request
+from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "1.5.0-postgres-pilot-storage"
+APP_VERSION = "1.6.0-observability-funnel"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -161,11 +162,25 @@ PILOT_MIN_FILL_SEC = int(os.getenv("PILOT_MIN_FILL_SEC", "3"))
 PILOT_MAX_NOTES_LEN = int(os.getenv("PILOT_MAX_NOTES_LEN", "2500"))
 MAX_CONTENT_LENGTH_BYTES = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", "32768"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_BYTES
+OBSERVABILITY_WINDOW_SEC = int(os.getenv("OBSERVABILITY_WINDOW_SEC", "900"))
+OBSERVABILITY_MIN_REQUESTS = int(os.getenv("OBSERVABILITY_MIN_REQUESTS", "8"))
+ALERT_ERROR_RATE_THRESHOLD = float(os.getenv("ALERT_ERROR_RATE_THRESHOLD", "0.35"))
+ALERT_TIMEOUT_RATE_THRESHOLD = float(os.getenv("ALERT_TIMEOUT_RATE_THRESHOLD", "0.20"))
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "600"))
 
 RATE_LIMIT_BUCKETS: Dict[str, deque] = {}
 RATE_LIMIT_LOCK = Lock()
 PILOT_DEDUP_CACHE: Dict[str, float] = {}
 PILOT_DEDUP_LOCK = Lock()
+ALERT_STATE: Dict[str, float] = {}
+ALERT_LOCK = Lock()
+logger = logging.getLogger("payeeproof")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
 API_SCOPE_BY_PATH = {
     "/api/preflight-check": "preflight",
     "/api/recovery-copilot": "recovery",
@@ -229,6 +244,305 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
 
 PUBLIC_DEMO_HOSTS = _split_origin_hosts(PUBLIC_DEMO_ORIGINS)
 API_KEYS = load_api_keys()
+
+
+def current_request_id() -> str:
+    if has_request_context() and getattr(g, "request_id", None):
+        return str(g.request_id)
+    return ""
+
+
+def ensure_request_id() -> str:
+    incoming = str(request.headers.get("X-Request-ID") or request.headers.get("X-Correlation-ID") or "").strip()
+    if incoming:
+        return incoming[:128]
+    return f"req_{uuid.uuid4().hex[:16]}"
+
+
+def request_duration_ms() -> int:
+    started = getattr(g, "request_started_at", None)
+    if started is None:
+        return 0
+    return max(0, int((time.perf_counter() - started) * 1000))
+
+
+def json_dumps_safe(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def emit_structured_log(event: str, level: str = "info", **fields: Any) -> None:
+    payload = {
+        "ts": utc_now_iso(),
+        "level": level.upper(),
+        "service": "payeeproof-api",
+        "version": APP_VERSION,
+        "event": event,
+    }
+    request_id = current_request_id()
+    if request_id:
+        payload["request_id"] = request_id
+    payload.update({k: v for k, v in fields.items() if v is not None})
+    log_method = getattr(logger, str(level or "info").lower(), logger.info)
+    log_method(json_dumps_safe(payload))
+
+
+def looks_like_timeout(value: Any) -> bool:
+    text = str(value or "").lower()
+    if not text:
+        return False
+    return "timeout" in text or "timed out" in text or "read timed out" in text or "connect timeout" in text
+
+
+def normalize_metric_status(status: Any, http_status: int) -> str:
+    raw = str(status or "").strip().lower()
+    if raw in {"ok", "success", "safe", "found", "ready", "review_required", "blocked", "not_found", "reverted"}:
+        return "success"
+    if raw in {"error", "failed", "invalid"}:
+        return "error"
+    if raw in {"timeout"}:
+        return "timeout"
+    if raw in {"rejected", "filtered", "deduplicated"}:
+        return "rejected"
+    if http_status >= 500:
+        return "error"
+    if http_status >= 400:
+        return "rejected"
+    if raw in {"unavailable", "degraded", "partial"}:
+        return "degraded"
+    return "success"
+
+
+def current_access_meta() -> Dict[str, str]:
+    access = getattr(g, "api_access", None) or {}
+    return {
+        "access_mode": str(access.get("mode") or "public"),
+        "client_label": str(access.get("client") or "website"),
+    }
+
+
+def infer_network_from_payload(path: str, payload: Optional[Dict[str, Any]]) -> str:
+    payload = payload or {}
+    if path == "/api/preflight-check":
+        provided = payload.get("provided") or {}
+        expected = payload.get("expected") or {}
+        return normalize_chain(provided.get("network") or provided.get("chain") or expected.get("network") or expected.get("chain") or "")
+    if path == "/api/recovery-copilot":
+        return normalize_chain(payload.get("network") or payload.get("chain") or payload.get("intended_chain") or "")
+    if path == "/pilot-request":
+        return "pilot"
+    return ""
+
+
+def current_json_payload() -> Dict[str, Any]:
+    try:
+        payload = request.get_json(silent=True)
+    except Exception:
+        payload = None
+    return payload if isinstance(payload, dict) else {}
+
+
+def record_request_event(
+    *,
+    event_name: str,
+    endpoint: str,
+    status: str,
+    reason_code: str = "",
+    network: str = "",
+    http_status: int = 200,
+    timeout_flag: bool = False,
+    error_message: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    meta = current_access_meta()
+    payload_meta = metadata or {}
+    record = {
+        "created_at": utc_now_iso(),
+        "request_id": current_request_id(),
+        "event_name": event_name,
+        "endpoint": endpoint,
+        "status": normalize_metric_status(status, http_status),
+        "reason_code": str(reason_code or "").strip(),
+        "network": str(network or "").strip(),
+        "http_status": int(http_status),
+        "timeout_flag": 1 if timeout_flag else 0,
+        "duration_ms": request_duration_ms(),
+        "access_mode": meta["access_mode"],
+        "client_label": meta["client_label"],
+        "source_ip": get_client_ip(),
+        "error_message": (str(error_message or "")[:500] if error_message else ""),
+        "metadata_json": json_dumps_safe(payload_meta) if payload_meta else "",
+    }
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            INSERT INTO event_log(
+                created_at, request_id, event_name, endpoint, status, reason_code, network,
+                http_status, timeout_flag, duration_ms, access_mode, client_label, source_ip,
+                error_message, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["created_at"],
+                record["request_id"],
+                record["event_name"],
+                record["endpoint"],
+                record["status"],
+                record["reason_code"],
+                record["network"],
+                record["http_status"],
+                record["timeout_flag"],
+                record["duration_ms"],
+                record["access_mode"],
+                record["client_label"],
+                record["source_ip"],
+                record["error_message"],
+                record["metadata_json"],
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        emit_structured_log(
+            "observability_write_failed",
+            level="warning",
+            endpoint=endpoint,
+            event_name=event_name,
+            error=str(exc),
+        )
+    finally:
+        conn.close()
+
+    emit_structured_log(
+        event_name,
+        level="warning" if (timeout_flag or http_status >= 500) else "info",
+        endpoint=endpoint,
+        status=record["status"],
+        reason_code=record["reason_code"],
+        network=record["network"],
+        http_status=http_status,
+        timeout=bool(timeout_flag),
+        duration_ms=record["duration_ms"],
+        access_mode=record["access_mode"],
+        client_label=record["client_label"],
+    )
+    evaluate_recent_alerts(trigger_event=record)
+    if has_request_context():
+        g.event_logged = True
+
+
+def event_name_for_path(path: str) -> str:
+    return {
+        "/api/preflight-check": "preflight_run",
+        "/api/recovery-copilot": "recovery_run",
+        "/pilot-request": "pilot_submit_fail",
+    }.get(path.rstrip("/") or path, "request_event")
+
+
+def record_request_failure(path: str, status_code: int, message: str) -> None:
+    payload = current_json_payload()
+    timeout_flag = looks_like_timeout(message)
+    event_name = event_name_for_path(path)
+    if path == "/pilot-request" and status_code < 500:
+        event_name = "pilot_submit_fail"
+    record_request_event(
+        event_name=event_name,
+        endpoint=path,
+        status="timeout" if timeout_flag else "error",
+        reason_code=("TIMEOUT" if timeout_flag else f"HTTP_{status_code}"),
+        network=infer_network_from_payload(path, payload),
+        http_status=status_code,
+        timeout_flag=timeout_flag,
+        error_message=message,
+        metadata={"path": path},
+    )
+
+
+def get_recent_event_rows(window_sec: int = OBSERVABILITY_WINDOW_SEC) -> List[Any]:
+    cutoff = datetime.fromtimestamp(max(0, time.time() - window_sec), tz=timezone.utc).replace(microsecond=0).isoformat()
+    conn = get_db()
+    try:
+        rows = db_fetchall(
+            conn,
+            """
+            SELECT created_at, event_name, endpoint, status, reason_code, network, http_status, timeout_flag, duration_ms
+            FROM event_log
+            WHERE created_at >= ?
+            ORDER BY id DESC
+            """,
+            (cutoff,),
+        )
+        return rows
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def build_metrics_snapshot(window_sec: int = OBSERVABILITY_WINDOW_SEC) -> Dict[str, Any]:
+    rows = get_recent_event_rows(window_sec)
+    summary: Dict[str, Any] = {
+        "window_sec": window_sec,
+        "total_requests": len(rows),
+        "success": 0,
+        "error": 0,
+        "timeout": 0,
+        "rejected": 0,
+        "degraded": 0,
+        "by_event": {},
+        "by_network": {},
+    }
+    for row in rows:
+        status = str(row["status"] if isinstance(row, dict) else row[3])
+        event_name = str(row["event_name"] if isinstance(row, dict) else row[1])
+        network = str((row["network"] if isinstance(row, dict) else row[5]) or "unknown")
+        summary[status] = summary.get(status, 0) + 1
+        bucket = summary["by_event"].setdefault(event_name, {"total": 0, "success": 0, "error": 0, "timeout": 0, "rejected": 0, "degraded": 0})
+        bucket["total"] += 1
+        bucket[status] = bucket.get(status, 0) + 1
+        n_bucket = summary["by_network"].setdefault(network or "unknown", {"total": 0, "success": 0, "error": 0, "timeout": 0, "rejected": 0, "degraded": 0})
+        n_bucket["total"] += 1
+        n_bucket[status] = n_bucket.get(status, 0) + 1
+    return summary
+
+
+def evaluate_recent_alerts(trigger_event: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    snapshot = build_metrics_snapshot(OBSERVABILITY_WINDOW_SEC)
+    alerts: List[Dict[str, Any]] = []
+    for event_name, stats in snapshot.get("by_event", {}).items():
+        total = int(stats.get("total", 0))
+        if total < OBSERVABILITY_MIN_REQUESTS:
+            continue
+        error_rate = (stats.get("error", 0) + stats.get("rejected", 0)) / max(1, total)
+        timeout_rate = stats.get("timeout", 0) / max(1, total)
+        if error_rate >= ALERT_ERROR_RATE_THRESHOLD:
+            alerts.append({
+                "level": "warning",
+                "type": "high_error_rate",
+                "event_name": event_name,
+                "total": total,
+                "error_rate": round(error_rate, 3),
+                "window_sec": OBSERVABILITY_WINDOW_SEC,
+            })
+        if timeout_rate >= ALERT_TIMEOUT_RATE_THRESHOLD:
+            alerts.append({
+                "level": "warning",
+                "type": "high_timeout_rate",
+                "event_name": event_name,
+                "total": total,
+                "timeout_rate": round(timeout_rate, 3),
+                "window_sec": OBSERVABILITY_WINDOW_SEC,
+            })
+    now = time.time()
+    if trigger_event and alerts:
+        with ALERT_LOCK:
+            for alert in alerts:
+                key = f"{alert['type']}:{alert['event_name']}"
+                last_sent = ALERT_STATE.get(key, 0.0)
+                if now - last_sent >= ALERT_COOLDOWN_SEC:
+                    ALERT_STATE[key] = now
+                    emit_structured_log("alert_triggered", level="warning", **alert)
+    return alerts
 
 
 def get_client_ip() -> str:
@@ -419,6 +733,7 @@ def pilot_ack_response(
         "message": message,
         "stored": stored,
         "email_notification": email_notification,
+        "trace_id": current_request_id(),
     }
     if submitted_at:
         payload["submitted_at"] = submitted_at
@@ -1065,6 +1380,57 @@ def ensure_db() -> None:
                 )
                 """
             )
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS event_log (
+                  id BIGSERIAL PRIMARY KEY,
+                  created_at TEXT NOT NULL,
+                  request_id TEXT,
+                  event_name TEXT NOT NULL,
+                  endpoint TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  reason_code TEXT,
+                  network TEXT,
+                  http_status INTEGER NOT NULL,
+                  timeout_flag INTEGER DEFAULT 0,
+                  duration_ms INTEGER DEFAULT 0,
+                  access_mode TEXT,
+                  client_label TEXT,
+                  source_ip TEXT,
+                  error_message TEXT,
+                  metadata_json TEXT
+                )
+                """
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS event_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at TEXT NOT NULL,
+                  request_id TEXT,
+                  event_name TEXT NOT NULL,
+                  endpoint TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  reason_code TEXT,
+                  network TEXT,
+                  http_status INTEGER NOT NULL,
+                  timeout_flag INTEGER DEFAULT 0,
+                  duration_ms INTEGER DEFAULT 0,
+                  access_mode TEXT,
+                  client_label TEXT,
+                  source_ip TEXT,
+                  error_message TEXT,
+                  metadata_json TEXT
+                )
+                """
+            )
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_created_at ON event_log(created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_event_name_created_at ON event_log(event_name, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_network_created_at ON event_log(network, created_at)")
         conn.commit()
     finally:
         conn.close()
@@ -1075,6 +1441,9 @@ ensure_db()
 
 @app.before_request
 def apply_access_controls():
+    g.request_started_at = time.perf_counter()
+    g.request_id = ensure_request_id()
+    g.event_logged = False
     if request.method == "OPTIONS":
         return None
 
@@ -1125,6 +1494,8 @@ def apply_access_controls():
 @app.after_request
 def attach_response_headers(response):
     response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("X-Request-ID", current_request_id())
+    response.headers.setdefault("X-Response-Time-Ms", str(request_duration_ms()))
     meta = getattr(g, "rate_limit_meta", None)
     if meta:
         response.headers.setdefault("X-RateLimit-Limit", str(meta.get("limit", 0)))
@@ -1155,18 +1526,26 @@ class ApiError(Exception):
 
 @app.errorhandler(ApiError)
 def handle_api_error(err: ApiError):
-    return jsonify({"ok": False, "error": err.message}), err.status_code
+    if not getattr(g, "event_logged", False):
+        record_request_failure(request.path, err.status_code, err.message)
+    return jsonify({"ok": False, "error": err.message, "trace_id": current_request_id()}), err.status_code
 
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(err: Exception):
-    return jsonify({"ok": False, "error": f"Unexpected server error: {type(err).__name__}"}), 500
+    message = f"Unexpected server error: {type(err).__name__}"
+    if not getattr(g, "event_logged", False):
+        record_request_failure(request.path, 500, message)
+    emit_structured_log("unhandled_exception", level="error", path=request.path, error_type=type(err).__name__)
+    return jsonify({"ok": False, "error": message, "trace_id": current_request_id()}), 500
 
 
 @app.get("/health")
 def health():
     configured = {k: bool(v) for k, v in RPC_URLS.items()}
     live_networks = [k for k, v in configured.items() if v]
+    metrics = build_metrics_snapshot(OBSERVABILITY_WINDOW_SEC)
+    alerts = evaluate_recent_alerts()
     return jsonify({
         "ok": True,
         "service": "payeeproof-api",
@@ -1176,6 +1555,13 @@ def health():
         "configured_networks": live_networks,
         "api_status": "live",
         "db_backend": DB_BACKEND,
+        "trace_id": current_request_id(),
+        "observability": {
+            "request_id_header": "X-Request-ID",
+            "metrics_window_sec": OBSERVABILITY_WINDOW_SEC,
+            "metrics": metrics,
+            "alerts": alerts,
+        },
     })
 
 
@@ -1322,10 +1708,25 @@ def preflight_check():
 
     checked_at = utc_now_iso()
     log_api_access("/api/preflight-check")
+    record_request_event(
+        event_name="preflight_run",
+        endpoint="/api/preflight-check",
+        status=outcome["status"],
+        reason_code=outcome["reason_code"],
+        network=provided_chain,
+        http_status=200,
+        timeout_flag=looks_like_timeout(provided_onchain.get("details")) or looks_like_timeout(expected_onchain.get("details")),
+        metadata={
+            "verdict": outcome["verdict"],
+            "next_action": outcome["next_action"],
+            "risk_flags": sorted(set(risk_flags)),
+        },
+    )
     return jsonify({
         "ok": True,
         "service": "preflight-check",
         "version": APP_VERSION,
+        "trace_id": current_request_id(),
         "checked_at": checked_at,
         "chain": provided_chain,
         "status": outcome["status"],
@@ -1342,6 +1743,7 @@ def preflight_check():
         "proof": {
             "checked_at": checked_at,
             "chain": provided_chain,
+            "trace_id": current_request_id(),
             "verdict": outcome["verdict"],
             "confidence": outcome["confidence"],
             "reason_code": outcome["reason_code"],
@@ -1549,11 +1951,26 @@ def recovery_copilot():
         why=why,
     )
     support_message = build_recovery_support_message(support_packet)
+    record_request_event(
+        event_name="recovery_run",
+        endpoint="/api/recovery-copilot",
+        status=analysis.get("status") or outcome,
+        reason_code=analysis.get("reason_code") or "",
+        network=effective_chain,
+        http_status=200,
+        timeout_flag=looks_like_timeout(analysis.get("summary")) or looks_like_timeout((analysis.get("observed") or {}).get("details")),
+        metadata={
+            "outcome": outcome,
+            "recoverability": analysis.get("recoverability"),
+            "auto_detected": bool(analysis.get("auto_detected")),
+        },
+    )
 
     return jsonify({
         "ok": True,
         "service": "recovery-copilot",
         "version": APP_VERSION,
+        "trace_id": current_request_id(),
         "checked_at": checked_at,
         "chain": effective_chain,
         "outcome": outcome,
@@ -1568,7 +1985,8 @@ def recovery_copilot():
         "support_message": support_message,
         "proof": {
             "checked_at": checked_at,
-        "chain": effective_chain,
+            "chain": effective_chain,
+            "trace_id": current_request_id(),
             "outcome": outcome,
             "confidence": confidence,
             "reason_code": analysis.get("reason_code"),
@@ -1584,6 +2002,15 @@ def pilot_request():
     form_started_at_raw = payload.get("form_started_at")
 
     if honeypot_value:
+        record_request_event(
+            event_name="pilot_submit_fail",
+            endpoint="/pilot-request",
+            status="rejected",
+            reason_code="HONEYPOT_TRIGGERED",
+            network="pilot",
+            http_status=200,
+            metadata={"filter": "honeypot"},
+        )
         return pilot_ack_response(
             "Your request has been sent successfully.",
             stored=False,
@@ -1598,6 +2025,15 @@ def pilot_request():
                 started_at_value = started_at_value / 1000.0
             age_sec = time.time() - started_at_value
             if 0 <= age_sec < PILOT_MIN_FILL_SEC:
+                record_request_event(
+                    event_name="pilot_submit_fail",
+                    endpoint="/pilot-request",
+                    status="rejected",
+                    reason_code="MIN_FILL_TIME",
+                    network="pilot",
+                    http_status=200,
+                    metadata={"filter": "speed_guard"},
+                )
                 return pilot_ack_response(
                     "Your request has been sent successfully.",
                     stored=False,
@@ -1639,6 +2075,15 @@ def pilot_request():
     try:
         duplicate = find_recent_duplicate_request(conn, fingerprint, PILOT_DUPLICATE_TTL_SEC)
         if duplicate:
+            record_request_event(
+                event_name="pilot_submit_fail",
+                endpoint="/pilot-request",
+                status="rejected",
+                reason_code="DUPLICATE_REQUEST",
+                network="pilot",
+                http_status=200,
+                metadata={"existing_request_id": str(duplicate["request_id"])},
+            )
             return pilot_ack_response(
                 "This pilot request is already in review.",
                 submitted_at=str(duplicate["created_at"]),
@@ -1691,34 +2136,66 @@ def pilot_request():
     update_pilot_delivery_status(request_id, email_result)
 
     if email_result.get("status") == "sent":
+        record_request_event(
+            event_name="pilot_submit_success",
+            endpoint="/pilot-request",
+            status="success",
+            reason_code="EMAIL_SENT",
+            network="pilot",
+            http_status=200,
+            metadata={"request_id": request_id, "email_notification": "sent"},
+        )
         return jsonify({
             "ok": True,
             "message": "Your request was recorded successfully.",
             "stored": True,
             "persisted": True,
             "request_id": request_id,
+            "trace_id": current_request_id(),
             "email_notification": "sent",
             "email_id": email_result.get("email_id"),
             "submitted_at": created_at,
         })
 
     if email_result.get("status") == "not_configured":
+        record_request_event(
+            event_name="pilot_submit_success",
+            endpoint="/pilot-request",
+            status="degraded",
+            reason_code="EMAIL_NOT_CONFIGURED",
+            network="pilot",
+            http_status=200,
+            metadata={"request_id": request_id, "email_notification": "not_configured"},
+        )
         return jsonify({
             "ok": True,
             "message": "Your request was recorded successfully, but email forwarding is not configured yet.",
             "stored": True,
             "persisted": True,
             "request_id": request_id,
+            "trace_id": current_request_id(),
             "email_notification": "not_configured",
             "submitted_at": created_at,
         }), 200
 
+    record_request_event(
+        event_name="pilot_submit_success",
+        endpoint="/pilot-request",
+        status="degraded",
+        reason_code="EMAIL_FORWARDING_DELAYED",
+        network="pilot",
+        http_status=200,
+        timeout_flag=looks_like_timeout(email_result.get("debug_detail")),
+        error_message=str(email_result.get("debug_detail") or ""),
+        metadata={"request_id": request_id, "email_notification": "failed"},
+    )
     return jsonify({
         "ok": True,
         "message": "Your request was recorded successfully, but email forwarding is delayed right now.",
         "stored": True,
         "persisted": True,
         "request_id": request_id,
+        "trace_id": current_request_id(),
         "email_notification": "failed",
         "submitted_at": created_at,
         "debug_detail": email_result.get("debug_detail"),
@@ -1839,6 +2316,12 @@ def log_api_access(path: str) -> None:
     access = getattr(g, "api_access", None) or {}
     if not access:
         return
+    emit_structured_log(
+        "api_access",
+        endpoint=path,
+        access_mode=str(access.get("mode") or "unknown"),
+        client_label=str(access.get("client") or "unknown-client"),
+    )
     conn = get_db()
     try:
         db_execute(
