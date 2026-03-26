@@ -28,7 +28,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "1.8.0-usage-ledger"
+APP_VERSION = "1.9.0-tenancy-foundation"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -200,6 +200,47 @@ API_SCOPE_BY_PATH = {
     "/api/usage-summary": "records",
 }
 
+ALLOWED_ENVIRONMENTS = {"live", "test", "sandbox", "staging", "production", "public-demo"}
+ALLOWED_ROLES = {"owner", "admin", "client", "viewer", "demo"}
+
+
+def normalize_environment(value: Any, default: str = "live") -> str:
+    text = str(value or default).strip().lower()
+    if not text:
+        text = default
+    if text not in ALLOWED_ENVIRONMENTS:
+        if text in {"prod", "main", "mainnet"}:
+            return "live"
+        if text in {"dev", "qa"}:
+            return "test"
+        return default
+    return text
+
+
+def normalize_role(value: Any, default: str = "client") -> str:
+    text = str(value or default).strip().lower()
+    if not text:
+        text = default
+    if text not in ALLOWED_ROLES:
+        if text in {"read_only", "readonly"}:
+            return "viewer"
+        return default
+    return text
+
+
+def api_key_fingerprint(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def api_key_hint(value: str) -> str:
+    token = str(value or "").strip()
+    if len(token) <= 8:
+        return token
+    return f"{token[:6]}...{token[-4:]}"
+
 
 def resolve_required_api_scope(path: str) -> str:
     normalized = path.rstrip("/") or "/"
@@ -272,28 +313,32 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
             or item.get("client_label")
             or item.get("name")
             or "unknown-client"
-        ).strip()
+        ).strip()[:120]
+        tenant_value = str(item.get("tenant_id") or client_value).strip()[:120]
         label_value = str(
             item.get("label")
             or item.get("name")
             or item.get("client_label")
             or item.get("client")
             or client_value
-        ).strip()
+        ).strip()[:160]
         loaded[key] = {
             "client": client_value,
             "active": bool(item.get("active", True)),
             "scopes": scopes or {"preflight", "recovery", "records"},
             "label": label_value,
-            "tenant_id": str(item.get("tenant_id") or client_value).strip(),
-            "environment": str(item.get("environment") or item.get("env") or "live").strip().lower(),
-            "role": str(item.get("role") or "client").strip().lower(),
-            "plan": str(item.get("plan") or "pilot").strip(),
+            "tenant_id": tenant_value,
+            "environment": normalize_environment(item.get("environment") or item.get("env") or "live"),
+            "role": normalize_role(item.get("role") or "client"),
+            "plan": str(item.get("plan") or "pilot").strip()[:80],
             "usage_limit_monthly": usage_limit_monthly,
             "webhook_url": str(item.get("webhook_url") or "").strip(),
             "webhook_secret": str(item.get("webhook_secret") or "").strip(),
             "webhook_active": bool(item.get("webhook_active", True)),
             "webhook_events": webhook_events,
+            "display_name": label_value,
+            "key_fingerprint": api_key_fingerprint(key),
+            "key_hint": api_key_hint(key),
         }
     return loaded
 
@@ -370,9 +415,16 @@ def normalize_metric_status(status: Any, http_status: int) -> str:
 
 def current_access_meta() -> Dict[str, str]:
     access = getattr(g, "api_access", None) or {}
+    client_label = normalize_text(str(access.get("client") or "website"), 120)
+    tenant_id = normalize_text(str(access.get("tenant_id") or client_label), 120)
+    environment = normalize_environment(access.get("environment") or "live")
+    role = normalize_role(access.get("role") or "client")
     return {
         "access_mode": str(access.get("mode") or "public"),
-        "client_label": str(access.get("client") or "website"),
+        "client_label": client_label,
+        "tenant_id": tenant_id,
+        "environment": environment,
+        "role": role,
     }
 
 
@@ -423,7 +475,10 @@ def record_request_event(
         "timeout_flag": 1 if timeout_flag else 0,
         "duration_ms": request_duration_ms(),
         "access_mode": meta["access_mode"],
+        "tenant_id": meta["tenant_id"],
         "client_label": meta["client_label"],
+        "environment": meta["environment"],
+        "role": meta["role"],
         "source_ip": get_client_ip(),
         "error_message": (str(error_message or "")[:500] if error_message else ""),
         "metadata_json": json_dumps_safe(payload_meta) if payload_meta else "",
@@ -435,9 +490,9 @@ def record_request_event(
             """
             INSERT INTO event_log(
                 created_at, request_id, event_name, endpoint, status, reason_code, network,
-                http_status, timeout_flag, duration_ms, access_mode, client_label, source_ip,
-                error_message, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                http_status, timeout_flag, duration_ms, access_mode, tenant_id, client_label,
+                environment, role, source_ip, error_message, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["created_at"],
@@ -451,7 +506,10 @@ def record_request_event(
                 record["timeout_flag"],
                 record["duration_ms"],
                 record["access_mode"],
+                record["tenant_id"],
                 record["client_label"],
+                record["environment"],
+                record["role"],
                 record["source_ip"],
                 record["error_message"],
                 record["metadata_json"],
@@ -480,7 +538,10 @@ def record_request_event(
         timeout=bool(timeout_flag),
         duration_ms=record["duration_ms"],
         access_mode=record["access_mode"],
+        tenant_id=record["tenant_id"],
         client_label=record["client_label"],
+        environment=record["environment"],
+        role=record["role"],
     )
     evaluate_recent_alerts(trigger_event=record)
     if has_request_context():
@@ -633,6 +694,7 @@ def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
         scopes = set(record.get("scopes") or set())
         if required_scope not in scopes and "*" not in scopes:
             raise ApiError("API key is not allowed for this endpoint.", 403)
+        touch_tenant_api_key(api_key, record)
         return {
             "mode": "api_key",
             "scope": required_scope,
@@ -640,14 +702,16 @@ def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
             "label": record.get("label") or "",
             "scopes": sorted(list(scopes)),
             "tenant_id": record.get("tenant_id") or (record.get("client") or "unknown-client"),
-            "environment": record.get("environment") or "live",
-            "role": record.get("role") or "client",
+            "environment": normalize_environment(record.get("environment") or "live"),
+            "role": normalize_role(record.get("role") or "client"),
             "plan": record.get("plan") or "pilot",
             "usage_limit_monthly": record.get("usage_limit_monthly"),
             "webhook_url": record.get("webhook_url") or "",
             "webhook_secret": record.get("webhook_secret") or "",
             "webhook_active": bool(record.get("webhook_active", True)),
             "webhook_events": list(record.get("webhook_events") or []),
+            "key_fingerprint": record.get("key_fingerprint") or api_key_fingerprint(api_key),
+            "key_hint": record.get("key_hint") or api_key_hint(api_key),
         }
 
     if is_allowed_public_demo_request():
@@ -1423,9 +1487,9 @@ def extract_record_filters(args: Any) -> Dict[str, Any]:
     }
 
 
-def build_record_where_sql(filters: Dict[str, Any], client_label: str) -> Tuple[str, List[Any]]:
-    clauses = ["vr.client_label = ?"]
-    params: List[Any] = [client_label]
+def build_record_where_sql(filters: Dict[str, Any], tenant_id: str, environment: str) -> Tuple[str, List[Any]]:
+    clauses = ["vr.tenant_id = ?", "vr.environment = ?"]
+    params: List[Any] = [tenant_id, environment]
     mapping = {
         "service": "vr.service",
         "network": "vr.network",
@@ -1471,7 +1535,11 @@ def summarize_record_row(row: Any) -> Dict[str, Any]:
 
 def store_verification_record(*, service: str, event_name: str, payload: Dict[str, Any], response_payload: Dict[str, Any], network: str, status: str, reason_code: str, access: Dict[str, Any]) -> str:
     record_id = verification_record_id()
-    client_label = str(access.get("client") or "website-demo")
+    scope = access_scope(access)
+    client_label = scope["client_label"]
+    tenant_id = scope["tenant_id"]
+    environment = scope["environment"]
+    role = scope["role"]
     access_mode = str(access.get("mode") or "public_demo")
     reference_id = ""
     address = ""
@@ -1501,10 +1569,10 @@ def store_verification_record(*, service: str, event_name: str, payload: Dict[st
             conn,
             """
             INSERT INTO verification_records(
-                record_id, created_at, request_id, service, event_name, client_label, access_mode, source_ip,
-                reference_id, network, status, verdict, reason_code, address, counterparty_address, tx_hash,
-                search_text, payload_json, response_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                record_id, created_at, request_id, service, event_name, tenant_id, client_label, environment, role,
+                access_mode, source_ip, reference_id, network, status, verdict, reason_code, address,
+                counterparty_address, tx_hash, search_text, payload_json, response_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record_id,
@@ -1512,7 +1580,10 @@ def store_verification_record(*, service: str, event_name: str, payload: Dict[st
                 current_request_id(),
                 service,
                 event_name,
+                tenant_id,
                 client_label,
+                environment,
+                role,
                 access_mode,
                 get_client_ip(),
                 reference_id,
@@ -1535,7 +1606,8 @@ def store_verification_record(*, service: str, event_name: str, payload: Dict[st
 
 
 def store_usage_event(*, service: str, event_name: str, network: str, status: str, verdict: str, reason_code: str, access: Dict[str, Any], record_id: str = "", timeout_flag: bool = False, metadata: Optional[Dict[str, Any]] = None) -> None:
-    client_label = str(access.get("client") or "website-demo")
+    scope = access_scope(access)
+    client_label = scope["client_label"]
     conn = get_db()
     try:
         db_execute(
@@ -1550,10 +1622,10 @@ def store_usage_event(*, service: str, event_name: str, network: str, status: st
                 utc_now_iso(),
                 current_request_id(),
                 normalize_text(record_id, 80),
-                normalize_text(str(access.get("tenant_id") or client_label), 120),
+                normalize_text(scope["tenant_id"], 120),
                 normalize_text(client_label, 120),
-                normalize_text(str(access.get("environment") or "live"), 40),
-                normalize_text(str(access.get("role") or "client"), 40),
+                normalize_text(scope["environment"], 40),
+                normalize_text(scope["role"], 40),
                 normalize_text(str(access.get("plan") or "pilot"), 80),
                 normalize_text(service, 80),
                 normalize_text(event_name, 80),
@@ -1580,7 +1652,7 @@ def store_usage_event(*, service: str, event_name: str, network: str, status: st
         conn.close()
 
 
-def get_record_row_by_id(record_id: str, client_label: str) -> Optional[Any]:
+def get_record_row_by_id(record_id: str, tenant_id: str, environment: str) -> Optional[Any]:
     conn = get_db()
     try:
         return db_fetchone(
@@ -1588,17 +1660,17 @@ def get_record_row_by_id(record_id: str, client_label: str) -> Optional[Any]:
             """
             SELECT *
             FROM verification_records
-            WHERE record_id = ? AND client_label = ?
+            WHERE record_id = ? AND tenant_id = ? AND environment = ?
             LIMIT 1
             """,
-            (record_id, client_label),
+            (record_id, tenant_id, environment),
         )
     finally:
         conn.close()
 
 
-def fetch_record_detail(record_id: str, client_label: str) -> Optional[Dict[str, Any]]:
-    row = get_record_row_by_id(record_id, client_label)
+def fetch_record_detail(record_id: str, tenant_id: str, environment: str) -> Optional[Dict[str, Any]]:
+    row = get_record_row_by_id(record_id, tenant_id, environment)
     if not row:
         return None
     record = row_to_dict(row)
@@ -1611,8 +1683,8 @@ def fetch_record_detail(record_id: str, client_label: str) -> Optional[Dict[str,
     return record
 
 
-def search_verification_records(filters: Dict[str, Any], client_label: str) -> Dict[str, Any]:
-    where_sql, params = build_record_where_sql(filters, client_label)
+def search_verification_records(filters: Dict[str, Any], tenant_id: str, environment: str) -> Dict[str, Any]:
+    where_sql, params = build_record_where_sql(filters, tenant_id, environment)
     conn = get_db()
     try:
         rows = db_fetchall(
@@ -1672,8 +1744,11 @@ def sorted_counter(bucket: Dict[str, int]) -> Dict[str, int]:
     return dict(sorted(bucket.items(), key=lambda item: (-item[1], item[0])))
 
 
-def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[str, Any]:
+def summarize_usage_for_scope(access: Dict[str, Any], period: str = "30d") -> Dict[str, Any]:
     since_iso = period_start_iso(period)
+    scope = access_scope(access)
+    tenant_id = scope["tenant_id"]
+    environment = scope["environment"]
     conn = get_db()
     try:
         usage_rows = db_fetchall(
@@ -1681,20 +1756,20 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
             """
             SELECT created_at, service, event_name, network, status, verdict, reason_code, timeout_flag, duration_ms
             FROM usage_events
-            WHERE client_label = ? AND created_at >= ?
+            WHERE tenant_id = ? AND environment = ? AND created_at >= ?
             ORDER BY created_at ASC
             """,
-            (client_label, since_iso),
+            (tenant_id, environment, since_iso),
         )
         webhook_rows = db_fetchall(
             conn,
             """
             SELECT delivery_status, ack_status
             FROM webhook_deliveries
-            WHERE client_label = ? AND created_at >= ?
+            WHERE tenant_id = ? AND environment = ? AND created_at >= ?
             ORDER BY created_at ASC
             """,
-            (client_label, since_iso),
+            (tenant_id, environment, since_iso),
         )
         fallback_event_rows: List[Any] = []
         fallback_record_rows: List[Any] = []
@@ -1704,20 +1779,20 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
                 """
                 SELECT created_at, event_name, status, reason_code, network, timeout_flag, duration_ms
                 FROM event_log
-                WHERE client_label = ? AND created_at >= ?
+                WHERE tenant_id = ? AND environment = ? AND created_at >= ?
                 ORDER BY created_at ASC
                 """,
-                (client_label, since_iso),
+                (tenant_id, environment, since_iso),
             )
             fallback_record_rows = db_fetchall(
                 conn,
                 """
                 SELECT created_at, service, event_name, network, status, verdict, reason_code
                 FROM verification_records
-                WHERE client_label = ? AND created_at >= ?
+                WHERE tenant_id = ? AND environment = ? AND created_at >= ?
                 ORDER BY created_at ASC
                 """,
-                (client_label, since_iso),
+                (tenant_id, environment, since_iso),
             )
     finally:
         conn.close()
@@ -1813,6 +1888,8 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
         "period": str(period or "30d"),
         "since": since_iso,
         "usage_source": usage_source,
+        "tenant_id": tenant_id,
+        "environment": environment,
         "totals": {
             "events": total_events,
             "checks": total_checks,
@@ -1832,9 +1909,11 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
         "daily": dict(sorted(daily_totals.items())),
     }
 
+
 def build_account_snapshot(access: Dict[str, Any]) -> Dict[str, Any]:
-    client_label = str(access.get("client") or "unknown-client")
-    monthly_usage = summarize_usage_for_client(client_label, "this_month")
+    client_label = normalize_text(str(access.get("client") or "unknown-client"), 120)
+    tenant_summary = build_tenant_key_summary(access)
+    monthly_usage = summarize_usage_for_scope(access, "this_month")
     usage_limit_monthly = access.get("usage_limit_monthly")
     billable_checks = int(monthly_usage.get("totals", {}).get("checks") or 0)
     usage_remaining = None
@@ -1842,12 +1921,14 @@ def build_account_snapshot(access: Dict[str, Any]) -> Dict[str, Any]:
         usage_remaining = max(0, usage_limit_monthly - billable_checks)
 
     return {
-        "client": {
-            "tenant_id": str(access.get("tenant_id") or client_label),
+        "tenant": tenant_summary,
+        "current_key": {
             "client_label": client_label,
             "display_name": str(access.get("label") or client_label),
-            "environment": str(access.get("environment") or "live"),
-            "role": str(access.get("role") or "client"),
+            "key_fingerprint": str(access.get("key_fingerprint") or ""),
+            "key_hint": str(access.get("key_hint") or ""),
+            "environment": normalize_environment(access.get("environment") or "live"),
+            "role": normalize_role(access.get("role") or "client"),
             "plan": str(access.get("plan") or "pilot"),
             "scopes": sorted(list(access.get("scopes") or [])),
         },
@@ -1926,16 +2007,18 @@ def create_webhook_delivery_for_record(record_id: str, event_name: str, access: 
             conn,
             """
             INSERT INTO webhook_deliveries(
-                delivery_id, record_id, created_at, updated_at, client_label, event_name, webhook_url, webhook_secret,
+                delivery_id, record_id, created_at, updated_at, tenant_id, client_label, environment, event_name, webhook_url, webhook_secret,
                 delivery_status, ack_status, attempt_count, max_attempts, next_attempt_at, ack_token
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 delivery_id,
                 record_id,
                 utc_now_iso(),
                 utc_now_iso(),
-                str(access.get("client") or "unknown-client"),
+                normalize_text(str(access.get("tenant_id") or access.get("client") or "unknown-client"), 120),
+                normalize_text(str(access.get("client") or "unknown-client"), 120),
+                normalize_environment(access.get("environment") or "live"),
                 event_name,
                 webhook_url,
                 webhook_secret,
@@ -2266,6 +2349,136 @@ def get_db() -> Any:
     return conn
 
 
+def upsert_tenant_registry_from_api_keys() -> None:
+    if not API_KEYS:
+        return
+    conn = get_db()
+    now_iso = utc_now_iso()
+    try:
+        for record in API_KEYS.values():
+            tenant_id = normalize_text(str(record.get("tenant_id") or record.get("client") or "unknown-client"), 120)
+            display_name = normalize_text(str(record.get("label") or record.get("display_name") or record.get("client") or tenant_id), 160)
+            plan_value = normalize_text(str(record.get("plan") or "pilot"), 80)
+            tenant_exists = db_fetchone(conn, "SELECT tenant_id FROM tenants WHERE tenant_id = ? LIMIT 1", (tenant_id,))
+            if tenant_exists:
+                db_execute(
+                    conn,
+                    "UPDATE tenants SET updated_at = ?, display_name = ?, default_plan = ?, status = ? WHERE tenant_id = ?",
+                    (now_iso, display_name, plan_value, "active", tenant_id),
+                )
+            else:
+                db_execute(
+                    conn,
+                    "INSERT INTO tenants(tenant_id, created_at, updated_at, display_name, status, default_plan) VALUES (?, ?, ?, ?, ?, ?)",
+                    (tenant_id, now_iso, now_iso, display_name, "active", plan_value),
+                )
+
+            scopes_json = json_dumps_safe(sorted(list(record.get("scopes") or [])))
+            webhook_events_json = json_dumps_safe(list(record.get("webhook_events") or []))
+            key_fingerprint = normalize_text(str(record.get("key_fingerprint") or ""), 64)
+            key_hint = normalize_text(str(record.get("key_hint") or ""), 32)
+            key_exists = db_fetchone(conn, "SELECT key_fingerprint FROM tenant_api_keys WHERE key_fingerprint = ? LIMIT 1", (key_fingerprint,))
+            key_params = (
+                tenant_id,
+                normalize_text(str(record.get("client") or tenant_id), 120),
+                display_name,
+                normalize_environment(record.get("environment") or "live"),
+                normalize_role(record.get("role") or "client"),
+                plan_value,
+                scopes_json,
+                1 if bool(record.get("active", True)) else 0,
+                record.get("usage_limit_monthly"),
+                1 if bool(record.get("webhook_active", True)) else 0,
+                webhook_events_json,
+                normalize_text(_extract_host(str(record.get("webhook_url") or "")), 180),
+                key_hint,
+                now_iso,
+                now_iso,
+            )
+            if key_exists:
+                db_execute(
+                    conn,
+                    "UPDATE tenant_api_keys SET tenant_id = ?, client_label = ?, display_name = ?, environment = ?, role = ?, plan = ?, scopes_json = ?, active = ?, usage_limit_monthly = ?, webhook_active = ?, webhook_events_json = ?, webhook_url_host = ?, key_hint = ?, updated_at = ?, last_synced_at = ? WHERE key_fingerprint = ?",
+                    key_params + (key_fingerprint,),
+                )
+            else:
+                db_execute(
+                    conn,
+                    "INSERT INTO tenant_api_keys(tenant_id, client_label, display_name, environment, role, plan, scopes_json, active, usage_limit_monthly, webhook_active, webhook_events_json, webhook_url_host, key_fingerprint, key_hint, created_at, updated_at, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    key_params[:12] + (key_fingerprint, key_hint, now_iso, now_iso, now_iso),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def touch_tenant_api_key(api_key: str, record: Dict[str, Any]) -> None:
+    key_fingerprint = normalize_text(str(record.get("key_fingerprint") or api_key_fingerprint(api_key)), 64)
+    if not key_fingerprint:
+        return
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            "UPDATE tenant_api_keys SET last_seen_at = ?, updated_at = ? WHERE key_fingerprint = ?",
+            (utc_now_iso(), utc_now_iso(), key_fingerprint),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def build_tenant_key_summary(access: Dict[str, Any]) -> Dict[str, Any]:
+    tenant_id = normalize_text(str(access.get("tenant_id") or access.get("client") or "unknown-client"), 120)
+    environment = normalize_environment(access.get("environment") or "live")
+    conn = get_db()
+    try:
+        tenant_row = db_fetchone(
+            conn,
+            "SELECT tenant_id, display_name, status, default_plan, created_at, updated_at FROM tenants WHERE tenant_id = ? LIMIT 1",
+            (tenant_id,),
+        )
+        key_rows = db_fetchall(
+            conn,
+            "SELECT environment, role, active FROM tenant_api_keys WHERE tenant_id = ? ORDER BY environment, role",
+            (tenant_id,),
+        )
+    finally:
+        conn.close()
+
+    tenant_data = row_to_dict(tenant_row) if tenant_row else {}
+    environments: List[str] = []
+    active_keys = 0
+    for row in key_rows:
+        row_dict = row_to_dict(row)
+        env_value = normalize_environment((row_dict or {}).get("environment") or "live")
+        if env_value not in environments:
+            environments.append(env_value)
+        if int((row_dict or {}).get("active") or 0):
+            active_keys += 1
+
+    return {
+        "tenant_id": tenant_id,
+        "display_name": str((tenant_data or {}).get("display_name") or access.get("label") or access.get("client") or tenant_id),
+        "status": str((tenant_data or {}).get("status") or "active"),
+        "default_plan": str((tenant_data or {}).get("default_plan") or access.get("plan") or "pilot"),
+        "environments": environments or [environment],
+        "keys_total": len(key_rows),
+        "keys_active": active_keys,
+        "current_environment": environment,
+    }
+
+
+def access_scope(access: Dict[str, Any]) -> Dict[str, str]:
+    client_label = normalize_text(str(access.get("client") or "website-demo"), 120)
+    return {
+        "tenant_id": normalize_text(str(access.get("tenant_id") or client_label), 120),
+        "client_label": client_label,
+        "environment": normalize_environment(access.get("environment") or ("public-demo" if access.get("mode") == "public_demo" else "live")),
+        "role": normalize_role(access.get("role") or ("demo" if access.get("mode") == "public_demo" else "client")),
+    }
+
+
 def ensure_db() -> None:
     conn = get_db()
     try:
@@ -2389,7 +2602,10 @@ def ensure_db() -> None:
                   timeout_flag INTEGER DEFAULT 0,
                   duration_ms INTEGER DEFAULT 0,
                   access_mode TEXT,
+                  tenant_id TEXT,
                   client_label TEXT,
+                  environment TEXT,
+                  role TEXT,
                   source_ip TEXT,
                   error_message TEXT,
                   metadata_json TEXT
@@ -2413,7 +2629,10 @@ def ensure_db() -> None:
                   timeout_flag INTEGER DEFAULT 0,
                   duration_ms INTEGER DEFAULT 0,
                   access_mode TEXT,
+                  tenant_id TEXT,
                   client_label TEXT,
+                  environment TEXT,
+                  role TEXT,
                   source_ip TEXT,
                   error_message TEXT,
                   metadata_json TEXT
@@ -2421,8 +2640,87 @@ def ensure_db() -> None:
                 """
             )
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_created_at ON event_log(created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_tenant_env_created_at ON event_log(tenant_id, environment, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_event_name_created_at ON event_log(event_name, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_network_created_at ON event_log(network, created_at)")
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS tenants (
+                  tenant_id TEXT PRIMARY KEY,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  display_name TEXT,
+                  status TEXT,
+                  default_plan TEXT
+                )
+                """
+            )
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS tenant_api_keys (
+                  key_fingerprint TEXT PRIMARY KEY,
+                  tenant_id TEXT NOT NULL,
+                  client_label TEXT,
+                  display_name TEXT,
+                  environment TEXT,
+                  role TEXT,
+                  plan TEXT,
+                  scopes_json TEXT,
+                  active INTEGER DEFAULT 1,
+                  usage_limit_monthly INTEGER,
+                  webhook_active INTEGER DEFAULT 0,
+                  webhook_events_json TEXT,
+                  webhook_url_host TEXT,
+                  key_hint TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  last_synced_at TEXT,
+                  last_seen_at TEXT
+                )
+                """
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS tenants (
+                  tenant_id TEXT PRIMARY KEY,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  display_name TEXT,
+                  status TEXT,
+                  default_plan TEXT
+                )
+                """
+            )
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS tenant_api_keys (
+                  key_fingerprint TEXT PRIMARY KEY,
+                  tenant_id TEXT NOT NULL,
+                  client_label TEXT,
+                  display_name TEXT,
+                  environment TEXT,
+                  role TEXT,
+                  plan TEXT,
+                  scopes_json TEXT,
+                  active INTEGER DEFAULT 1,
+                  usage_limit_monthly INTEGER,
+                  webhook_active INTEGER DEFAULT 0,
+                  webhook_events_json TEXT,
+                  webhook_url_host TEXT,
+                  key_hint TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  last_synced_at TEXT,
+                  last_seen_at TEXT
+                )
+                """
+            )
         if db_is_postgres():
             db_execute(
                 conn,
@@ -2476,6 +2774,8 @@ def ensure_db() -> None:
                 """
             )
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_client_created_at ON usage_events(client_label, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_env_created_at ON usage_events(tenant_id, environment, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_tenant_env ON tenant_api_keys(tenant_id, environment)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_service_created_at ON usage_events(service, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_event_created_at ON usage_events(event_name, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_network_created_at ON usage_events(network, created_at)")
@@ -2490,7 +2790,10 @@ def ensure_db() -> None:
                   request_id TEXT,
                   service TEXT NOT NULL,
                   event_name TEXT NOT NULL,
+                  tenant_id TEXT,
                   client_label TEXT NOT NULL,
+                  environment TEXT,
+                  role TEXT,
                   access_mode TEXT NOT NULL,
                   source_ip TEXT,
                   reference_id TEXT,
@@ -2516,7 +2819,9 @@ def ensure_db() -> None:
                   record_id TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL,
+                  tenant_id TEXT,
                   client_label TEXT NOT NULL,
+                  environment TEXT,
                   event_name TEXT NOT NULL,
                   webhook_url TEXT NOT NULL,
                   webhook_secret TEXT NOT NULL,
@@ -2547,7 +2852,10 @@ def ensure_db() -> None:
                   request_id TEXT,
                   service TEXT NOT NULL,
                   event_name TEXT NOT NULL,
+                  tenant_id TEXT,
                   client_label TEXT NOT NULL,
+                  environment TEXT,
+                  role TEXT,
                   access_mode TEXT NOT NULL,
                   source_ip TEXT,
                   reference_id TEXT,
@@ -2573,7 +2881,9 @@ def ensure_db() -> None:
                   record_id TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL,
+                  tenant_id TEXT,
                   client_label TEXT NOT NULL,
+                  environment TEXT,
                   event_name TEXT NOT NULL,
                   webhook_url TEXT NOT NULL,
                   webhook_secret TEXT NOT NULL,
@@ -2597,6 +2907,24 @@ def ensure_db() -> None:
         ensure_column(conn, "verification_records", "request_id", "TEXT")
         ensure_column(conn, "verification_records", "service", "TEXT")
         ensure_column(conn, "verification_records", "event_name", "TEXT")
+        ensure_column(conn, "tenants", "display_name", "TEXT")
+        ensure_column(conn, "tenants", "status", "TEXT")
+        ensure_column(conn, "tenants", "default_plan", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "tenant_id", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "client_label", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "display_name", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "environment", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "role", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "plan", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "scopes_json", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "active", "INTEGER DEFAULT 1")
+        ensure_column(conn, "tenant_api_keys", "usage_limit_monthly", "INTEGER")
+        ensure_column(conn, "tenant_api_keys", "webhook_active", "INTEGER DEFAULT 0")
+        ensure_column(conn, "tenant_api_keys", "webhook_events_json", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "webhook_url_host", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "key_hint", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "last_synced_at", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "last_seen_at", "TEXT")
         ensure_column(conn, "usage_events", "record_id", "TEXT")
         ensure_column(conn, "usage_events", "tenant_id", "TEXT")
         ensure_column(conn, "usage_events", "client_label", "TEXT")
@@ -2612,7 +2940,13 @@ def ensure_db() -> None:
         ensure_column(conn, "usage_events", "timeout_flag", "INTEGER DEFAULT 0")
         ensure_column(conn, "usage_events", "duration_ms", "INTEGER DEFAULT 0")
         ensure_column(conn, "usage_events", "metadata_json", "TEXT")
+        ensure_column(conn, "event_log", "tenant_id", "TEXT")
+        ensure_column(conn, "event_log", "environment", "TEXT")
+        ensure_column(conn, "event_log", "role", "TEXT")
+        ensure_column(conn, "verification_records", "tenant_id", "TEXT")
         ensure_column(conn, "verification_records", "client_label", "TEXT")
+        ensure_column(conn, "verification_records", "environment", "TEXT")
+        ensure_column(conn, "verification_records", "role", "TEXT")
         ensure_column(conn, "verification_records", "access_mode", "TEXT")
         ensure_column(conn, "verification_records", "source_ip", "TEXT")
         ensure_column(conn, "verification_records", "reference_id", "TEXT")
@@ -2628,7 +2962,9 @@ def ensure_db() -> None:
         ensure_column(conn, "verification_records", "response_json", "TEXT")
         ensure_column(conn, "webhook_deliveries", "delivery_id", "TEXT")
         ensure_column(conn, "webhook_deliveries", "record_id", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "tenant_id", "TEXT")
         ensure_column(conn, "webhook_deliveries", "client_label", "TEXT")
+        ensure_column(conn, "webhook_deliveries", "environment", "TEXT")
         ensure_column(conn, "webhook_deliveries", "event_name", "TEXT")
         ensure_column(conn, "webhook_deliveries", "webhook_url", "TEXT")
         ensure_column(conn, "webhook_deliveries", "webhook_secret", "TEXT")
@@ -2647,11 +2983,13 @@ def ensure_db() -> None:
         ensure_column(conn, "webhook_deliveries", "ack_payload_json", "TEXT")
         db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_records_record_id ON verification_records(record_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_client_created_at ON verification_records(client_label, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_tenant_env_created_at ON verification_records(tenant_id, environment, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_service_created_at ON verification_records(service, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_request_id ON verification_records(request_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_verification_records_reference_id ON verification_records(reference_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_delivery_id ON webhook_deliveries(delivery_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_record_id ON webhook_deliveries(record_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_env_created_at ON webhook_deliveries(tenant_id, environment, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_next_attempt ON webhook_deliveries(delivery_status, next_attempt_at)")
         conn.commit()
     finally:
@@ -2659,6 +2997,7 @@ def ensure_db() -> None:
 
 
 ensure_db()
+upsert_tenant_registry_from_api_keys()
 kick_webhook_processor(force=True)
 
 
@@ -2816,10 +3155,21 @@ def account_summary():
     access = getattr(g, "api_access", None) or {}
     if access.get("mode") != "api_key":
         raise ApiError("API key required for account summary.", 401)
+    snapshot = build_account_snapshot(access)
+    if "current_key" in snapshot:
+        snapshot["client"] = {
+            "tenant_id": snapshot.get("tenant", {}).get("tenant_id"),
+            "client_label": snapshot.get("current_key", {}).get("client_label"),
+            "display_name": snapshot.get("current_key", {}).get("display_name"),
+            "environment": snapshot.get("current_key", {}).get("environment"),
+            "role": snapshot.get("current_key", {}).get("role"),
+            "plan": snapshot.get("current_key", {}).get("plan"),
+            "scopes": snapshot.get("current_key", {}).get("scopes", []),
+        }
     return jsonify({
         "ok": True,
         "trace_id": current_request_id(),
-        **build_account_snapshot(access),
+        **snapshot,
     })
 
 
@@ -2829,11 +3179,11 @@ def usage_summary():
     if access.get("mode") != "api_key":
         raise ApiError("API key required for usage summary.", 401)
     period = str(request.args.get("period") or "30d").strip().lower()
-    summary = summarize_usage_for_client(str(access.get("client") or "unknown-client"), period)
+    summary = summarize_usage_for_scope(access, period)
     return jsonify({
         "ok": True,
         "trace_id": current_request_id(),
-        "client": str(access.get("client") or "unknown-client"),
+        "tenant_id": str(access.get("tenant_id") or access.get("client") or "unknown-client"),
         "environment": str(access.get("environment") or "live"),
         **summary,
     })
@@ -2845,7 +3195,7 @@ def verification_records_history():
     if access.get("mode") != "api_key":
         raise ApiError("API key required for verification history.", 401)
     filters = extract_record_filters(request.args)
-    result = search_verification_records(filters, str(access.get("client") or ""))
+    result = search_verification_records(filters, str(access.get("tenant_id") or access.get("client") or ""), normalize_environment(access.get("environment") or "live"))
     return jsonify({
         "ok": True,
         "trace_id": current_request_id(),
@@ -2859,7 +3209,7 @@ def verification_record_detail(record_id: str):
     access = getattr(g, "api_access", None) or {}
     if access.get("mode") != "api_key":
         raise ApiError("API key required for verification history.", 401)
-    record = fetch_record_detail(record_id, str(access.get("client") or ""))
+    record = fetch_record_detail(record_id, str(access.get("tenant_id") or access.get("client") or ""), normalize_environment(access.get("environment") or "live"))
     if not record:
         raise ApiError("Verification record not found.", 404)
     return jsonify({
