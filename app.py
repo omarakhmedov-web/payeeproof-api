@@ -29,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.0.1-policy-fallback"
+APP_VERSION = "2.0.2-origin-optional-for-api-key"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1821,14 +1821,13 @@ def enforce_policy_for_request(access: Dict[str, Any], path: str, payload: Optio
     payload = payload or current_json_payload()
     origin_host = current_request_host()
     allowed_origin_hosts = policy.get("allowed_origin_hosts") or []
-    if allowed_origin_hosts:
-        if not origin_host or origin_host not in allowed_origin_hosts:
-            raise ApiError(
-                "Request origin is not allowed for this API key.",
-                403,
-                code="POLICY_ORIGIN_NOT_ALLOWED",
-                details={"origin_host": origin_host or "", "allowed_origin_hosts": allowed_origin_hosts},
-            )
+    if allowed_origin_hosts and origin_host and origin_host not in allowed_origin_hosts:
+        raise ApiError(
+            "Request origin is not allowed for this API key.",
+            403,
+            code="POLICY_ORIGIN_NOT_ALLOWED",
+            details={"origin_host": origin_host or "", "allowed_origin_hosts": allowed_origin_hosts},
+        )
     allowed_ip_cidrs = policy.get("allowed_ip_cidrs") or []
     if allowed_ip_cidrs and not ip_allowed_by_cidrs(get_client_ip(), allowed_ip_cidrs):
         raise ApiError(
