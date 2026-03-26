@@ -28,7 +28,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "1.7.1-webhooks-inline-dispatch"
+APP_VERSION = "1.8.0-usage-ledger"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1534,6 +1534,52 @@ def store_verification_record(*, service: str, event_name: str, payload: Dict[st
     return record_id
 
 
+def store_usage_event(*, service: str, event_name: str, network: str, status: str, verdict: str, reason_code: str, access: Dict[str, Any], record_id: str = "", timeout_flag: bool = False, metadata: Optional[Dict[str, Any]] = None) -> None:
+    client_label = str(access.get("client") or "website-demo")
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            INSERT INTO usage_events(
+                created_at, request_id, record_id, tenant_id, client_label, environment, role, plan,
+                service, event_name, network, status, verdict, reason_code, timeout_flag, duration_ms, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now_iso(),
+                current_request_id(),
+                normalize_text(record_id, 80),
+                normalize_text(str(access.get("tenant_id") or client_label), 120),
+                normalize_text(client_label, 120),
+                normalize_text(str(access.get("environment") or "live"), 40),
+                normalize_text(str(access.get("role") or "client"), 40),
+                normalize_text(str(access.get("plan") or "pilot"), 80),
+                normalize_text(service, 80),
+                normalize_text(event_name, 80),
+                normalize_text(network, 80),
+                normalize_text(status, 80),
+                normalize_text(verdict, 80),
+                normalize_text(reason_code, 120),
+                1 if timeout_flag else 0,
+                request_duration_ms(),
+                json_dumps_safe(metadata or {}),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        emit_structured_log(
+            "usage_event_write_failed",
+            level="warning",
+            client_label=client_label,
+            service=service,
+            event_name=event_name,
+            error=str(exc),
+        )
+    finally:
+        conn.close()
+
+
 def get_record_row_by_id(record_id: str, client_label: str) -> Optional[Any]:
     conn = get_db()
     try:
@@ -1630,21 +1676,11 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
     since_iso = period_start_iso(period)
     conn = get_db()
     try:
-        event_rows = db_fetchall(
+        usage_rows = db_fetchall(
             conn,
             """
-            SELECT created_at, event_name, status, reason_code, network, timeout_flag, duration_ms
-            FROM event_log
-            WHERE client_label = ? AND created_at >= ?
-            ORDER BY created_at ASC
-            """,
-            (client_label, since_iso),
-        )
-        record_rows = db_fetchall(
-            conn,
-            """
-            SELECT created_at, service, event_name, network, status, verdict, reason_code
-            FROM verification_records
+            SELECT created_at, service, event_name, network, status, verdict, reason_code, timeout_flag, duration_ms
+            FROM usage_events
             WHERE client_label = ? AND created_at >= ?
             ORDER BY created_at ASC
             """,
@@ -1660,6 +1696,29 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
             """,
             (client_label, since_iso),
         )
+        fallback_event_rows: List[Any] = []
+        fallback_record_rows: List[Any] = []
+        if not usage_rows:
+            fallback_event_rows = db_fetchall(
+                conn,
+                """
+                SELECT created_at, event_name, status, reason_code, network, timeout_flag, duration_ms
+                FROM event_log
+                WHERE client_label = ? AND created_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (client_label, since_iso),
+            )
+            fallback_record_rows = db_fetchall(
+                conn,
+                """
+                SELECT created_at, service, event_name, network, status, verdict, reason_code
+                FROM verification_records
+                WHERE client_label = ? AND created_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (client_label, since_iso),
+            )
     finally:
         conn.close()
 
@@ -1672,36 +1731,67 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
     daily_totals: Dict[str, int] = {}
     timeout_count = 0
     duration_values: List[int] = []
+    usage_source = "usage_events" if usage_rows else "fallback"
 
-    for row in event_rows:
-        row_dict = row_to_dict(row)
-        created_at = str(row_dict.get("created_at") or "")
-        increment_counter(event_totals, str(row_dict.get("event_name") or "unknown"))
-        increment_counter(status_totals, str(row_dict.get("status") or "unknown"))
-        if row_dict.get("reason_code"):
-            increment_counter(reason_totals, str(row_dict.get("reason_code") or "unknown"))
-        if row_dict.get("network"):
-            increment_counter(network_totals, str(row_dict.get("network") or "unknown"))
-        if created_at:
-            increment_counter(daily_totals, created_at[:10])
-        if int(row_dict.get("timeout_flag") or 0):
-            timeout_count += 1
-        try:
-            duration_ms = int(row_dict.get("duration_ms") or 0)
-            if duration_ms > 0:
-                duration_values.append(duration_ms)
-        except Exception:
-            pass
+    if usage_rows:
+        for row in usage_rows:
+            row_dict = row_to_dict(row)
+            created_at = str(row_dict.get("created_at") or "")
+            increment_counter(event_totals, str(row_dict.get("event_name") or "unknown"))
+            increment_counter(service_totals, str(row_dict.get("service") or "unknown"))
+            if row_dict.get("status"):
+                increment_counter(status_totals, str(row_dict.get("status") or "unknown"))
+            if row_dict.get("reason_code"):
+                increment_counter(reason_totals, str(row_dict.get("reason_code") or "unknown"))
+            if row_dict.get("network"):
+                increment_counter(network_totals, str(row_dict.get("network") or "unknown"))
+            if row_dict.get("verdict"):
+                increment_counter(verdict_totals, str(row_dict.get("verdict") or "unknown"))
+            if created_at:
+                increment_counter(daily_totals, created_at[:10])
+            if int(row_dict.get("timeout_flag") or 0):
+                timeout_count += 1
+            try:
+                duration_ms = int(row_dict.get("duration_ms") or 0)
+                if duration_ms > 0:
+                    duration_values.append(duration_ms)
+            except Exception:
+                pass
+        total_events = len(usage_rows)
+        total_checks = len(usage_rows)
+    else:
+        for row in fallback_event_rows:
+            row_dict = row_to_dict(row)
+            created_at = str(row_dict.get("created_at") or "")
+            increment_counter(event_totals, str(row_dict.get("event_name") or "unknown"))
+            increment_counter(status_totals, str(row_dict.get("status") or "unknown"))
+            if row_dict.get("reason_code"):
+                increment_counter(reason_totals, str(row_dict.get("reason_code") or "unknown"))
+            if row_dict.get("network"):
+                increment_counter(network_totals, str(row_dict.get("network") or "unknown"))
+            if created_at:
+                increment_counter(daily_totals, created_at[:10])
+            if int(row_dict.get("timeout_flag") or 0):
+                timeout_count += 1
+            try:
+                duration_ms = int(row_dict.get("duration_ms") or 0)
+                if duration_ms > 0:
+                    duration_values.append(duration_ms)
+            except Exception:
+                pass
 
-    for row in record_rows:
-        row_dict = row_to_dict(row)
-        increment_counter(service_totals, str(row_dict.get("service") or "unknown"))
-        if row_dict.get("verdict"):
-            increment_counter(verdict_totals, str(row_dict.get("verdict") or "unknown"))
-        if row_dict.get("reason_code"):
-            increment_counter(reason_totals, str(row_dict.get("reason_code") or "unknown"))
-        if row_dict.get("network"):
-            increment_counter(network_totals, str(row_dict.get("network") or "unknown"))
+        for row in fallback_record_rows:
+            row_dict = row_to_dict(row)
+            increment_counter(service_totals, str(row_dict.get("service") or "unknown"))
+            if row_dict.get("verdict"):
+                increment_counter(verdict_totals, str(row_dict.get("verdict") or "unknown"))
+            if row_dict.get("reason_code"):
+                increment_counter(reason_totals, str(row_dict.get("reason_code") or "unknown"))
+            if row_dict.get("network"):
+                increment_counter(network_totals, str(row_dict.get("network") or "unknown"))
+
+        total_events = len(fallback_event_rows)
+        total_checks = len(fallback_record_rows)
 
     delivered_count = 0
     acknowledged_count = 0
@@ -1717,13 +1807,12 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
         if ack_status == "acknowledged":
             acknowledged_count += 1
 
-    total_events = len(event_rows)
-    total_checks = len(record_rows)
     avg_duration_ms = round(sum(duration_values) / len(duration_values), 1) if duration_values else 0
 
     return {
         "period": str(period or "30d"),
         "since": since_iso,
+        "usage_source": usage_source,
         "totals": {
             "events": total_events,
             "checks": total_checks,
@@ -1742,7 +1831,6 @@ def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[s
         "by_verdict": sorted_counter(verdict_totals),
         "daily": dict(sorted(daily_totals.items())),
     }
-
 
 def build_account_snapshot(access: Dict[str, Any]) -> Dict[str, Any]:
     client_label = str(access.get("client") or "unknown-client")
@@ -2339,6 +2427,62 @@ def ensure_db() -> None:
             db_execute(
                 conn,
                 """
+                CREATE TABLE IF NOT EXISTS usage_events (
+                  id BIGSERIAL PRIMARY KEY,
+                  created_at TEXT NOT NULL,
+                  request_id TEXT,
+                  record_id TEXT,
+                  tenant_id TEXT,
+                  client_label TEXT NOT NULL,
+                  environment TEXT,
+                  role TEXT,
+                  plan TEXT,
+                  service TEXT NOT NULL,
+                  event_name TEXT NOT NULL,
+                  network TEXT,
+                  status TEXT,
+                  verdict TEXT,
+                  reason_code TEXT,
+                  timeout_flag INTEGER DEFAULT 0,
+                  duration_ms INTEGER DEFAULT 0,
+                  metadata_json TEXT
+                )
+                """
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS usage_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at TEXT NOT NULL,
+                  request_id TEXT,
+                  record_id TEXT,
+                  tenant_id TEXT,
+                  client_label TEXT NOT NULL,
+                  environment TEXT,
+                  role TEXT,
+                  plan TEXT,
+                  service TEXT NOT NULL,
+                  event_name TEXT NOT NULL,
+                  network TEXT,
+                  status TEXT,
+                  verdict TEXT,
+                  reason_code TEXT,
+                  timeout_flag INTEGER DEFAULT 0,
+                  duration_ms INTEGER DEFAULT 0,
+                  metadata_json TEXT
+                )
+                """
+            )
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_client_created_at ON usage_events(client_label, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_service_created_at ON usage_events(service, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_event_created_at ON usage_events(event_name, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_usage_events_network_created_at ON usage_events(network, created_at)")
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
                 CREATE TABLE IF NOT EXISTS verification_records (
                   id BIGSERIAL PRIMARY KEY,
                   record_id TEXT,
@@ -2453,6 +2597,21 @@ def ensure_db() -> None:
         ensure_column(conn, "verification_records", "request_id", "TEXT")
         ensure_column(conn, "verification_records", "service", "TEXT")
         ensure_column(conn, "verification_records", "event_name", "TEXT")
+        ensure_column(conn, "usage_events", "record_id", "TEXT")
+        ensure_column(conn, "usage_events", "tenant_id", "TEXT")
+        ensure_column(conn, "usage_events", "client_label", "TEXT")
+        ensure_column(conn, "usage_events", "environment", "TEXT")
+        ensure_column(conn, "usage_events", "role", "TEXT")
+        ensure_column(conn, "usage_events", "plan", "TEXT")
+        ensure_column(conn, "usage_events", "service", "TEXT")
+        ensure_column(conn, "usage_events", "event_name", "TEXT")
+        ensure_column(conn, "usage_events", "network", "TEXT")
+        ensure_column(conn, "usage_events", "status", "TEXT")
+        ensure_column(conn, "usage_events", "verdict", "TEXT")
+        ensure_column(conn, "usage_events", "reason_code", "TEXT")
+        ensure_column(conn, "usage_events", "timeout_flag", "INTEGER DEFAULT 0")
+        ensure_column(conn, "usage_events", "duration_ms", "INTEGER DEFAULT 0")
+        ensure_column(conn, "usage_events", "metadata_json", "TEXT")
         ensure_column(conn, "verification_records", "client_label", "TEXT")
         ensure_column(conn, "verification_records", "access_mode", "TEXT")
         ensure_column(conn, "verification_records", "source_ip", "TEXT")
@@ -2942,6 +3101,21 @@ def preflight_check():
     )
     response_payload["record_id"] = record_id
     response_payload["history_url"] = f"/api/verification-records/{record_id}"
+    store_usage_event(
+        service="preflight-check",
+        event_name="preflight_run",
+        network=provided_chain,
+        status=outcome["status"],
+        verdict=outcome["verdict"],
+        reason_code=outcome["reason_code"],
+        access=access,
+        record_id=record_id,
+        timeout_flag=looks_like_timeout(provided_onchain.get("details")) or looks_like_timeout(expected_onchain.get("details")),
+        metadata={
+            "next_action": outcome["next_action"],
+            "confidence": outcome["confidence"],
+        },
+    )
     delivery_id = create_webhook_delivery_for_record(record_id, "preflight_run", access)
     if delivery_id:
         response_payload["webhook"] = {
@@ -3181,6 +3355,22 @@ def recovery_copilot():
     )
     response_payload["record_id"] = record_id
     response_payload["history_url"] = f"/api/verification-records/{record_id}"
+    store_usage_event(
+        service="recovery-copilot",
+        event_name="recovery_run",
+        network=effective_chain,
+        status=str(analysis.get("status") or outcome),
+        verdict=str(support_packet.get("verdict") or outcome),
+        reason_code=str(analysis.get("reason_code") or ""),
+        access=access,
+        record_id=record_id,
+        timeout_flag=looks_like_timeout(analysis.get("summary")) or looks_like_timeout((analysis.get("observed") or {}).get("details")),
+        metadata={
+            "outcome": outcome,
+            "recoverability": analysis.get("recoverability"),
+            "confidence": confidence,
+        },
+    )
     delivery_id = create_webhook_delivery_for_record(record_id, "recovery_run", access)
     if delivery_id:
         response_payload["webhook"] = {
