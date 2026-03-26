@@ -20,6 +20,21 @@ def app_module(tmp_path_factory):
             'key': 'pp_test_suite_key',
             'name': 'ci-suite',
             'client_label': 'ci-suite',
+            'tenant_id': 'tenant-ci',
+            'environment': 'live',
+            'role': 'client',
+            'plan': 'pilot',
+            'scopes': ['preflight', 'recovery', 'records'],
+            'webhook_active': False,
+        },
+        {
+            'key': 'pp_test_suite_key_test',
+            'name': 'ci-suite test',
+            'client_label': 'ci-suite-test',
+            'tenant_id': 'tenant-ci',
+            'environment': 'test',
+            'role': 'viewer',
+            'plan': 'pilot',
             'scopes': ['preflight', 'recovery', 'records'],
             'webhook_active': False,
         }
@@ -52,3 +67,8 @@ def client(app_module):
 @pytest.fixture()
 def api_headers():
     return {'X-API-Key': 'pp_test_suite_key'}
+
+
+@pytest.fixture()
+def api_headers_test():
+    return {'X-API-Key': 'pp_test_suite_key_test'}
