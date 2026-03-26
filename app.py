@@ -2639,6 +2639,9 @@ def ensure_db() -> None:
                 )
                 """
             )
+        ensure_column(conn, "event_log", "tenant_id", "TEXT")
+        ensure_column(conn, "event_log", "environment", "TEXT")
+        ensure_column(conn, "event_log", "role", "TEXT")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_created_at ON event_log(created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_tenant_env_created_at ON event_log(tenant_id, environment, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_event_log_event_name_created_at ON event_log(event_name, created_at)")
