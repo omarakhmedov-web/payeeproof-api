@@ -8,6 +8,7 @@ import sqlite3
 import time
 import uuid
 import logging
+import ipaddress
 
 try:
     import psycopg2
@@ -28,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "1.9.1-webhook-ack-inline"
+APP_VERSION = "2.0.0-limits-policy"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -57,6 +58,28 @@ PERSONAL_EMAIL_DOMAINS = {
     "yahoo.com", "ymail.com", "rocketmail.com", "icloud.com", "me.com", "mac.com",
     "proton.me", "protonmail.com", "pm.me", "mail.com", "aol.com", "gmx.com",
     "yandex.ru", "yandex.com", "ya.ru", "bk.ru", "inbox.ru", "list.ru", "mail.ru"
+}
+
+
+DEFAULT_PLAN_LIMITS_FALLBACK = {
+    "demo": {"monthly_checks": 50, "monthly_records_reads": 250},
+    "pilot": {"monthly_checks": 1000, "monthly_records_reads": 2000},
+    "growth": {"monthly_checks": 10000, "monthly_records_reads": 25000},
+    "enterprise": {},
+}
+LIMIT_COUNTER_LABELS = {
+    "monthly_checks": "Monthly checks",
+    "monthly_preflight_checks": "Monthly preflight checks",
+    "monthly_recovery_checks": "Monthly recovery checks",
+    "monthly_records_reads": "Monthly verification record reads",
+}
+ROLE_WRITE_BLOCKS = {
+    "viewer": {"/api/preflight-check", "/api/recovery-copilot"},
+}
+BILLING_LIMIT_ENDPOINTS = {
+    "/api/preflight-check": ["monthly_checks", "monthly_preflight_checks"],
+    "/api/recovery-copilot": ["monthly_checks", "monthly_recovery_checks"],
+    "/api/verification-records": ["monthly_records_reads"],
 }
 
 DEFAULT_RPC_URLS = {
@@ -169,6 +192,8 @@ ALERT_ERROR_RATE_THRESHOLD = float(os.getenv("ALERT_ERROR_RATE_THRESHOLD", "0.35
 ALERT_TIMEOUT_RATE_THRESHOLD = float(os.getenv("ALERT_TIMEOUT_RATE_THRESHOLD", "0.20"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "600"))
 PUBLIC_API_BASE = os.getenv("PUBLIC_API_BASE", "https://payeeproof-api.onrender.com").rstrip("/")
+PLAN_LIMITS_JSON = os.getenv("PLAN_LIMITS_JSON", "").strip()
+DEFAULT_RECORDS_MAX_PAGE_SIZE = int(os.getenv("DEFAULT_RECORDS_MAX_PAGE_SIZE", "100"))
 WEBHOOK_DELIVERY_TIMEOUT_SEC = float(os.getenv("WEBHOOK_DELIVERY_TIMEOUT_SEC", "10"))
 WEBHOOK_RETRY_SCHEDULE_SEC = [
     max(1, int(part.strip()))
@@ -202,6 +227,11 @@ API_SCOPE_BY_PATH = {
 
 ALLOWED_ENVIRONMENTS = {"live", "test", "sandbox", "staging", "production", "public-demo"}
 ALLOWED_ROLES = {"owner", "admin", "client", "viewer", "demo"}
+
+
+def _normalize_chain_raw(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return CHAIN_ALIASES.get(text, text)
 
 
 def normalize_environment(value: Any, default: str = "live") -> str:
@@ -260,6 +290,7 @@ def _extract_host(value: str) -> str:
     return (parsed.hostname or text.split(":")[0]).strip().lower()
 
 
+
 def _split_origin_hosts(value: str) -> List[str]:
     hosts: List[str] = []
     for item in str(value or "").split(","):
@@ -267,6 +298,123 @@ def _split_origin_hosts(value: str) -> List[str]:
         if host and host not in hosts:
             hosts.append(host)
     return hosts
+
+
+def _normalize_string_list(value: Any, max_len: int = 120) -> List[str]:
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = []
+    out: List[str] = []
+    for item in items:
+        text = str(item or "").strip()[:max_len]
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _normalize_limit_value(value: Any) -> Optional[int]:
+    if value in (None, "", False):
+        return None
+    try:
+        limit = int(str(value).strip())
+    except Exception:
+        return None
+    if limit < 0:
+        return None
+    return limit
+
+
+def _normalize_limit_map(raw_limits: Any) -> Dict[str, Optional[int]]:
+    if not isinstance(raw_limits, dict):
+        return {}
+    normalized: Dict[str, Optional[int]] = {}
+    aliases = {
+        "usage_limit_monthly": "monthly_checks",
+        "monthly_usage_limit": "monthly_checks",
+        "checks_monthly": "monthly_checks",
+        "preflight_monthly": "monthly_preflight_checks",
+        "recovery_monthly": "monthly_recovery_checks",
+        "records_monthly": "monthly_records_reads",
+    }
+    for raw_key, raw_value in raw_limits.items():
+        key = str(raw_key or "").strip().lower()
+        key = aliases.get(key, key)
+        if key not in LIMIT_COUNTER_LABELS:
+            continue
+        normalized[key] = _normalize_limit_value(raw_value)
+    return normalized
+
+
+def _normalize_assets_by_network(value: Any) -> Dict[str, List[str]]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for raw_chain, raw_assets in value.items():
+        chain = _normalize_chain_raw(raw_chain)
+        if not chain:
+            continue
+        assets = []
+        if isinstance(raw_assets, str):
+            assets = [item.strip().upper() for item in raw_assets.split(",") if item.strip()]
+        elif isinstance(raw_assets, (list, tuple, set)):
+            assets = [str(item or "").strip().upper() for item in raw_assets if str(item or "").strip()]
+        if assets:
+            out[chain] = sorted(set(assets))
+    return out
+
+
+def _normalize_policy_map(raw_policy: Any) -> Dict[str, Any]:
+    if not isinstance(raw_policy, dict):
+        raw_policy = {}
+    allowed_origin_hosts = _split_origin_hosts(",".join(_normalize_string_list(raw_policy.get("allowed_origins") or raw_policy.get("allowed_origin_hosts") or [])))
+    allowed_ip_cidrs = _normalize_string_list(raw_policy.get("allowed_ip_cidrs") or raw_policy.get("allowed_ips") or [])
+    allowed_networks = [_normalize_chain_raw(item) for item in _normalize_string_list(raw_policy.get("allowed_networks") or [])]
+    allowed_networks = [item for item in allowed_networks if item]
+    allowed_assets_by_network = _normalize_assets_by_network(raw_policy.get("allowed_assets_by_network") or {})
+    require_reference_raw = raw_policy.get("require_reference_id_on")
+    require_reference_id_on: List[str] = []
+    if raw_policy.get("require_reference_id") is True:
+        require_reference_id_on = ["preflight", "recovery"]
+    else:
+        require_reference_id_on = [
+            item for item in [str(v or "").strip().lower() for v in _normalize_string_list(require_reference_raw or [])]
+            if item in {"preflight", "recovery"}
+        ]
+    records_max_page_size = _normalize_limit_value(raw_policy.get("records_max_page_size"))
+    out: Dict[str, Any] = {
+        "allowed_origin_hosts": allowed_origin_hosts,
+        "allowed_ip_cidrs": allowed_ip_cidrs,
+        "allowed_networks": allowed_networks,
+        "allowed_assets_by_network": allowed_assets_by_network,
+        "require_reference_id_on": require_reference_id_on,
+    }
+    if records_max_page_size is not None:
+        out["records_max_page_size"] = max(1, min(DEFAULT_RECORDS_MAX_PAGE_SIZE, records_max_page_size))
+    return out
+
+
+def load_plan_limits() -> Dict[str, Dict[str, Optional[int]]]:
+    out = {plan: dict(limits) for plan, limits in DEFAULT_PLAN_LIMITS_FALLBACK.items()}
+    raw = PLAN_LIMITS_JSON
+    if not raw:
+        return out
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return out
+    if not isinstance(parsed, dict):
+        return out
+    for raw_plan, raw_limits in parsed.items():
+        plan = str(raw_plan or "").strip().lower()
+        if not plan:
+            continue
+        merged = dict(out.get(plan, {}))
+        merged.update(_normalize_limit_map(raw_limits))
+        out[plan] = merged
+    return out
 
 
 def load_api_keys() -> Dict[str, Dict[str, Any]]:
@@ -307,6 +455,26 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
             usage_limit_monthly = int(str(usage_limit_monthly_raw).strip()) if usage_limit_monthly_raw not in (None, "") else None
         except Exception:
             usage_limit_monthly = None
+        explicit_limits = _normalize_limit_map(item.get("limits") or {})
+        if "monthly_checks" not in explicit_limits and usage_limit_monthly is not None:
+            explicit_limits["monthly_checks"] = usage_limit_monthly
+        raw_policy = item.get("policy") if isinstance(item.get("policy"), dict) else {}
+        merged_policy = dict(raw_policy)
+        if item.get("allowed_origins") is not None:
+            merged_policy["allowed_origins"] = item.get("allowed_origins")
+        if item.get("allowed_ip_cidrs") is not None:
+            merged_policy["allowed_ip_cidrs"] = item.get("allowed_ip_cidrs")
+        if item.get("allowed_networks") is not None:
+            merged_policy["allowed_networks"] = item.get("allowed_networks")
+        if item.get("allowed_assets_by_network") is not None:
+            merged_policy["allowed_assets_by_network"] = item.get("allowed_assets_by_network")
+        if item.get("require_reference_id") is not None:
+            merged_policy["require_reference_id"] = item.get("require_reference_id")
+        if item.get("require_reference_id_on") is not None:
+            merged_policy["require_reference_id_on"] = item.get("require_reference_id_on")
+        if item.get("records_max_page_size") is not None:
+            merged_policy["records_max_page_size"] = item.get("records_max_page_size")
+        normalized_policy = _normalize_policy_map(merged_policy)
         client_value = str(
             item.get("client")
             or item.get("client_name")
@@ -332,6 +500,8 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
             "role": normalize_role(item.get("role") or "client"),
             "plan": str(item.get("plan") or "pilot").strip()[:80],
             "usage_limit_monthly": usage_limit_monthly,
+            "limits": explicit_limits,
+            "policy": normalized_policy,
             "webhook_url": str(item.get("webhook_url") or "").strip(),
             "webhook_secret": str(item.get("webhook_secret") or "").strip(),
             "webhook_active": bool(item.get("webhook_active", True)),
@@ -343,6 +513,7 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
     return loaded
 
 
+PLAN_LIMITS = load_plan_limits()
 PUBLIC_DEMO_HOSTS = _split_origin_hosts(PUBLIC_DEMO_ORIGINS)
 API_KEYS = load_api_keys()
 
@@ -658,7 +829,7 @@ def evaluate_recent_alerts(trigger_event: Optional[Dict[str, Any]] = None) -> Li
                 last_sent = ALERT_STATE.get(key, 0.0)
                 if now - last_sent >= ALERT_COOLDOWN_SEC:
                     ALERT_STATE[key] = now
-                    emit_structured_log("alert_triggered", level="warning", **alert)
+                    emit_structured_log("alert_triggered", **{**alert, "level": str(alert.get("level") or "warning")})
     return alerts
 
 
@@ -706,6 +877,8 @@ def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
             "role": normalize_role(record.get("role") or "client"),
             "plan": record.get("plan") or "pilot",
             "usage_limit_monthly": record.get("usage_limit_monthly"),
+            "limits": dict(record.get("limits") or {}),
+            "policy": dict(record.get("policy") or {}),
             "webhook_url": record.get("webhook_url") or "",
             "webhook_secret": record.get("webhook_secret") or "",
             "webhook_active": bool(record.get("webhook_active", True)),
@@ -726,6 +899,8 @@ def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
             "role": "demo",
             "plan": "demo",
             "usage_limit_monthly": None,
+            "limits": {},
+            "policy": {},
         }
 
     raise ApiError("API key required for direct API access.", 401)
@@ -1446,6 +1621,301 @@ def row_to_dict(row: Any) -> Dict[str, Any]:
     return {}
 
 
+def billing_period_bounds(period: str = "this_month") -> Dict[str, str]:
+    normalized = str(period or "this_month").strip().lower()
+    now = datetime.now(timezone.utc)
+    if normalized == "this_month":
+        since_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if since_dt.month == 12:
+            resets_dt = since_dt.replace(year=since_dt.year + 1, month=1)
+        else:
+            resets_dt = since_dt.replace(month=since_dt.month + 1)
+        return {
+            "period": "this_month",
+            "since": since_dt.isoformat(),
+            "resets_at": resets_dt.isoformat(),
+        }
+    return {
+        "period": normalized,
+        "since": period_start_iso(normalized),
+        "resets_at": "",
+    }
+
+
+def limit_counter_names_for_path(path: str) -> List[str]:
+    normalized = path.rstrip("/") or "/"
+    if normalized.startswith("/api/verification-records"):
+        return list(BILLING_LIMIT_ENDPOINTS.get("/api/verification-records", []))
+    return list(BILLING_LIMIT_ENDPOINTS.get(normalized, []))
+
+
+def resolve_effective_limits(access: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    plan = str(access.get("plan") or "pilot").strip().lower()
+    effective = dict(PLAN_LIMITS.get(plan, {}))
+    explicit = access.get("limits") or {}
+    if isinstance(explicit, dict):
+        effective.update(explicit)
+    legacy_monthly = access.get("usage_limit_monthly")
+    if legacy_monthly is not None and "monthly_checks" not in effective:
+        effective["monthly_checks"] = _normalize_limit_value(legacy_monthly)
+    for counter_name in LIMIT_COUNTER_LABELS:
+        effective.setdefault(counter_name, None)
+    return effective
+
+
+def fetch_usage_counters(access: Dict[str, Any], since_iso: str) -> Dict[str, int]:
+    scope = access_scope(access)
+    tenant_id = scope["tenant_id"]
+    environment = scope["environment"]
+    counters = {name: 0 for name in LIMIT_COUNTER_LABELS}
+    conn = get_db()
+    try:
+        usage_rows = db_fetchall(
+            conn,
+            """
+            SELECT service, COUNT(*) AS total_count
+            FROM usage_events
+            WHERE tenant_id = ? AND environment = ? AND created_at >= ?
+            GROUP BY service
+            """,
+            (tenant_id, environment, since_iso),
+        )
+        records_row = db_fetchone(
+            conn,
+            """
+            SELECT COUNT(*) AS total_count
+            FROM api_access_log
+            WHERE tenant_id = ? AND environment = ? AND created_at >= ? AND path LIKE ?
+            """,
+            (tenant_id, environment, since_iso, "/api/verification-records%"),
+        )
+    finally:
+        conn.close()
+    service_totals: Dict[str, int] = {}
+    for row in usage_rows:
+        row_dict = row_to_dict(row)
+        service = str(row_dict.get("service") or "").strip().lower()
+        try:
+            service_totals[service] = int(row_dict.get("total_count") or 0)
+        except Exception:
+            service_totals[service] = 0
+    counters["monthly_preflight_checks"] = int(service_totals.get("preflight-check", 0))
+    counters["monthly_recovery_checks"] = int(service_totals.get("recovery-copilot", 0))
+    counters["monthly_checks"] = counters["monthly_preflight_checks"] + counters["monthly_recovery_checks"]
+    records_data = row_to_dict(records_row)
+    counters["monthly_records_reads"] = int(records_data.get("total_count") or 0)
+    return counters
+
+
+def build_limit_state(access: Dict[str, Any], period: str = "this_month") -> Dict[str, Any]:
+    bounds = billing_period_bounds(period)
+    counters = fetch_usage_counters(access, bounds["since"])
+    effective_limits = resolve_effective_limits(access)
+    state: Dict[str, Any] = {
+        "period": bounds["period"],
+        "since": bounds["since"],
+        "resets_at": bounds["resets_at"],
+        "plan": str(access.get("plan") or "pilot"),
+        "quota_ok": True,
+        "items": {},
+    }
+    for counter_name, label in LIMIT_COUNTER_LABELS.items():
+        limit_value = effective_limits.get(counter_name)
+        used_value = int(counters.get(counter_name, 0))
+        remaining_value = None if limit_value is None else max(0, int(limit_value) - used_value)
+        exceeded = bool(limit_value is not None and used_value >= int(limit_value))
+        if exceeded:
+            state["quota_ok"] = False
+        state["items"][counter_name] = {
+            "label": label,
+            "limit": limit_value,
+            "used": used_value,
+            "remaining": remaining_value,
+            "exceeded": exceeded,
+        }
+    return state
+
+
+def request_endpoint_alias(path: str) -> str:
+    normalized = path.rstrip("/") or "/"
+    return {
+        "/api/preflight-check": "preflight",
+        "/api/recovery-copilot": "recovery",
+        "/api/verification-records": "records",
+        "/api/account": "account",
+        "/api/usage-summary": "usage",
+    }.get(normalized, normalized)
+
+
+def current_request_host() -> str:
+    return _extract_host(request.headers.get("Origin", "")) or _extract_host(request.headers.get("Referer", ""))
+
+
+def ip_allowed_by_cidrs(ip_value: str, cidrs: List[str]) -> bool:
+    ip_text = str(ip_value or "").strip()
+    if not ip_text or not cidrs:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(ip_text)
+    except Exception:
+        return False
+    for item in cidrs:
+        candidate = str(item or "").strip()
+        if not candidate:
+            continue
+        try:
+            if ip_obj in ipaddress.ip_network(candidate, strict=False):
+                return True
+        except Exception:
+            if candidate == ip_text:
+                return True
+    return False
+
+
+def resolve_access_policy(access: Dict[str, Any]) -> Dict[str, Any]:
+    raw_policy = access.get("policy") or {}
+    if not isinstance(raw_policy, dict):
+        raw_policy = {}
+    out = {
+        "allowed_origin_hosts": list(raw_policy.get("allowed_origin_hosts") or []),
+        "allowed_ip_cidrs": list(raw_policy.get("allowed_ip_cidrs") or []),
+        "allowed_networks": list(raw_policy.get("allowed_networks") or []),
+        "allowed_assets_by_network": dict(raw_policy.get("allowed_assets_by_network") or {}),
+        "require_reference_id_on": list(raw_policy.get("require_reference_id_on") or []),
+    }
+    max_page_size = raw_policy.get("records_max_page_size")
+    if isinstance(max_page_size, int):
+        out["records_max_page_size"] = max(1, min(DEFAULT_RECORDS_MAX_PAGE_SIZE, max_page_size))
+    return out
+
+
+def enforce_role_for_request(access: Dict[str, Any], path: str) -> None:
+    blocked_paths = ROLE_WRITE_BLOCKS.get(normalize_role(access.get("role") or "client"), set())
+    normalized = path.rstrip("/") or "/"
+    if normalized in blocked_paths:
+        raise ApiError(
+            "This API key is read-only for this endpoint.",
+            403,
+            code="ROLE_READ_ONLY",
+            details={"role": normalize_role(access.get("role") or "client"), "path": normalized},
+        )
+
+
+def enforce_policy_for_request(access: Dict[str, Any], path: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    policy = resolve_access_policy(access)
+    if not policy:
+        return
+    normalized = path.rstrip("/") or "/"
+    payload = payload or current_json_payload()
+    origin_host = current_request_host()
+    allowed_origin_hosts = policy.get("allowed_origin_hosts") or []
+    if allowed_origin_hosts:
+        if not origin_host or origin_host not in allowed_origin_hosts:
+            raise ApiError(
+                "Request origin is not allowed for this API key.",
+                403,
+                code="POLICY_ORIGIN_NOT_ALLOWED",
+                details={"origin_host": origin_host or "", "allowed_origin_hosts": allowed_origin_hosts},
+            )
+    allowed_ip_cidrs = policy.get("allowed_ip_cidrs") or []
+    if allowed_ip_cidrs and not ip_allowed_by_cidrs(get_client_ip(), allowed_ip_cidrs):
+        raise ApiError(
+            "Source IP is not allowed for this API key.",
+            403,
+            code="POLICY_IP_NOT_ALLOWED",
+            details={"source_ip": get_client_ip()},
+        )
+    endpoint_alias = request_endpoint_alias(normalized)
+    require_reference_id_on = set(policy.get("require_reference_id_on") or [])
+    if endpoint_alias in require_reference_id_on:
+        reference_id = normalize_text(((payload or {}).get("context") or {}).get("reference_id"), 120)
+        if not reference_id:
+            raise ApiError(
+                "reference_id is required by policy for this endpoint.",
+                403,
+                code="POLICY_REFERENCE_ID_REQUIRED",
+                details={"endpoint": endpoint_alias},
+            )
+    allowed_networks = policy.get("allowed_networks") or []
+    if normalized == "/api/preflight-check" and allowed_networks:
+        expected = (payload or {}).get("expected") or {}
+        provided = (payload or {}).get("provided") or {}
+        networks = [
+            normalize_chain(expected.get("network") or expected.get("chain") or ""),
+            normalize_chain(provided.get("network") or provided.get("chain") or ""),
+        ]
+        disallowed = sorted({network for network in networks if network and network not in allowed_networks})
+        if disallowed:
+            raise ApiError(
+                "Requested network is outside the policy allowlist.",
+                403,
+                code="POLICY_NETWORK_NOT_ALLOWED",
+                details={"disallowed_networks": disallowed, "allowed_networks": allowed_networks},
+            )
+    if normalized == "/api/recovery-copilot" and allowed_networks:
+        requested_chain = normalize_chain((payload or {}).get("network") or (payload or {}).get("chain") or "")
+        if requested_chain and requested_chain != "auto" and requested_chain not in allowed_networks:
+            raise ApiError(
+                "Requested network is outside the policy allowlist.",
+                403,
+                code="POLICY_NETWORK_NOT_ALLOWED",
+                details={"requested_network": requested_chain, "allowed_networks": allowed_networks},
+            )
+    allowed_assets_by_network = policy.get("allowed_assets_by_network") or {}
+    if normalized == "/api/preflight-check" and allowed_assets_by_network:
+        expected = (payload or {}).get("expected") or {}
+        provided = (payload or {}).get("provided") or {}
+        asset_checks = [
+            (normalize_chain(expected.get("network") or expected.get("chain") or ""), str(expected.get("asset") or "").strip().upper(), "expected"),
+            (normalize_chain(provided.get("network") or provided.get("chain") or ""), str(provided.get("asset") or "").strip().upper(), "provided"),
+        ]
+        violations: List[Dict[str, str]] = []
+        for network, asset, side in asset_checks:
+            allowed_assets = allowed_assets_by_network.get(network) or []
+            if network and asset and allowed_assets and asset not in allowed_assets:
+                violations.append({"side": side, "network": network, "asset": asset})
+        if violations:
+            raise ApiError(
+                "Requested asset is outside the policy allowlist.",
+                403,
+                code="POLICY_ASSET_NOT_ALLOWED",
+                details={"violations": violations},
+            )
+
+
+def enforce_billing_limits_for_request(access: Dict[str, Any], path: str) -> None:
+    normalized = path.rstrip("/") or "/"
+    counter_names = limit_counter_names_for_path(normalized)
+    if not counter_names:
+        return
+    limit_state = build_limit_state(access, "this_month")
+    if has_request_context():
+        g.limit_state = limit_state
+    for counter_name in counter_names:
+        item = (limit_state.get("items") or {}).get(counter_name) or {}
+        if item.get("exceeded"):
+            raise ApiError(
+                f"{item.get('label') or counter_name} limit reached for the current billing period.",
+                429,
+                code="QUOTA_EXCEEDED",
+                details={
+                    "counter": counter_name,
+                    "period": limit_state.get("period"),
+                    "since": limit_state.get("since"),
+                    "resets_at": limit_state.get("resets_at"),
+                    **item,
+                },
+            )
+
+
+def apply_record_limit_policy(filters: Dict[str, Any], access: Dict[str, Any]) -> Dict[str, Any]:
+    policy = resolve_access_policy(access)
+    out = dict(filters)
+    max_page_size = int(policy.get("records_max_page_size") or DEFAULT_RECORDS_MAX_PAGE_SIZE)
+    out["limit"] = max(1, min(int(out.get("limit") or 20), max_page_size))
+    return out
+
+
 def build_record_search_text(parts: List[Any]) -> str:
     joined = " | ".join(str(part or "").strip() for part in parts if str(part or "").strip())
     return joined[:2000]
@@ -1914,11 +2384,8 @@ def build_account_snapshot(access: Dict[str, Any]) -> Dict[str, Any]:
     client_label = normalize_text(str(access.get("client") or "unknown-client"), 120)
     tenant_summary = build_tenant_key_summary(access)
     monthly_usage = summarize_usage_for_scope(access, "this_month")
-    usage_limit_monthly = access.get("usage_limit_monthly")
-    billable_checks = int(monthly_usage.get("totals", {}).get("checks") or 0)
-    usage_remaining = None
-    if isinstance(usage_limit_monthly, int):
-        usage_remaining = max(0, usage_limit_monthly - billable_checks)
+    limit_state = build_limit_state(access, "this_month")
+    checks_item = ((limit_state.get("items") or {}).get("monthly_checks") or {})
 
     return {
         "tenant": tenant_summary,
@@ -1934,11 +2401,13 @@ def build_account_snapshot(access: Dict[str, Any]) -> Dict[str, Any]:
         },
         "usage": {
             "billing_period": "this_month",
-            "billable_checks": billable_checks,
-            "usage_limit_monthly": usage_limit_monthly,
-            "usage_remaining_monthly": usage_remaining,
+            "billable_checks": int(monthly_usage.get("totals", {}).get("checks") or 0),
+            "usage_limit_monthly": checks_item.get("limit"),
+            "usage_remaining_monthly": checks_item.get("remaining"),
             "summary": monthly_usage,
         },
+        "limits": limit_state,
+        "policy": resolve_access_policy(access),
         "webhooks": {
             "active": bool(access.get("webhook_active", False)),
             "events": list(access.get("webhook_events") or []),
@@ -2403,6 +2872,8 @@ def upsert_tenant_registry_from_api_keys() -> None:
                 )
 
             scopes_json = json_dumps_safe(sorted(list(record.get("scopes") or [])))
+            limits_json = json_dumps_safe(record.get("limits") or {})
+            policy_json = json_dumps_safe(record.get("policy") or {})
             webhook_events_json = json_dumps_safe(list(record.get("webhook_events") or []))
             key_fingerprint = normalize_text(str(record.get("key_fingerprint") or ""), 64)
             key_hint = normalize_text(str(record.get("key_hint") or ""), 32)
@@ -2415,6 +2886,8 @@ def upsert_tenant_registry_from_api_keys() -> None:
                 normalize_role(record.get("role") or "client"),
                 plan_value,
                 scopes_json,
+                limits_json,
+                policy_json,
                 1 if bool(record.get("active", True)) else 0,
                 record.get("usage_limit_monthly"),
                 1 if bool(record.get("webhook_active", True)) else 0,
@@ -2427,14 +2900,14 @@ def upsert_tenant_registry_from_api_keys() -> None:
             if key_exists:
                 db_execute(
                     conn,
-                    "UPDATE tenant_api_keys SET tenant_id = ?, client_label = ?, display_name = ?, environment = ?, role = ?, plan = ?, scopes_json = ?, active = ?, usage_limit_monthly = ?, webhook_active = ?, webhook_events_json = ?, webhook_url_host = ?, key_hint = ?, updated_at = ?, last_synced_at = ? WHERE key_fingerprint = ?",
+                    "UPDATE tenant_api_keys SET tenant_id = ?, client_label = ?, display_name = ?, environment = ?, role = ?, plan = ?, scopes_json = ?, limits_json = ?, policy_json = ?, active = ?, usage_limit_monthly = ?, webhook_active = ?, webhook_events_json = ?, webhook_url_host = ?, key_hint = ?, updated_at = ?, last_synced_at = ? WHERE key_fingerprint = ?",
                     key_params + (key_fingerprint,),
                 )
             else:
                 db_execute(
                     conn,
-                    "INSERT INTO tenant_api_keys(tenant_id, client_label, display_name, environment, role, plan, scopes_json, active, usage_limit_monthly, webhook_active, webhook_events_json, webhook_url_host, key_fingerprint, key_hint, created_at, updated_at, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    key_params[:12] + (key_fingerprint, key_hint, now_iso, now_iso, now_iso),
+                    "INSERT INTO tenant_api_keys(tenant_id, client_label, display_name, environment, role, plan, scopes_json, limits_json, policy_json, active, usage_limit_monthly, webhook_active, webhook_events_json, webhook_url_host, key_fingerprint, key_hint, created_at, updated_at, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    key_params[:14] + (key_fingerprint, key_hint, now_iso, now_iso, now_iso),
                 )
         conn.commit()
     finally:
@@ -2701,6 +3174,8 @@ def ensure_db() -> None:
                   role TEXT,
                   plan TEXT,
                   scopes_json TEXT,
+                  limits_json TEXT,
+                  policy_json TEXT,
                   active INTEGER DEFAULT 1,
                   usage_limit_monthly INTEGER,
                   webhook_active INTEGER DEFAULT 0,
@@ -2740,6 +3215,8 @@ def ensure_db() -> None:
                   role TEXT,
                   plan TEXT,
                   scopes_json TEXT,
+                  limits_json TEXT,
+                  policy_json TEXT,
                   active INTEGER DEFAULT 1,
                   usage_limit_monthly INTEGER,
                   webhook_active INTEGER DEFAULT 0,
@@ -2949,6 +3426,8 @@ def ensure_db() -> None:
         ensure_column(conn, "tenant_api_keys", "role", "TEXT")
         ensure_column(conn, "tenant_api_keys", "plan", "TEXT")
         ensure_column(conn, "tenant_api_keys", "scopes_json", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "limits_json", "TEXT")
+        ensure_column(conn, "tenant_api_keys", "policy_json", "TEXT")
         ensure_column(conn, "tenant_api_keys", "active", "INTEGER DEFAULT 1")
         ensure_column(conn, "tenant_api_keys", "usage_limit_monthly", "INTEGER")
         ensure_column(conn, "tenant_api_keys", "webhook_active", "INTEGER DEFAULT 0")
@@ -2972,6 +3451,9 @@ def ensure_db() -> None:
         ensure_column(conn, "usage_events", "timeout_flag", "INTEGER DEFAULT 0")
         ensure_column(conn, "usage_events", "duration_ms", "INTEGER DEFAULT 0")
         ensure_column(conn, "usage_events", "metadata_json", "TEXT")
+        ensure_column(conn, "api_access_log", "tenant_id", "TEXT")
+        ensure_column(conn, "api_access_log", "environment", "TEXT")
+        ensure_column(conn, "api_access_log", "role", "TEXT")
         ensure_column(conn, "event_log", "tenant_id", "TEXT")
         ensure_column(conn, "event_log", "environment", "TEXT")
         ensure_column(conn, "event_log", "role", "TEXT")
@@ -3023,6 +3505,8 @@ def ensure_db() -> None:
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_record_id ON webhook_deliveries(record_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_env_created_at ON webhook_deliveries(tenant_id, environment, created_at)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_next_attempt ON webhook_deliveries(delivery_status, next_attempt_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_api_access_log_tenant_env_created_at ON api_access_log(tenant_id, environment, created_at)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_api_access_log_path_created_at ON api_access_log(path, created_at)")
         conn.commit()
     finally:
         conn.close()
@@ -3047,9 +3531,13 @@ def apply_access_controls():
         access = authenticate_api_request(scope)
         g.api_access = access
         if access["mode"] == "api_key":
+            enforce_role_for_request(access, path)
+            enforce_policy_for_request(access, path)
+            enforce_billing_limits_for_request(access, path)
             bucket = f"api:key:{access['client']}:{scope}"
             allowed, meta = consume_rate_limit(bucket, KEYED_API_RATE_LIMIT, KEYED_API_RATE_WINDOW_SEC)
         else:
+            g.limit_state = build_limit_state(access, "this_month")
             bucket = f"api:anon:{get_client_ip()}:{scope}"
             allowed, meta = consume_rate_limit(bucket, ANON_API_RATE_LIMIT, ANON_API_RATE_WINDOW_SEC)
         g.rate_limit_meta = meta
@@ -3104,6 +3592,18 @@ def attach_response_headers(response):
         response.headers.setdefault("X-API-Client", str(access.get("client") or ""))
         response.headers.setdefault("X-API-Environment", str(access.get("environment") or ""))
         response.headers.setdefault("X-API-Plan", str(access.get("plan") or ""))
+    limit_state = getattr(g, "limit_state", None)
+    if isinstance(limit_state, dict):
+        checks_item = ((limit_state.get("items") or {}).get("monthly_checks") or {})
+        if checks_item:
+            response.headers.setdefault("X-Billing-Period", str(limit_state.get("period") or "this_month"))
+            if checks_item.get("limit") is not None:
+                response.headers.setdefault("X-Usage-Checks-Limit", str(checks_item.get("limit")))
+            response.headers.setdefault("X-Usage-Checks-Used", str(checks_item.get("used") or 0))
+            if checks_item.get("remaining") is not None:
+                response.headers.setdefault("X-Usage-Checks-Remaining", str(checks_item.get("remaining")))
+            if limit_state.get("resets_at"):
+                response.headers.setdefault("X-Billing-Resets-At", str(limit_state.get("resets_at")))
     kick_webhook_processor()
     return response
 
@@ -3116,17 +3616,24 @@ class RpcResult:
 
 
 class ApiError(Exception):
-    def __init__(self, message: str, status_code: int = 400):
+    def __init__(self, message: str, status_code: int = 400, code: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        self.code = code
+        self.details = details or {}
 
 
 @app.errorhandler(ApiError)
 def handle_api_error(err: ApiError):
     if not getattr(g, "event_logged", False):
-        record_request_failure(request.path, err.status_code, err.message)
-    return jsonify({"ok": False, "error": err.message, "trace_id": current_request_id()}), err.status_code
+        record_request_failure(request.path, err.status_code, err.code or err.message)
+    payload = {"ok": False, "error": err.code or err.message, "trace_id": current_request_id()}
+    if err.code:
+        payload["message"] = err.message
+    if err.details:
+        payload["details"] = err.details
+    return jsonify(payload), err.status_code
 
 
 @app.errorhandler(Exception)
@@ -3187,7 +3694,9 @@ def account_summary():
     access = getattr(g, "api_access", None) or {}
     if access.get("mode") != "api_key":
         raise ApiError("API key required for account summary.", 401)
+    log_api_access("/api/account")
     snapshot = build_account_snapshot(access)
+    g.limit_state = snapshot.get("limits")
     if "current_key" in snapshot:
         snapshot["client"] = {
             "tenant_id": snapshot.get("tenant", {}).get("tenant_id"),
@@ -3210,13 +3719,17 @@ def usage_summary():
     access = getattr(g, "api_access", None) or {}
     if access.get("mode") != "api_key":
         raise ApiError("API key required for usage summary.", 401)
+    log_api_access("/api/usage-summary")
     period = str(request.args.get("period") or "30d").strip().lower()
     summary = summarize_usage_for_scope(access, period)
+    limit_state = build_limit_state(access, "this_month")
+    g.limit_state = limit_state
     return jsonify({
         "ok": True,
         "trace_id": current_request_id(),
         "tenant_id": str(access.get("tenant_id") or access.get("client") or "unknown-client"),
         "environment": str(access.get("environment") or "live"),
+        "limits": limit_state,
         **summary,
     })
 
@@ -3226,8 +3739,10 @@ def verification_records_history():
     access = getattr(g, "api_access", None) or {}
     if access.get("mode") != "api_key":
         raise ApiError("API key required for verification history.", 401)
-    filters = extract_record_filters(request.args)
+    log_api_access("/api/verification-records")
+    filters = apply_record_limit_policy(extract_record_filters(request.args), access)
     result = search_verification_records(filters, str(access.get("tenant_id") or access.get("client") or ""), normalize_environment(access.get("environment") or "live"))
+    g.limit_state = build_limit_state(access, "this_month")
     return jsonify({
         "ok": True,
         "trace_id": current_request_id(),
@@ -3241,7 +3756,9 @@ def verification_record_detail(record_id: str):
     access = getattr(g, "api_access", None) or {}
     if access.get("mode") != "api_key":
         raise ApiError("API key required for verification history.", 401)
+    log_api_access(f"/api/verification-records/{record_id}")
     record = fetch_record_detail(record_id, str(access.get("tenant_id") or access.get("client") or ""), normalize_environment(access.get("environment") or "live"))
+    g.limit_state = build_limit_state(access, "this_month")
     if not record:
         raise ApiError("Verification record not found.", 404)
     return jsonify({
@@ -3498,6 +4015,8 @@ def preflight_check():
             "confidence": outcome["confidence"],
         },
     )
+    g.limit_state = build_limit_state(access, "this_month")
+    response_payload["limits"] = g.limit_state
     delivery_id = create_webhook_delivery_for_record(record_id, "preflight_run", access)
     if delivery_id:
         response_payload["webhook"] = {
@@ -3547,8 +4066,10 @@ def analyze_transaction_on_chain(chain: str, tx_hash: str, issue_type: str, inte
     }
 
 
-def auto_detect_recovery_chain(tx_hash: str, issue_type: str, intended_address: str, intended_chain: str) -> Tuple[str, Dict[str, Any]]:
-    if is_likely_evm_tx_hash(tx_hash):
+def auto_detect_recovery_chain(tx_hash: str, issue_type: str, intended_address: str, intended_chain: str, candidate_override: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
+    if candidate_override:
+        candidates = ordered_candidates([normalize_chain(item) for item in candidate_override if normalize_chain(item)], intended_chain)
+    elif is_likely_evm_tx_hash(tx_hash):
         candidates = ordered_candidates(EVM_CHAIN_ORDER, intended_chain)
     elif is_likely_solana_signature(tx_hash):
         candidates = ['solana']
@@ -3652,8 +4173,13 @@ def recovery_copilot():
     if not tx_hash:
         raise ApiError("tx_hash is required.")
 
+    access = getattr(g, "api_access", None) or {}
+    policy = resolve_access_policy(access)
+    allowed_networks = list(policy.get("allowed_networks") or [])
+
     if not chain or chain == "auto":
-        chain, analysis = auto_detect_recovery_chain(tx_hash, issue_type, intended_address, intended_chain)
+        candidate_override = allowed_networks if allowed_networks else None
+        chain, analysis = auto_detect_recovery_chain(tx_hash, issue_type, intended_address, intended_chain, candidate_override=candidate_override)
     elif chain in EVM_CHAINS or chain == "solana":
         analysis = analyze_transaction_on_chain(chain, tx_hash, issue_type, intended_address, intended_chain)
     else:
@@ -3661,6 +4187,13 @@ def recovery_copilot():
 
     observed = analysis.get("observed") or {}
     effective_chain = normalize_chain(str(observed.get("chain") or chain or "")) or chain or "auto"
+    if allowed_networks and effective_chain not in {"", "auto"} and effective_chain not in allowed_networks:
+        raise ApiError(
+            "Resolved network is outside the policy allowlist.",
+            403,
+            code="POLICY_NETWORK_NOT_ALLOWED",
+            details={"resolved_network": effective_chain, "allowed_networks": allowed_networks},
+        )
     destination_profile = build_destination_profile(effective_chain if effective_chain != 'auto' else '', str(observed.get("destination") or ""), {
         "address_type": observed.get("destination_type") or "unknown",
         "rpc_used": bool(observed.get("destination") and analysis.get("status") not in {"unavailable", "not_found"}),
@@ -3753,6 +4286,8 @@ def recovery_copilot():
             "confidence": confidence,
         },
     )
+    g.limit_state = build_limit_state(access, "this_month")
+    response_payload["limits"] = g.limit_state
     delivery_id = create_webhook_delivery_for_record(record_id, "recovery_run", access)
     if delivery_id:
         response_payload["webhook"] = {
@@ -4087,22 +4622,28 @@ def log_api_access(path: str) -> None:
     access = getattr(g, "api_access", None) or {}
     if not access:
         return
+    scope = access_scope(access)
     emit_structured_log(
         "api_access",
         endpoint=path,
         access_mode=str(access.get("mode") or "unknown"),
         client_label=str(access.get("client") or "unknown-client"),
+        tenant_id=scope.get("tenant_id"),
+        environment=scope.get("environment"),
     )
     conn = get_db()
     try:
         db_execute(
             conn,
-            "INSERT INTO api_access_log(created_at, path, access_mode, client_label, source_ip) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO api_access_log(created_at, path, access_mode, client_label, tenant_id, environment, role, source_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 utc_now_iso(),
                 path,
                 str(access.get("mode") or "unknown"),
                 str(access.get("client") or "unknown-client"),
+                scope.get("tenant_id"),
+                scope.get("environment"),
+                scope.get("role"),
                 get_client_ip(),
             ),
         )
