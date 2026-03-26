@@ -28,7 +28,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "1.7.0-webhooks-records"
+APP_VERSION = "1.7.1-webhooks-inline-dispatch"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1720,6 +1720,25 @@ def update_webhook_delivery_result(delivery_id: str, *, delivery_status: str, ac
         conn.close()
 
 
+def fetch_webhook_delivery_by_id(delivery_id: str) -> Dict[str, Any]:
+    conn = get_db()
+    try:
+        row = db_fetchone(
+            conn,
+            """
+            SELECT wd.*, vr.response_json, vr.request_id, vr.service, vr.network, vr.status, vr.reason_code, vr.client_label, vr.record_id
+            FROM webhook_deliveries wd
+            JOIN verification_records vr ON vr.record_id = wd.record_id
+            WHERE wd.delivery_id = ?
+            LIMIT 1
+            """,
+            (delivery_id,),
+        )
+    finally:
+        conn.close()
+    return row_to_dict(row)
+
+
 def fetch_pending_webhook_deliveries(limit: int) -> List[Dict[str, Any]]:
     now_iso = utc_now_iso()
     conn = get_db()
@@ -1842,6 +1861,17 @@ def process_pending_webhooks(batch_size: int = WEBHOOK_PROCESS_BATCH_SIZE) -> No
         attempt_webhook_delivery(delivery)
 
 
+def dispatch_webhook_delivery_now(delivery_id: str) -> Dict[str, Any]:
+    delivery = fetch_webhook_delivery_by_id(delivery_id)
+    if not delivery:
+        return {}
+    status = str(delivery.get("delivery_status") or "")
+    if status not in {"pending", "retry_scheduled"}:
+        return delivery
+    attempt_webhook_delivery(delivery)
+    return fetch_webhook_delivery_by_id(delivery_id)
+
+
 def _run_webhook_processor() -> None:
     try:
         idle_cycles = 0
@@ -1863,7 +1893,8 @@ def _run_webhook_processor() -> None:
                 time.sleep(0.25)
                 continue
             if sleep_for > 120:
-                break
+                time.sleep(30.0)
+                continue
             time.sleep(min(sleep_for, 30.0))
     finally:
         with WEBHOOK_PROCESS_LOCK:
@@ -2668,7 +2699,9 @@ def preflight_check():
             "delivery_id": delivery_id,
             "event": "preflight_run",
         }
-        kick_webhook_processor(force=True)
+        delivery_state = dispatch_webhook_delivery_now(delivery_id)
+        if str(delivery_state.get("delivery_status") or "") in {"pending", "retry_scheduled"}:
+            kick_webhook_processor(force=True)
     return jsonify(response_payload)
 
 
@@ -2905,7 +2938,9 @@ def recovery_copilot():
             "delivery_id": delivery_id,
             "event": "recovery_run",
         }
-        kick_webhook_processor(force=True)
+        delivery_state = dispatch_webhook_delivery_now(delivery_id)
+        if str(delivery_state.get("delivery_status") or "") in {"pending", "retry_scheduled"}:
+            kick_webhook_processor(force=True)
     return jsonify(response_payload)
 
 
