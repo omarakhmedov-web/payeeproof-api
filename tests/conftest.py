@@ -61,6 +61,23 @@ def app_module(tmp_path_factory):
 @pytest.fixture()
 def client(app_module):
     app_module.RATE_LIMIT_BUCKETS.clear()
+    conn = app_module.get_db()
+    try:
+        for table_name in [
+            'webhook_deliveries',
+            'verification_records',
+            'usage_events',
+            'api_access_log',
+            'event_log',
+            'pilot_requests',
+            'tenant_api_keys',
+            'tenants',
+        ]:
+            app_module.db_execute(conn, f'DELETE FROM {table_name}')
+        conn.commit()
+    finally:
+        conn.close()
+    app_module.upsert_tenant_registry_from_api_keys()
     return app_module.app.test_client()
 
 
