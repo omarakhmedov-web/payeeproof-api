@@ -28,7 +28,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "1.9.0-tenancy-foundation"
+APP_VERSION = "1.9.1-webhook-ack-inline"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -2067,7 +2067,7 @@ def build_webhook_payload(record: Dict[str, Any], delivery: Dict[str, Any]) -> D
 def update_webhook_delivery_result(delivery_id: str, *, delivery_status: str, ack_status: Optional[str] = None,
                                    next_attempt_at: str = "", last_response_code: Optional[int] = None,
                                    last_response_excerpt: str = "", last_error: str = "", delivered_at: str = "",
-                                   increment_attempt: bool = False) -> None:
+                                   acknowledged_at: str = "", increment_attempt: bool = False) -> None:
     conn = get_db()
     try:
         row = db_fetchone(conn, "SELECT attempt_count FROM webhook_deliveries WHERE delivery_id = ? LIMIT 1", (delivery_id,))
@@ -2084,6 +2084,7 @@ def update_webhook_delivery_result(delivery_id: str, *, delivery_status: str, ac
                 next_attempt_at = ?,
                 last_attempt_at = ?,
                 delivered_at = COALESCE(?, delivered_at),
+                acknowledged_at = COALESCE(?, acknowledged_at),
                 last_response_code = ?,
                 last_response_excerpt = ?,
                 last_error = ?
@@ -2097,6 +2098,7 @@ def update_webhook_delivery_result(delivery_id: str, *, delivery_status: str, ac
                 next_attempt_at,
                 utc_now_iso(),
                 delivered_at or None,
+                acknowledged_at or None,
                 last_response_code,
                 normalize_text(last_response_excerpt, 500),
                 normalize_text(last_error, 500),
@@ -2180,6 +2182,30 @@ def compute_retry_schedule(attempt_count: int) -> Tuple[bool, str]:
     return False, ""
 
 
+def should_mark_webhook_acknowledged(response: Any) -> bool:
+    try:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+    except Exception:
+        status_code = 0
+    if status_code < 200 or status_code >= 300:
+        return False
+    text = str(getattr(response, "text", "") or "").strip()
+    if not text:
+        return True
+    try:
+        payload = response.json()
+    except Exception:
+        lowered = text.lower()
+        return lowered in {"ok", "accepted", "ack", "acknowledged", "received"}
+    if isinstance(payload, dict):
+        if payload.get("acknowledged") is True or payload.get("ack") is True or payload.get("ok") is True:
+            return True
+        status_value = str(payload.get("status") or "").strip().lower()
+        if status_value in {"ok", "accepted", "acknowledged", "received"}:
+            return True
+    return False
+
+
 def attempt_webhook_delivery(delivery: Dict[str, Any]) -> None:
     delivery_id = str(delivery.get("delivery_id") or "")
     record_id = str(delivery.get("record_id") or "")
@@ -2206,17 +2232,20 @@ def attempt_webhook_delivery(delivery: Dict[str, Any]) -> None:
         )
         excerpt = normalize_text(response.text, 500)
         if 200 <= int(response.status_code) < 300:
+            delivered_at = utc_now_iso()
+            acknowledged_at = delivered_at if should_mark_webhook_acknowledged(response) else ""
             update_webhook_delivery_result(
                 delivery_id,
                 delivery_status="delivered",
-                ack_status="http_accepted",
+                ack_status="acknowledged" if acknowledged_at else "http_accepted",
                 last_response_code=int(response.status_code),
                 last_response_excerpt=excerpt,
                 last_error="",
-                delivered_at=utc_now_iso(),
+                delivered_at=delivered_at,
+                acknowledged_at=acknowledged_at,
                 increment_attempt=True,
             )
-            emit_structured_log("webhook_delivery_succeeded", event_name=delivery.get("event_name"), delivery_id=delivery_id, record_id=record_id, status_code=int(response.status_code))
+            emit_structured_log("webhook_delivery_succeeded", event_name=delivery.get("event_name"), delivery_id=delivery_id, record_id=record_id, status_code=int(response.status_code), acknowledged=bool(acknowledged_at))
             return
         should_retry, next_attempt_at = compute_retry_schedule(int(delivery.get("attempt_count") or 0) + 1)
         update_webhook_delivery_result(
