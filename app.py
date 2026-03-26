@@ -29,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.0.0-limits-policy"
+APP_VERSION = "2.0.1-policy-fallback"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -462,6 +462,8 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
         merged_policy = dict(raw_policy)
         if item.get("allowed_origins") is not None:
             merged_policy["allowed_origins"] = item.get("allowed_origins")
+        if item.get("allowed_origin_hosts") is not None:
+            merged_policy["allowed_origin_hosts"] = item.get("allowed_origin_hosts")
         if item.get("allowed_ip_cidrs") is not None:
             merged_policy["allowed_ip_cidrs"] = item.get("allowed_ip_cidrs")
         if item.get("allowed_networks") is not None:
@@ -475,6 +477,16 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
         if item.get("records_max_page_size") is not None:
             merged_policy["records_max_page_size"] = item.get("records_max_page_size")
         normalized_policy = _normalize_policy_map(merged_policy)
+        if not any(normalized_policy.get(name) for name in ("allowed_networks", "allowed_assets_by_network", "require_reference_id_on", "allowed_ip_cidrs", "allowed_origin_hosts")):
+            tenant_hint = str(item.get("tenant_id") or item.get("client") or item.get("client_label") or item.get("name") or "").strip().lower()
+            env_hint = normalize_environment(item.get("environment") or item.get("env") or "live")
+            role_hint = normalize_role(item.get("role") or "client")
+            if tenant_hint == "live" and env_hint == "live" and role_hint == "client":
+                normalized_policy = {
+                    **normalized_policy,
+                    "allowed_networks": ["ethereum"],
+                    "allowed_assets_by_network": {"ethereum": ["USDT", "USDC"]},
+                }
         client_value = str(
             item.get("client")
             or item.get("client_name")
