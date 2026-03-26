@@ -1,0 +1,50 @@
+PayeeProof Proprietary License
+Version 2.0
+Effective date: March 27, 2026
+
+1. Ownership
+This repository, its source code, documentation, designs, text, schemas, APIs, examples, and related materials (collectively, the “Materials”) are proprietary to the operator of the PayeeProof service (“PayeeProof”, “we”, “us”). All rights not expressly granted are reserved.
+
+2. No open-source grant
+The Materials are not provided under an open-source license. No right is granted to use, copy, modify, distribute, sublicense, publish, sell, or create derivative works from the Materials except as expressly stated in this license or in a separate written agreement signed by PayeeProof.
+
+3. Limited evaluation permission
+PayeeProof grants a limited, revocable, non-exclusive, non-transferable, non-sublicensable permission to view and use the Materials internally for review, security evaluation, procurement review, integration assessment, or testing.
+
+This permission does not allow production use, resale, commercial exploitation, public redistribution, hosted use for third parties, or any competitive use.
+
+4. Restrictions
+You may not, and may not allow any third party to:
+- distribute, publish, sublicense, lease, sell, or otherwise make the Materials available to others;
+- remove copyright, trademark, attribution, or confidentiality notices;
+- use the Materials to build, benchmark, or market a competing product or service;
+- use the Materials in production without PayeeProof’s written authorization;
+- reverse engineer non-public service components, except to the extent such restriction is prohibited by applicable law; or
+- access or use the Materials in violation of law, regulation, sanctions, or export-control restrictions.
+
+5. Feedback
+If you provide suggestions, feedback, or improvement ideas, PayeeProof may use them without restriction or compensation, and without creating any confidentiality obligation unless separately agreed in writing.
+
+6. Confidentiality
+If the Materials are shared with you for evaluation, you must treat all non-public portions as confidential information and use at least reasonable care to protect them.
+
+7. Third-party components
+Some third-party components may be included or referenced in the Materials. Those components remain subject to their own license terms. This license applies only to PayeeProof-owned Materials.
+
+8. No warranty
+THE MATERIALS ARE PROVIDED “AS IS” AND “AS AVAILABLE.” TO THE MAXIMUM EXTENT PERMITTED BY LAW, PAYEEPROOF DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, ACCURACY, OR SECURITY.
+
+9. Limitation of liability
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, PAYEEPROOF WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF DATA, PROFITS, REVENUE, GOODWILL, OR BUSINESS OPPORTUNITY, ARISING OUT OF OR RELATED TO THE MATERIALS OR THIS LICENSE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, PAYEEPROOF’S TOTAL LIABILITY ARISING OUT OF OR RELATED TO THE MATERIALS OR THIS LICENSE WILL NOT EXCEED USD 100.
+
+10. Termination
+This license terminates automatically if you violate it. Upon termination, you must stop using the Materials and delete all copies in your possession or control, except where retention is required by law.
+
+11. Governing law
+If a separate written agreement specifies governing law or venue, that agreement controls. Otherwise, this license is governed by the law of the operator’s principal place of business, excluding conflict-of-law rules, and disputes will be brought in the courts having jurisdiction there, unless applicable law requires otherwise.
+
+12. Contact
+Legal contact: hello@payeeproof.com
+Website: https://payeeproof.com
