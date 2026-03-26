@@ -196,6 +196,8 @@ logger.setLevel(logging.INFO)
 API_SCOPE_BY_PATH = {
     "/api/preflight-check": "preflight",
     "/api/recovery-copilot": "recovery",
+    "/api/account": "records",
+    "/api/usage-summary": "records",
 }
 
 
@@ -259,11 +261,35 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
             webhook_events = [evt.strip() for evt in webhook_events_raw.split(",") if evt.strip()]
         else:
             webhook_events = [str(evt).strip() for evt in webhook_events_raw if str(evt).strip()]
+        usage_limit_monthly_raw = item.get("usage_limit_monthly")
+        try:
+            usage_limit_monthly = int(str(usage_limit_monthly_raw).strip()) if usage_limit_monthly_raw not in (None, "") else None
+        except Exception:
+            usage_limit_monthly = None
+        client_value = str(
+            item.get("client")
+            or item.get("client_name")
+            or item.get("client_label")
+            or item.get("name")
+            or "unknown-client"
+        ).strip()
+        label_value = str(
+            item.get("label")
+            or item.get("name")
+            or item.get("client_label")
+            or item.get("client")
+            or client_value
+        ).strip()
         loaded[key] = {
-            "client": str(item.get("client") or item.get("client_name") or "unknown-client").strip(),
+            "client": client_value,
             "active": bool(item.get("active", True)),
             "scopes": scopes or {"preflight", "recovery", "records"},
-            "label": str(item.get("label") or "").strip(),
+            "label": label_value,
+            "tenant_id": str(item.get("tenant_id") or client_value).strip(),
+            "environment": str(item.get("environment") or item.get("env") or "live").strip().lower(),
+            "role": str(item.get("role") or "client").strip().lower(),
+            "plan": str(item.get("plan") or "pilot").strip(),
+            "usage_limit_monthly": usage_limit_monthly,
             "webhook_url": str(item.get("webhook_url") or "").strip(),
             "webhook_secret": str(item.get("webhook_secret") or "").strip(),
             "webhook_active": bool(item.get("webhook_active", True)),
@@ -612,6 +638,12 @@ def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
             "scope": required_scope,
             "client": record.get("client") or "unknown-client",
             "label": record.get("label") or "",
+            "scopes": sorted(list(scopes)),
+            "tenant_id": record.get("tenant_id") or (record.get("client") or "unknown-client"),
+            "environment": record.get("environment") or "live",
+            "role": record.get("role") or "client",
+            "plan": record.get("plan") or "pilot",
+            "usage_limit_monthly": record.get("usage_limit_monthly"),
             "webhook_url": record.get("webhook_url") or "",
             "webhook_secret": record.get("webhook_secret") or "",
             "webhook_active": bool(record.get("webhook_active", True)),
@@ -624,6 +656,12 @@ def authenticate_api_request(required_scope: str) -> Dict[str, Any]:
             "scope": required_scope,
             "client": "website-demo",
             "label": "Public website demo",
+            "scopes": [required_scope],
+            "tenant_id": "website-demo",
+            "environment": "public-demo",
+            "role": "demo",
+            "plan": "demo",
+            "usage_limit_monthly": None,
         }
 
     raise ApiError("API key required for direct API access.", 401)
@@ -1561,6 +1599,185 @@ def search_verification_records(filters: Dict[str, Any], client_label: str) -> D
     }
 
 
+def month_start_iso(dt: Optional[datetime] = None) -> str:
+    current = dt or datetime.now(timezone.utc)
+    start = datetime(current.year, current.month, 1, tzinfo=timezone.utc)
+    return start.replace(microsecond=0).isoformat()
+
+
+def period_start_iso(period: str) -> str:
+    normalized = str(period or "30d").strip().lower()
+    if normalized in {"month", "this_month", "current_month", "mtd"}:
+        return month_start_iso()
+    match = re.fullmatch(r"(\d{1,3})d", normalized)
+    if match:
+        days = max(1, min(int(match.group(1)), 365))
+        start = datetime.now(timezone.utc).timestamp() - (days * 86400)
+        return datetime.fromtimestamp(start, tz=timezone.utc).replace(microsecond=0).isoformat()
+    return month_start_iso()
+
+
+def increment_counter(bucket: Dict[str, int], key: str) -> None:
+    key_text = str(key or "unknown").strip() or "unknown"
+    bucket[key_text] = int(bucket.get(key_text, 0)) + 1
+
+
+def sorted_counter(bucket: Dict[str, int]) -> Dict[str, int]:
+    return dict(sorted(bucket.items(), key=lambda item: (-item[1], item[0])))
+
+
+def summarize_usage_for_client(client_label: str, period: str = "30d") -> Dict[str, Any]:
+    since_iso = period_start_iso(period)
+    conn = get_db()
+    try:
+        event_rows = db_fetchall(
+            conn,
+            """
+            SELECT created_at, event_name, status, reason_code, network, timeout_flag, duration_ms
+            FROM event_log
+            WHERE client_label = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            """,
+            (client_label, since_iso),
+        )
+        record_rows = db_fetchall(
+            conn,
+            """
+            SELECT created_at, service, event_name, network, status, verdict, reason_code
+            FROM verification_records
+            WHERE client_label = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            """,
+            (client_label, since_iso),
+        )
+        webhook_rows = db_fetchall(
+            conn,
+            """
+            SELECT delivery_status, ack_status
+            FROM webhook_deliveries
+            WHERE client_label = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            """,
+            (client_label, since_iso),
+        )
+    finally:
+        conn.close()
+
+    event_totals: Dict[str, int] = {}
+    network_totals: Dict[str, int] = {}
+    status_totals: Dict[str, int] = {}
+    reason_totals: Dict[str, int] = {}
+    verdict_totals: Dict[str, int] = {}
+    service_totals: Dict[str, int] = {}
+    daily_totals: Dict[str, int] = {}
+    timeout_count = 0
+    duration_values: List[int] = []
+
+    for row in event_rows:
+        row_dict = row_to_dict(row)
+        created_at = str(row_dict.get("created_at") or "")
+        increment_counter(event_totals, str(row_dict.get("event_name") or "unknown"))
+        increment_counter(status_totals, str(row_dict.get("status") or "unknown"))
+        if row_dict.get("reason_code"):
+            increment_counter(reason_totals, str(row_dict.get("reason_code") or "unknown"))
+        if row_dict.get("network"):
+            increment_counter(network_totals, str(row_dict.get("network") or "unknown"))
+        if created_at:
+            increment_counter(daily_totals, created_at[:10])
+        if int(row_dict.get("timeout_flag") or 0):
+            timeout_count += 1
+        try:
+            duration_ms = int(row_dict.get("duration_ms") or 0)
+            if duration_ms > 0:
+                duration_values.append(duration_ms)
+        except Exception:
+            pass
+
+    for row in record_rows:
+        row_dict = row_to_dict(row)
+        increment_counter(service_totals, str(row_dict.get("service") or "unknown"))
+        if row_dict.get("verdict"):
+            increment_counter(verdict_totals, str(row_dict.get("verdict") or "unknown"))
+        if row_dict.get("reason_code"):
+            increment_counter(reason_totals, str(row_dict.get("reason_code") or "unknown"))
+        if row_dict.get("network"):
+            increment_counter(network_totals, str(row_dict.get("network") or "unknown"))
+
+    delivered_count = 0
+    acknowledged_count = 0
+    pending_count = 0
+    for row in webhook_rows:
+        row_dict = row_to_dict(row)
+        delivery_status = str(row_dict.get("delivery_status") or "").strip().lower()
+        ack_status = str(row_dict.get("ack_status") or "").strip().lower()
+        if delivery_status == "delivered":
+            delivered_count += 1
+        elif delivery_status:
+            pending_count += 1
+        if ack_status == "acknowledged":
+            acknowledged_count += 1
+
+    total_events = len(event_rows)
+    total_checks = len(record_rows)
+    avg_duration_ms = round(sum(duration_values) / len(duration_values), 1) if duration_values else 0
+
+    return {
+        "period": str(period or "30d"),
+        "since": since_iso,
+        "totals": {
+            "events": total_events,
+            "checks": total_checks,
+            "timeouts": timeout_count,
+            "avg_duration_ms": avg_duration_ms,
+            "webhook_deliveries": len(webhook_rows),
+            "webhook_delivered": delivered_count,
+            "webhook_acknowledged": acknowledged_count,
+            "webhook_pending": pending_count,
+        },
+        "by_event": sorted_counter(event_totals),
+        "by_service": sorted_counter(service_totals),
+        "by_status": sorted_counter(status_totals),
+        "by_network": sorted_counter(network_totals),
+        "by_reason_code": sorted_counter(reason_totals),
+        "by_verdict": sorted_counter(verdict_totals),
+        "daily": dict(sorted(daily_totals.items())),
+    }
+
+
+def build_account_snapshot(access: Dict[str, Any]) -> Dict[str, Any]:
+    client_label = str(access.get("client") or "unknown-client")
+    monthly_usage = summarize_usage_for_client(client_label, "this_month")
+    usage_limit_monthly = access.get("usage_limit_monthly")
+    billable_checks = int(monthly_usage.get("totals", {}).get("checks") or 0)
+    usage_remaining = None
+    if isinstance(usage_limit_monthly, int):
+        usage_remaining = max(0, usage_limit_monthly - billable_checks)
+
+    return {
+        "client": {
+            "tenant_id": str(access.get("tenant_id") or client_label),
+            "client_label": client_label,
+            "display_name": str(access.get("label") or client_label),
+            "environment": str(access.get("environment") or "live"),
+            "role": str(access.get("role") or "client"),
+            "plan": str(access.get("plan") or "pilot"),
+            "scopes": sorted(list(access.get("scopes") or [])),
+        },
+        "usage": {
+            "billing_period": "this_month",
+            "billable_checks": billable_checks,
+            "usage_limit_monthly": usage_limit_monthly,
+            "usage_remaining_monthly": usage_remaining,
+            "summary": monthly_usage,
+        },
+        "webhooks": {
+            "active": bool(access.get("webhook_active", False)),
+            "events": list(access.get("webhook_events") or []),
+            "url_configured": bool(str(access.get("webhook_url") or "").strip()),
+        },
+    }
+
+
 def list_webhook_deliveries_for_record(record_id: str) -> List[Dict[str, Any]]:
     conn = get_db()
     try:
@@ -2354,6 +2571,9 @@ def attach_response_headers(response):
     access = getattr(g, "api_access", None)
     if access:
         response.headers.setdefault("X-API-Access-Mode", str(access.get("mode") or ""))
+        response.headers.setdefault("X-API-Client", str(access.get("client") or ""))
+        response.headers.setdefault("X-API-Environment", str(access.get("environment") or ""))
+        response.headers.setdefault("X-API-Plan", str(access.get("plan") or ""))
     kick_webhook_processor()
     return response
 
@@ -2423,10 +2643,40 @@ def root():
             "/health",
             "/api/preflight-check",
             "/api/recovery-copilot",
+            "/api/account",
+            "/api/usage-summary",
             "/pilot-request",
             "/api/verification-records",
             "/api/webhooks/ack",
         ]
+    })
+
+
+@app.get("/api/account")
+def account_summary():
+    access = getattr(g, "api_access", None) or {}
+    if access.get("mode") != "api_key":
+        raise ApiError("API key required for account summary.", 401)
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        **build_account_snapshot(access),
+    })
+
+
+@app.get("/api/usage-summary")
+def usage_summary():
+    access = getattr(g, "api_access", None) or {}
+    if access.get("mode") != "api_key":
+        raise ApiError("API key required for usage summary.", 401)
+    period = str(request.args.get("period") or "30d").strip().lower()
+    summary = summarize_usage_for_client(str(access.get("client") or "unknown-client"), period)
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "client": str(access.get("client") or "unknown-client"),
+        "environment": str(access.get("environment") or "live"),
+        **summary,
     })
 
 
