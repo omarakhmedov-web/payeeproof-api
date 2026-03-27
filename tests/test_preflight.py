@@ -7,6 +7,25 @@ def _wallet_stub(chain, address):
     }
 
 
+
+
+def _contract_stub(chain, address):
+    return {
+        'chain': chain,
+        'address_type': 'contract',
+        'rpc_used': True,
+        'details': 'stubbed contract destination',
+    }
+
+
+def _bridge_stub(chain, address):
+    return {
+        'chain': chain,
+        'address_type': 'bridge_router',
+        'rpc_used': True,
+        'details': 'stubbed bridge destination',
+    }
+
 def test_preflight_requires_api_key(client):
     response = client.post('/api/preflight-check', json={})
 
@@ -113,3 +132,84 @@ def test_preflight_missing_memo_stays_blocked(client, api_headers, app_module, m
     assert body['verdict'] == 'BLOCK'
     assert body['checks']['memo_match'] is False
     assert 'MEMO_MISMATCH' in body['risk_flags']
+
+
+
+def test_preflight_payout_strict_blocks_contract_route(client, api_headers, app_module, monkeypatch):
+    monkeypatch.setattr(app_module, 'classify_address', _contract_stub)
+
+    payload = {
+        'policy_profile': 'payout_strict',
+        'expected': {
+            'network': 'ethereum',
+            'asset': 'USDT',
+            'address': '0x1111111111111111111111111111111111111111',
+        },
+        'provided': {
+            'network': 'ethereum',
+            'asset': 'USDT',
+            'address': '0x1111111111111111111111111111111111111111',
+        },
+    }
+    response = client.post('/api/preflight-check', json=payload, headers=api_headers)
+    body = response.get_json()
+
+    assert response.status_code == 200
+    assert body['policy_profile'] == 'payout_strict'
+    assert body['reason_code'] == 'DESTINATION_IS_CONTRACT_OR_APP'
+    assert body['verdict'] == 'BLOCK'
+    assert body['next_action'] == 'BLOCK_AND_REVERIFY'
+
+
+
+def test_preflight_deposit_review_reverifies_contract_route(client, api_headers, app_module, monkeypatch):
+    monkeypatch.setattr(app_module, 'classify_address', _contract_stub)
+
+    payload = {
+        'policy_profile': 'deposit_review',
+        'expected': {
+            'network': 'ethereum',
+            'asset': 'USDT',
+            'address': '0x1111111111111111111111111111111111111111',
+        },
+        'provided': {
+            'network': 'ethereum',
+            'asset': 'USDT',
+            'address': '0x1111111111111111111111111111111111111111',
+        },
+    }
+    response = client.post('/api/preflight-check', json=payload, headers=api_headers)
+    body = response.get_json()
+
+    assert response.status_code == 200
+    assert body['policy_profile'] == 'deposit_review'
+    assert body['reason_code'] == 'DESTINATION_IS_CONTRACT_OR_APP'
+    assert body['verdict'] == 'REVERIFY'
+    assert body['next_action'] == 'REVERIFY_DESTINATION'
+
+
+
+def test_preflight_treasury_review_blocks_bridge_route(client, api_headers, app_module, monkeypatch):
+    monkeypatch.setattr(app_module, 'classify_address', _bridge_stub)
+
+    payload = {
+        'policy_profile': 'treasury_review',
+        'expected': {
+            'network': 'ethereum',
+            'asset': 'USDT',
+            'address': '0x1111111111111111111111111111111111111111',
+        },
+        'provided': {
+            'network': 'ethereum',
+            'asset': 'USDT',
+            'address': '0x1111111111111111111111111111111111111111',
+        },
+    }
+    response = client.post('/api/preflight-check', json=payload, headers=api_headers)
+    body = response.get_json()
+
+    assert response.status_code == 200
+    assert body['policy_profile'] == 'treasury_review'
+    assert body['reason_code'] == 'DESTINATION_IS_BRIDGE_ROUTER'
+    assert body['verdict'] == 'BLOCK'
+    assert body['next_action'] == 'BLOCK_AND_REVERIFY'
