@@ -1226,8 +1226,109 @@ def preflight_next_step_label(action: str) -> str:
         "MANUAL_REVIEW": "Escalate for manual review",
         "DO_NOT_SEND": "Do not send",
         "REVIEW_REQUEST_TEMPLATE": "Correct the approved payout instructions",
+        "REVERIFY_DESTINATION": "Re-verify the destination route",
+        "CONFIRM_DESTINATION": "Confirm the destination before approval",
     }
     return labels.get(str(action or "").upper(), str(action or "").replace("_", " ").title() or "Review required")
+
+
+POLICY_PROFILE_ALIASES = {
+    "": "standard",
+    "default": "standard",
+    "standard": "standard",
+    "payout_strict": "payout_strict",
+    "strict": "payout_strict",
+    "deposit_review": "deposit_review",
+    "deposit": "deposit_review",
+    "treasury_review": "treasury_review",
+    "treasury": "treasury_review",
+}
+
+
+def normalize_policy_profile(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    return POLICY_PROFILE_ALIASES.get(key, "standard")
+
+
+def policy_profile_label(profile: str) -> str:
+    labels = {
+        "standard": "Standard",
+        "payout_strict": "Payout Strict",
+        "deposit_review": "Deposit Review",
+        "treasury_review": "Treasury Review",
+    }
+    return labels.get(normalize_policy_profile(profile), "Standard")
+
+
+def derive_preflight_policy_override(destination_class: str, policy_profile: str) -> Optional[Dict[str, str]]:
+    profile = normalize_policy_profile(policy_profile)
+    destination_class = str(destination_class or "").lower()
+    if profile == "standard" or destination_class in {"", "personal_wallet", "unavailable"}:
+        return None
+
+    reason_map = {
+        "contract_or_app": "DESTINATION_IS_CONTRACT_OR_APP",
+        "bridge_router": "DESTINATION_IS_BRIDGE_ROUTER",
+        "exchange_like_deposit": "DESTINATION_REQUIRES_MEMO_OR_VENUE_CHECK",
+        "unknown": "DESTINATION_NOT_CLASSIFIED",
+        "not_found": "DESTINATION_NOT_CLASSIFIED",
+    }
+    summary_map = {
+        "contract_or_app": "The destination looks like a contract or app rather than a simple wallet route.",
+        "bridge_router": "The destination looks like bridge or router infrastructure rather than a simple wallet route.",
+        "exchange_like_deposit": "The destination looks like an exchange-style or venue-dependent deposit route.",
+        "unknown": "The destination could not be classified confidently.",
+        "not_found": "The destination could not be classified confidently.",
+    }
+    reason_code = reason_map.get(destination_class)
+    summary = summary_map.get(destination_class)
+    if not reason_code or not summary:
+        return None
+
+    if profile == "payout_strict":
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": reason_code,
+            "next_action": "BLOCK_AND_REVERIFY",
+            "confidence": "High",
+            "summary": summary,
+            "why": "Payout Strict only approves clear personal-wallet style destinations. Ambiguous, infrastructure, or venue-dependent routes should be stopped and re-verified before funds move.",
+        }
+
+    if profile == "deposit_review":
+        return {
+            "status": "review_required",
+            "verdict": "REVERIFY",
+            "reason_code": reason_code,
+            "next_action": "REVERIFY_DESTINATION" if destination_class != "exchange_like_deposit" else "RECHECK_MEMO_OR_TAG",
+            "confidence": "Medium",
+            "summary": summary,
+            "why": "Deposit Review keeps ambiguous or venue-dependent routes in a confirmation path instead of treating them like normal wallet payouts.",
+        }
+
+    if profile == "treasury_review":
+        if destination_class in {"exchange_like_deposit", "bridge_router"}:
+            return {
+                "status": "blocked",
+                "verdict": "BLOCK",
+                "reason_code": reason_code,
+                "next_action": "BLOCK_AND_REVERIFY",
+                "confidence": "High",
+                "summary": summary,
+                "why": "Treasury Review blocks routes that look like infrastructure or venue-dependent deposit paths until the destination is re-confirmed through an approved internal process.",
+            }
+        return {
+            "status": "review_required",
+            "verdict": "REVERIFY",
+            "reason_code": reason_code,
+            "next_action": "REVERIFY_DESTINATION",
+            "confidence": "Medium",
+            "summary": summary,
+            "why": "Treasury Review keeps ambiguous destinations in a cautious review path before release.",
+        }
+
+    return None
 
 
 def derive_preflight_outcome(
@@ -1243,6 +1344,7 @@ def derive_preflight_outcome(
     provided_valid: bool,
     provided_destination: Dict[str, Any],
     risk_flags: List[str],
+    policy_profile: str = "standard",
 ) -> Dict[str, str]:
     mismatch_reason = None
     for code, is_failed in [
@@ -1319,6 +1421,22 @@ def derive_preflight_outcome(
         }
 
     destination_class = provided_destination.get("classification")
+
+    if provided_destination.get("source") == "unavailable":
+        return {
+            "status": "unavailable",
+            "verdict": "UNAVAILABLE",
+            "reason_code": "DESTINATION_LOOKUP_UNAVAILABLE",
+            "next_action": "CHECK_BACKEND",
+            "confidence": "Limited",
+            "summary": "Live destination lookup is currently unavailable.",
+            "why": "The service could compare the transfer fields, but the live destination classification step did not complete. Retry or review manually.",
+        }
+
+    profile_override = derive_preflight_policy_override(destination_class, policy_profile)
+    if profile_override:
+        return profile_override
+
     if destination_class == "bridge_router":
         return {
             "status": "review_required",
@@ -1350,17 +1468,6 @@ def derive_preflight_outcome(
             "confidence": "Medium",
             "summary": "The details match, but the destination looks like a deposit-style address.",
             "why": "Deposit-style destinations often depend on the exact venue, network, asset, and memo or tag. Re-verify all of them before sending.",
-        }
-
-    if provided_destination.get("source") == "unavailable":
-        return {
-            "status": "unavailable",
-            "verdict": "UNAVAILABLE",
-            "reason_code": "DESTINATION_LOOKUP_UNAVAILABLE",
-            "next_action": "CHECK_BACKEND",
-            "confidence": "Limited",
-            "summary": "Live destination lookup is currently unavailable.",
-            "why": "The service could compare the transfer fields, but the live destination classification step did not complete. Retry or review manually.",
         }
 
     if destination_class in {"unknown", "not_found"}:
@@ -3805,6 +3912,8 @@ def preflight_check():
     payload = request.get_json(silent=True) or {}
     expected = payload.get("expected") or {}
     provided = payload.get("provided") or {}
+    context = payload.get("context") or {}
+    policy_profile = normalize_policy_profile(payload.get("policy_profile") or context.get("policy_profile"))
 
     expected_chain = normalize_chain(expected.get("network") or expected.get("chain"))
     provided_chain = normalize_chain(provided.get("network") or provided.get("chain"))
@@ -3924,6 +4033,7 @@ def preflight_check():
         provided_valid=provided_valid,
         provided_destination=provided_destination,
         risk_flags=risk_flags,
+        policy_profile=policy_profile,
     )
 
     checked_at = utc_now_iso()
@@ -3940,6 +4050,7 @@ def preflight_check():
             "verdict": outcome["verdict"],
             "next_action": outcome["next_action"],
             "risk_flags": sorted(set(risk_flags)),
+            "policy_profile": policy_profile,
         },
     )
     response_payload = {
@@ -3949,6 +4060,8 @@ def preflight_check():
         "trace_id": current_request_id(),
         "checked_at": checked_at,
         "chain": provided_chain,
+        "policy_profile": policy_profile,
+        "policy_profile_label": policy_profile_label(policy_profile),
         "status": outcome["status"],
         "verdict": outcome["verdict"],
         "reason_code": outcome["reason_code"],
@@ -3969,6 +4082,7 @@ def preflight_check():
             "reason_code": outcome["reason_code"],
             "next_action": outcome["next_action"],
             "next_action_label": preflight_next_step_label(outcome["next_action"]),
+            "policy_profile": policy_profile,
         },
         "expected": {
             "network": expected_chain,
@@ -4024,6 +4138,7 @@ def preflight_check():
         metadata={
             "next_action": outcome["next_action"],
             "confidence": outcome["confidence"],
+            "policy_profile": policy_profile,
         },
     )
     g.limit_state = build_limit_state(access, "this_month")
