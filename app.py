@@ -176,6 +176,11 @@ RESEND_TO = os.getenv("RESEND_TO", "hello@payeeproof.com").strip()
 PILOT_AUTO_WELCOME_ENABLED = str(os.getenv("PILOT_AUTO_WELCOME_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
 PILOT_WELCOME_REPLY_TO = os.getenv("PILOT_WELCOME_REPLY_TO", RESEND_TO).strip()
 PILOT_WELCOME_NEXT_STEP_HOURS = int(os.getenv("PILOT_WELCOME_NEXT_STEP_HOURS", "24"))
+WEEKLY_SUMMARY_ENABLED = str(os.getenv("WEEKLY_SUMMARY_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+WEEKLY_SUMMARY_DEFAULT_TO = os.getenv("WEEKLY_SUMMARY_DEFAULT_TO", RESEND_TO).strip()
+WEEKLY_SUMMARY_REPLY_TO = os.getenv("WEEKLY_SUMMARY_REPLY_TO", RESEND_TO).strip()
+WEEKLY_SUMMARY_DEFAULT_PERIOD = os.getenv("WEEKLY_SUMMARY_DEFAULT_PERIOD", "7d").strip().lower() or "7d"
+WEEKLY_SUMMARY_MAX_EXAMPLES = max(1, int(os.getenv("WEEKLY_SUMMARY_MAX_EXAMPLES", "5")))
 PUBLIC_DEMO_ORIGINS = os.getenv("PUBLIC_DEMO_ORIGINS", ",".join(allowed_origins)).strip()
 API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
 ANON_API_RATE_LIMIT = int(os.getenv("ANON_API_RATE_LIMIT", "20"))
@@ -226,6 +231,8 @@ API_SCOPE_BY_PATH = {
     "/api/recovery-copilot": "recovery",
     "/api/account": "records",
     "/api/usage-summary": "records",
+    "/api/weekly-summary": "records",
+    "/api/weekly-summary/send": "records",
 }
 
 ALLOWED_ENVIRONMENTS = {"live", "test", "sandbox", "staging", "production", "public-demo"}
@@ -1880,6 +1887,8 @@ def request_endpoint_alias(path: str) -> str:
         "/api/verification-records": "records",
         "/api/account": "account",
         "/api/usage-summary": "usage",
+        "/api/weekly-summary": "weekly_summary",
+        "/api/weekly-summary/send": "weekly_summary",
     }.get(normalized, normalized)
 
 
@@ -4454,6 +4463,339 @@ def recovery_copilot():
         if str(delivery_state.get("delivery_status") or "") in {"pending", "retry_scheduled"}:
             kick_webhook_processor(force=True)
     return jsonify(response_payload)
+
+
+
+
+def _normalize_email_list_csv(value: Any) -> List[str]:
+    emails: List[str] = []
+    seen = set()
+    for item in str(value or "").replace(";", ",").split(","):
+        email_value = str(item or "").strip()
+        if not email_value:
+            continue
+        if not is_valid_email(email_value):
+            raise ApiError(f"Invalid email address: {email_value}", 400)
+        lowered = email_value.lower()
+        if lowered not in seen:
+            seen.add(lowered)
+            emails.append(email_value)
+    return emails
+
+
+def _summary_counter_value(counter: Dict[str, int], *keys: str) -> int:
+    total = 0
+    normalized = {str(k or "").strip().upper().replace(" ", "_"): int(v or 0) for k, v in (counter or {}).items()}
+    for key in keys:
+        total += int(normalized.get(str(key or "").strip().upper().replace(" ", "_"), 0))
+    return total
+
+
+def _format_top_counter_items(counter: Dict[str, int], limit: int = 3) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for key, value in sorted((counter or {}).items(), key=lambda item: (-int(item[1] or 0), str(item[0] or ""))):
+        label = str(key or "").strip()
+        if not label:
+            continue
+        items.append({"label": label, "count": int(value or 0)})
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_recent_summary_examples(access: Dict[str, Any], since_iso: str, limit: int = 5) -> List[Dict[str, str]]:
+    scope = access_scope(access)
+    tenant_id = scope["tenant_id"]
+    environment = scope["environment"]
+    conn = get_db()
+    try:
+        rows = db_fetchall(
+            conn,
+            """
+            SELECT created_at, service, network, verdict, reason_code, reference_id
+            FROM verification_records
+            WHERE tenant_id = ? AND environment = ? AND created_at >= ?
+              AND UPPER(REPLACE(COALESCE(verdict, ''), ' ', '_')) IN ('BLOCK', 'REVERIFY', 'TEST_FIRST')
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (tenant_id, environment, since_iso, int(limit or 5)),
+        )
+    finally:
+        conn.close()
+
+    examples: List[Dict[str, str]] = []
+    for row in rows:
+        row_dict = row_to_dict(row)
+        examples.append({
+            "created_at": str(row_dict.get("created_at") or ""),
+            "service": str(row_dict.get("service") or "unknown"),
+            "network": str(row_dict.get("network") or "unknown"),
+            "verdict": str(row_dict.get("verdict") or "unknown"),
+            "reason_code": str(row_dict.get("reason_code") or "unknown"),
+            "reference_id": str(row_dict.get("reference_id") or ""),
+        })
+    return examples
+
+
+def build_weekly_summary_report(access: Dict[str, Any], period: str = "7d") -> Dict[str, Any]:
+    normalized_period = str(period or WEEKLY_SUMMARY_DEFAULT_PERIOD or "7d").strip().lower() or "7d"
+    usage = summarize_usage_for_scope(access, normalized_period)
+    verdicts = dict(usage.get("by_verdict") or {})
+    reasons = dict(usage.get("by_reason_code") or {})
+    networks = dict(usage.get("by_network") or {})
+    totals = dict(usage.get("totals") or {})
+    display_name = str(access.get("label") or access.get("client") or access.get("tenant_id") or "Client").strip()
+
+    checks_count = int(totals.get("checks") or 0)
+    safe_count = _summary_counter_value(verdicts, "SAFE")
+    review_count = _summary_counter_value(verdicts, "REVERIFY", "TEST_FIRST")
+    blocked_count = _summary_counter_value(verdicts, "BLOCK")
+    risky_count = blocked_count + review_count
+    timeout_count = int(totals.get("timeouts") or 0)
+    avg_duration_ms = float(totals.get("avg_duration_ms") or 0)
+    delivered = int(totals.get("webhook_delivered") or 0)
+    acknowledged = int(totals.get("webhook_acknowledged") or 0)
+
+    top_reasons = _format_top_counter_items(reasons, limit=3)
+    top_networks = _format_top_counter_items(networks, limit=3)
+    examples = fetch_recent_summary_examples(access, str(usage.get("since") or ""), WEEKLY_SUMMARY_MAX_EXAMPLES)
+
+    if risky_count > 0 and top_reasons:
+        next_step = f"Review the top issue ({top_reasons[0]['label']}) and tighten the approval rule on the highest-volume path first."
+    elif checks_count > 0:
+        next_step = "No risky cases dominated this period. Keep the current approval path stable and monitor for new flows."
+    else:
+        next_step = "No checks were recorded in the selected period. Confirm that traffic is live before the next review."
+
+    headline = f"{checks_count} checks in {normalized_period}; {risky_count} risky or review cases detected."
+    if checks_count == 0:
+        headline = f"No checks were recorded in {normalized_period}."
+
+    top_reason_line = ", ".join(f"{item['label']} ({item['count']})" for item in top_reasons) or "No repeated risk pattern detected."
+    top_network_line = ", ".join(f"{item['label']} ({item['count']})" for item in top_networks) or "No active network signal yet."
+    verdict_line_parts = [
+        f"SAFE: {safe_count}",
+        f"BLOCK: {blocked_count}",
+        f"REVERIFY / TEST FIRST: {review_count}",
+    ]
+    verdict_line = " | ".join(verdict_line_parts)
+
+    example_lines: List[str] = []
+    for example in examples:
+        line = f"- {example['created_at'][:10]} · {example['network']} · {example['verdict']} · {example['reason_code']}"
+        if example.get("reference_id"):
+            line += f" · ref {example['reference_id']}"
+        example_lines.append(line)
+    if not example_lines:
+        example_lines = ["- No recent risky examples in the selected period."]
+
+    subject = f"PayeeProof weekly summary — {display_name} — {normalized_period}"
+    text_body = "\n".join([
+        f"Hi,",
+        "",
+        f"Here is your PayeeProof weekly summary for {display_name}.",
+        "",
+        headline,
+        "",
+        "Summary:",
+        f"- Checks: {checks_count}",
+        f"- Risky / review cases: {risky_count}",
+        f"- Webhook delivered: {delivered}",
+        f"- Webhook acknowledged: {acknowledged}",
+        f"- Avg API duration: {avg_duration_ms} ms",
+        f"- Timeouts: {timeout_count}",
+        "",
+        f"Verdicts: {verdict_line}",
+        f"Top reason codes: {top_reason_line}",
+        f"Top networks: {top_network_line}",
+        "",
+        "Recent risky examples:",
+        *example_lines,
+        "",
+        "Suggested next step:",
+        next_step,
+        "",
+        "— PayeeProof",
+        "https://payeeproof.com",
+    ])
+
+    html_examples = "".join(f"<li>{html.escape(line[2:])}</li>" for line in example_lines)
+    html_body = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111">
+      <h2>PayeeProof weekly summary</h2>
+      <p>Here is your PayeeProof weekly summary for <strong>{html.escape(display_name)}</strong>.</p>
+      <p><strong>{html.escape(headline)}</strong></p>
+      <p><strong>Summary</strong><br>
+      Checks: {checks_count}<br>
+      Risky / review cases: {risky_count}<br>
+      Webhook delivered: {delivered}<br>
+      Webhook acknowledged: {acknowledged}<br>
+      Avg API duration: {html.escape(str(avg_duration_ms))} ms<br>
+      Timeouts: {timeout_count}</p>
+      <p><strong>Verdicts</strong><br>{html.escape(verdict_line)}</p>
+      <p><strong>Top reason codes</strong><br>{html.escape(top_reason_line)}</p>
+      <p><strong>Top networks</strong><br>{html.escape(top_network_line)}</p>
+      <p><strong>Recent risky examples</strong></p>
+      <ul>{html_examples}</ul>
+      <p><strong>Suggested next step</strong><br>{html.escape(next_step)}</p>
+      <p>— PayeeProof<br><a href="https://payeeproof.com">payeeproof.com</a></p>
+    </div>
+    """.strip()
+
+    return {
+        "tenant_id": str(access.get("tenant_id") or access.get("client") or "unknown-client"),
+        "environment": str(access.get("environment") or "live"),
+        "display_name": display_name,
+        "period": normalized_period,
+        "since": str(usage.get("since") or ""),
+        "headline": headline,
+        "next_step": next_step,
+        "totals": {
+            "checks": checks_count,
+            "safe": safe_count,
+            "blocked": blocked_count,
+            "review": review_count,
+            "risky": risky_count,
+            "timeouts": timeout_count,
+            "avg_duration_ms": avg_duration_ms,
+            "webhook_delivered": delivered,
+            "webhook_acknowledged": acknowledged,
+        },
+        "top_reason_codes": top_reasons,
+        "top_networks": top_networks,
+        "recent_examples": examples,
+        "email_subject": subject,
+        "email_text": text_body,
+        "email_html": html_body,
+        "source": usage,
+    }
+
+
+def send_weekly_summary_email(summary: Dict[str, Any], recipients: List[str]) -> Dict[str, Optional[str]]:
+    if not WEEKLY_SUMMARY_ENABLED:
+        return {"status": "disabled", "email_id": None, "debug_detail": None}
+    if not RESEND_API_KEY or not RESEND_FROM:
+        return {"status": "not_configured", "email_id": None, "debug_detail": None}
+    if not recipients:
+        return {"status": "missing_recipient", "email_id": None, "debug_detail": None}
+
+    resend_payload = {
+        "from": RESEND_FROM,
+        "to": recipients,
+        "subject": summary.get("email_subject") or "PayeeProof weekly summary",
+        "reply_to": WEEKLY_SUMMARY_REPLY_TO or RESEND_TO or RESEND_FROM,
+        "text": summary.get("email_text") or "",
+        "html": summary.get("email_html") or "",
+        "tags": [
+            {"name": "source", "value": "weekly_summary"},
+            {"name": "product", "value": "payeeproof"},
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        "Idempotency-Key": f"weekly-summary-{_pilot_payload_fingerprint({'to': recipients, 'subject': resend_payload['subject'], 'period': summary.get('period'), 'tenant_id': summary.get('tenant_id')})}",
+    }
+
+    try:
+        response = requests.post(
+            f"{RESEND_API_BASE}/emails",
+            headers=headers,
+            json=resend_payload,
+            timeout=EMAIL_TIMEOUT,
+        )
+        raw_text = response.text[:1000]
+        if response.status_code < 200 or response.status_code >= 300:
+            return {
+                "status": "failed",
+                "email_id": None,
+                "debug_detail": f"RESEND_HTTP_{response.status_code}: {raw_text}",
+            }
+        data = response.json() if response.text else {}
+        return {
+            "status": "sent",
+            "email_id": data.get("id"),
+            "debug_detail": None,
+        }
+    except requests.RequestException as exc:
+        return {
+            "status": "failed",
+            "email_id": None,
+            "debug_detail": f"RESEND_REQUEST_ERROR: {exc}",
+        }
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "email_id": None,
+            "debug_detail": f"RESEND_JSON_ERROR: {exc}",
+        }
+
+
+@app.get("/api/weekly-summary")
+def weekly_summary_preview():
+    access = getattr(g, "api_access", None) or {}
+    if access.get("mode") != "api_key":
+        raise ApiError("API key required for weekly summary.", 401)
+    log_api_access("/api/weekly-summary")
+    period = str(request.args.get("period") or WEEKLY_SUMMARY_DEFAULT_PERIOD or "7d").strip().lower() or "7d"
+    summary = build_weekly_summary_report(access, period)
+    g.limit_state = build_limit_state(access, "this_month")
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "summary": {
+            "tenant_id": summary.get("tenant_id"),
+            "environment": summary.get("environment"),
+            "display_name": summary.get("display_name"),
+            "period": summary.get("period"),
+            "since": summary.get("since"),
+            "headline": summary.get("headline"),
+            "next_step": summary.get("next_step"),
+            "totals": summary.get("totals"),
+            "top_reason_codes": summary.get("top_reason_codes"),
+            "top_networks": summary.get("top_networks"),
+            "recent_examples": summary.get("recent_examples"),
+            "email_subject": summary.get("email_subject"),
+            "email_text": summary.get("email_text"),
+        },
+    })
+
+
+@app.post("/api/weekly-summary/send")
+def weekly_summary_send():
+    access = getattr(g, "api_access", None) or {}
+    if access.get("mode") != "api_key":
+        raise ApiError("API key required for weekly summary.", 401)
+    log_api_access("/api/weekly-summary/send")
+    payload = request.get_json(silent=True) or {}
+    period = str(payload.get("period") or WEEKLY_SUMMARY_DEFAULT_PERIOD or "7d").strip().lower() or "7d"
+    recipient_value = str(payload.get("to") or payload.get("recipient") or WEEKLY_SUMMARY_DEFAULT_TO or "").strip()
+    recipients = _normalize_email_list_csv(recipient_value)
+    summary = build_weekly_summary_report(access, period)
+    email_result = send_weekly_summary_email(summary, recipients)
+    g.limit_state = build_limit_state(access, "this_month")
+    if email_result.get("status") == "sent":
+        return jsonify({
+            "ok": True,
+            "message": "Weekly summary email sent.",
+            "summary_id": f"ws_{uuid.uuid4().hex[:16]}",
+            "period": summary.get("period"),
+            "to": recipients,
+            "email_id": email_result.get("email_id"),
+            "headline": summary.get("headline"),
+        })
+    return jsonify({
+        "ok": False,
+        "message": "Weekly summary email was not sent.",
+        "period": summary.get("period"),
+        "to": recipients,
+        "status": email_result.get("status"),
+        "debug_detail": email_result.get("debug_detail"),
+    }), 502
 
 
 @app.post("/pilot-request")
