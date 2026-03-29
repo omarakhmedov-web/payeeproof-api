@@ -29,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.0.3-pilot-welcome-flow"
+APP_VERSION = "2.1.0-crm-intake-light"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -181,6 +181,12 @@ WEEKLY_SUMMARY_DEFAULT_TO = os.getenv("WEEKLY_SUMMARY_DEFAULT_TO", RESEND_TO).st
 WEEKLY_SUMMARY_REPLY_TO = os.getenv("WEEKLY_SUMMARY_REPLY_TO", RESEND_TO).strip()
 WEEKLY_SUMMARY_DEFAULT_PERIOD = os.getenv("WEEKLY_SUMMARY_DEFAULT_PERIOD", "7d").strip().lower() or "7d"
 WEEKLY_SUMMARY_MAX_EXAMPLES = max(1, int(os.getenv("WEEKLY_SUMMARY_MAX_EXAMPLES", "5")))
+CRM_INTAKE_ENABLED = str(os.getenv("CRM_INTAKE_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+CRM_INTAKE_URL = os.getenv("CRM_INTAKE_URL", "").strip()
+CRM_INTAKE_SECRET = os.getenv("CRM_INTAKE_SECRET", "").strip()
+CRM_INTAKE_AUTH_HEADER = os.getenv("CRM_INTAKE_AUTH_HEADER", "X-PayeeProof-CRM-Secret").strip() or "X-PayeeProof-CRM-Secret"
+CRM_INTAKE_TIMEOUT = float(os.getenv("CRM_INTAKE_TIMEOUT_SEC", "6"))
+CRM_INTAKE_EVENT_NAME = os.getenv("CRM_INTAKE_EVENT_NAME", "pilot_request_created").strip() or "pilot_request_created"
 PUBLIC_DEMO_ORIGINS = os.getenv("PUBLIC_DEMO_ORIGINS", ",".join(allowed_origins)).strip()
 API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
 ANON_API_RATE_LIMIT = int(os.getenv("ANON_API_RATE_LIMIT", "20"))
@@ -1062,6 +1068,34 @@ def update_pilot_delivery_status(request_id: str, email_result: Dict[str, Option
 
 def update_pilot_welcome_status(request_id: str, email_result: Dict[str, Optional[str]]) -> None:
     update_pilot_email_status(request_id, email_result, prefix="welcome_email")
+
+
+def update_pilot_crm_status(request_id: str, crm_result: Dict[str, Optional[str]]) -> None:
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            UPDATE pilot_requests
+            SET crm_status = ?,
+                crm_delivery_id = ?,
+                crm_error = ?,
+                crm_last_attempt_at = ?,
+                crm_response_code = ?
+            WHERE request_id = ?
+            """,
+            (
+                str(crm_result.get("status") or "unknown"),
+                crm_result.get("delivery_id"),
+                crm_result.get("debug_detail"),
+                utc_now_iso(),
+                crm_result.get("response_code"),
+                request_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def pilot_ack_response(
@@ -3152,7 +3186,12 @@ def ensure_db() -> None:
                   welcome_email_status TEXT DEFAULT 'pending',
                   welcome_email_id TEXT,
                   welcome_email_error TEXT,
-                  welcome_email_last_attempt_at TEXT
+                  welcome_email_last_attempt_at TEXT,
+                  crm_status TEXT DEFAULT 'pending',
+                  crm_delivery_id TEXT,
+                  crm_error TEXT,
+                  crm_last_attempt_at TEXT,
+                  crm_response_code INTEGER
                 )
                 """
             )
@@ -3180,7 +3219,12 @@ def ensure_db() -> None:
                   welcome_email_status TEXT DEFAULT 'pending',
                   welcome_email_id TEXT,
                   welcome_email_error TEXT,
-                  welcome_email_last_attempt_at TEXT
+                  welcome_email_last_attempt_at TEXT,
+                  crm_status TEXT DEFAULT 'pending',
+                  crm_delivery_id TEXT,
+                  crm_error TEXT,
+                  crm_last_attempt_at TEXT,
+                  crm_response_code INTEGER
                 )
                 """
             )
@@ -3195,6 +3239,11 @@ def ensure_db() -> None:
         ensure_column(conn, "pilot_requests", "welcome_email_id", "TEXT")
         ensure_column(conn, "pilot_requests", "welcome_email_error", "TEXT")
         ensure_column(conn, "pilot_requests", "welcome_email_last_attempt_at", "TEXT")
+        ensure_column(conn, "pilot_requests", "crm_status", "TEXT DEFAULT 'pending'")
+        ensure_column(conn, "pilot_requests", "crm_delivery_id", "TEXT")
+        ensure_column(conn, "pilot_requests", "crm_error", "TEXT")
+        ensure_column(conn, "pilot_requests", "crm_last_attempt_at", "TEXT")
+        ensure_column(conn, "pilot_requests", "crm_response_code", "INTEGER")
         db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_pilot_requests_request_id ON pilot_requests(request_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_pilot_requests_fingerprint_created_at ON pilot_requests(fingerprint, created_at)")
         if db_is_postgres():
@@ -4902,8 +4951,9 @@ def pilot_request():
             INSERT INTO pilot_requests(
                 request_id, fingerprint, created_at, name, company, email, volume, notes,
                 source_ip, user_agent, origin, email_status, email_last_attempt_at,
-                welcome_email_status, welcome_email_last_attempt_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                welcome_email_status, welcome_email_last_attempt_at,
+                crm_status, crm_last_attempt_at, crm_response_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
@@ -4921,12 +4971,28 @@ def pilot_request():
                 None,
                 "pending",
                 None,
+                "pending",
+                None,
+                None,
             ),
         )
         conn.commit()
     finally:
         conn.close()
 
+    crm_result = send_pilot_crm_intake({
+        "request_id": request_id,
+        "created_at": created_at,
+        "name": name,
+        "company": company,
+        "email": email,
+        "volume": volume,
+        "notes": notes,
+        "source_ip": source_ip or "",
+        "user_agent": user_agent or "",
+        "origin": origin or "",
+    })
+    update_pilot_crm_status(request_id, crm_result)
     email_result = send_pilot_notification({
         "request_id": request_id,
         "created_at": created_at,
@@ -4963,6 +5029,7 @@ def pilot_request():
                 "request_id": request_id,
                 "email_notification": "sent",
                 "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
+                "crm_notification": str(crm_result.get("status") or "unknown"),
             },
         )
         return jsonify({
@@ -4970,6 +5037,7 @@ def pilot_request():
             "message": "Your request was received successfully. A confirmation email is on the way.",
             "request_id": request_id,
             "submitted_at": created_at,
+            "crm_notification": str(crm_result.get("status") or "unknown"),
             "next_step": f"We will review it within about {PILOT_WELCOME_NEXT_STEP_HOURS} hours." if PILOT_WELCOME_NEXT_STEP_HOURS > 0 else "We will review it soon.",
         })
 
@@ -4985,6 +5053,7 @@ def pilot_request():
                 "request_id": request_id,
                 "email_notification": "not_configured",
                 "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
+                "crm_notification": str(crm_result.get("status") or "unknown"),
             },
         )
         return jsonify({
@@ -4992,6 +5061,7 @@ def pilot_request():
             "message": "Your request was received successfully.",
             "request_id": request_id,
             "submitted_at": created_at,
+            "crm_notification": str(crm_result.get("status") or "unknown"),
             "next_step": f"We will review it within about {PILOT_WELCOME_NEXT_STEP_HOURS} hours." if PILOT_WELCOME_NEXT_STEP_HOURS > 0 else "We will review it soon.",
         }), 200
 
@@ -5008,6 +5078,7 @@ def pilot_request():
             "request_id": request_id,
             "email_notification": "failed",
             "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
+            "crm_notification": str(crm_result.get("status") or "unknown"),
         },
     )
     return jsonify({
@@ -5019,6 +5090,7 @@ def pilot_request():
         "trace_id": current_request_id(),
         "email_notification": "failed",
         "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
+        "crm_notification": str(crm_result.get("status") or "unknown"),
         "submitted_at": created_at,
         "debug_detail": email_result.get("debug_detail"),
     }), 200
@@ -5247,6 +5319,75 @@ def send_pilot_welcome_email(payload: Dict[str, str]) -> Dict[str, Optional[str]
             "email_id": None,
             "debug_detail": f"RESEND_JSON_ERROR: {exc}",
         }
+
+
+def send_pilot_crm_intake(payload: Dict[str, str]) -> Dict[str, Optional[str]]:
+    if not CRM_INTAKE_ENABLED:
+        return {"status": "disabled", "delivery_id": None, "debug_detail": None, "response_code": None}
+    if not CRM_INTAKE_URL:
+        return {"status": "not_configured", "delivery_id": None, "debug_detail": None, "response_code": None}
+
+    crm_payload = {
+        "event": CRM_INTAKE_EVENT_NAME,
+        "product": "payeeproof",
+        "request": {
+            "request_id": payload.get("request_id") or "",
+            "submitted_at": payload.get("created_at") or utc_now_iso(),
+            "name": payload.get("name") or "",
+            "company": payload.get("company") or "",
+            "email": payload.get("email") or "",
+            "volume": payload.get("volume") or "",
+            "notes": payload.get("notes") or "",
+        },
+        "meta": {
+            "origin": payload.get("origin") or "",
+            "source_ip": payload.get("source_ip") or "",
+            "user_agent": payload.get("user_agent") or "",
+        },
+        "links": {
+            "site": "https://payeeproof.com",
+            "api_base": PUBLIC_API_BASE,
+        },
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        "Idempotency-Key": f"crm-intake-{payload.get('request_id') or _pilot_payload_fingerprint(crm_payload)}",
+    }
+    if CRM_INTAKE_SECRET:
+        headers[CRM_INTAKE_AUTH_HEADER] = CRM_INTAKE_SECRET
+
+    try:
+        response = requests.post(
+            CRM_INTAKE_URL,
+            headers=headers,
+            json=crm_payload,
+            timeout=CRM_INTAKE_TIMEOUT,
+        )
+        raw_text = response.text[:1000]
+        if response.status_code < 200 or response.status_code >= 300:
+            return {
+                "status": "failed",
+                "delivery_id": payload.get("request_id"),
+                "debug_detail": f"CRM_HTTP_{response.status_code}: {raw_text}",
+                "response_code": response.status_code,
+            }
+        return {
+            "status": "sent",
+            "delivery_id": payload.get("request_id"),
+            "debug_detail": None,
+            "response_code": response.status_code,
+        }
+    except requests.RequestException as exc:
+        return {
+            "status": "failed",
+            "delivery_id": payload.get("request_id"),
+            "debug_detail": f"CRM_REQUEST_ERROR: {exc}",
+            "response_code": None,
+        }
+
 
 
 def log_api_access(path: str) -> None:
