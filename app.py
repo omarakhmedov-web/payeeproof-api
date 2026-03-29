@@ -29,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.0.2-origin-optional-for-api-key"
+APP_VERSION = "2.0.3-pilot-welcome-flow"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -173,6 +173,9 @@ RESEND_API_BASE = os.getenv("RESEND_API_BASE", "https://api.resend.com").rstrip(
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 RESEND_FROM = os.getenv("RESEND_FROM", "PayeeProof <alerts@notify.payeeproof.com>").strip()
 RESEND_TO = os.getenv("RESEND_TO", "hello@payeeproof.com").strip()
+PILOT_AUTO_WELCOME_ENABLED = str(os.getenv("PILOT_AUTO_WELCOME_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+PILOT_WELCOME_REPLY_TO = os.getenv("PILOT_WELCOME_REPLY_TO", RESEND_TO).strip()
+PILOT_WELCOME_NEXT_STEP_HOURS = int(os.getenv("PILOT_WELCOME_NEXT_STEP_HOURS", "24"))
 PUBLIC_DEMO_ORIGINS = os.getenv("PUBLIC_DEMO_ORIGINS", ",".join(allowed_origins)).strip()
 API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
 ANON_API_RATE_LIMIT = int(os.getenv("ANON_API_RATE_LIMIT", "20"))
@@ -1016,17 +1019,21 @@ def find_recent_duplicate_request(conn: Any, fingerprint: str, ttl_sec: int) -> 
     )
 
 
-def update_pilot_delivery_status(request_id: str, email_result: Dict[str, Optional[str]]) -> None:
+def update_pilot_email_status(request_id: str, email_result: Dict[str, Optional[str]], *, prefix: str = "email") -> None:
+    status_column = f"{prefix}_status"
+    id_column = f"{prefix}_id"
+    error_column = f"{prefix}_error"
+    attempted_column = f"{prefix}_last_attempt_at"
     conn = get_db()
     try:
         db_execute(
             conn,
-            """
+            f"""
             UPDATE pilot_requests
-            SET email_status = ?,
-                email_id = ?,
-                email_error = ?,
-                email_last_attempt_at = ?
+            SET {status_column} = ?,
+                {id_column} = ?,
+                {error_column} = ?,
+                {attempted_column} = ?
             WHERE request_id = ?
             """,
             (
@@ -1042,11 +1049,20 @@ def update_pilot_delivery_status(request_id: str, email_result: Dict[str, Option
         conn.close()
 
 
+def update_pilot_delivery_status(request_id: str, email_result: Dict[str, Optional[str]]) -> None:
+    update_pilot_email_status(request_id, email_result, prefix="email")
+
+
+def update_pilot_welcome_status(request_id: str, email_result: Dict[str, Optional[str]]) -> None:
+    update_pilot_email_status(request_id, email_result, prefix="welcome_email")
+
+
 def pilot_ack_response(
     message: str,
     submitted_at: Optional[str] = None,
     stored: bool = False,
     email_notification: str = "skipped",
+    welcome_email_notification: str = "skipped",
     status_code: int = 200,
     request_id: Optional[str] = None,
     persisted: Optional[bool] = None,
@@ -1056,6 +1072,7 @@ def pilot_ack_response(
         "message": message,
         "stored": stored,
         "email_notification": email_notification,
+        "welcome_email_notification": welcome_email_notification,
         "trace_id": current_request_id(),
     }
     if submitted_at:
@@ -3122,7 +3139,11 @@ def ensure_db() -> None:
                   email_status TEXT DEFAULT 'pending',
                   email_id TEXT,
                   email_error TEXT,
-                  email_last_attempt_at TEXT
+                  email_last_attempt_at TEXT,
+                  welcome_email_status TEXT DEFAULT 'pending',
+                  welcome_email_id TEXT,
+                  welcome_email_error TEXT,
+                  welcome_email_last_attempt_at TEXT
                 )
                 """
             )
@@ -3146,7 +3167,11 @@ def ensure_db() -> None:
                   email_status TEXT DEFAULT 'pending',
                   email_id TEXT,
                   email_error TEXT,
-                  email_last_attempt_at TEXT
+                  email_last_attempt_at TEXT,
+                  welcome_email_status TEXT DEFAULT 'pending',
+                  welcome_email_id TEXT,
+                  welcome_email_error TEXT,
+                  welcome_email_last_attempt_at TEXT
                 )
                 """
             )
@@ -3157,6 +3182,10 @@ def ensure_db() -> None:
         ensure_column(conn, "pilot_requests", "email_id", "TEXT")
         ensure_column(conn, "pilot_requests", "email_error", "TEXT")
         ensure_column(conn, "pilot_requests", "email_last_attempt_at", "TEXT")
+        ensure_column(conn, "pilot_requests", "welcome_email_status", "TEXT DEFAULT 'pending'")
+        ensure_column(conn, "pilot_requests", "welcome_email_id", "TEXT")
+        ensure_column(conn, "pilot_requests", "welcome_email_error", "TEXT")
+        ensure_column(conn, "pilot_requests", "welcome_email_last_attempt_at", "TEXT")
         db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_pilot_requests_request_id ON pilot_requests(request_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_pilot_requests_fingerprint_created_at ON pilot_requests(fingerprint, created_at)")
         if db_is_postgres():
@@ -4530,8 +4559,9 @@ def pilot_request():
             """
             INSERT INTO pilot_requests(
                 request_id, fingerprint, created_at, name, company, email, volume, notes,
-                source_ip, user_agent, origin, email_status, email_last_attempt_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_ip, user_agent, origin, email_status, email_last_attempt_at,
+                welcome_email_status, welcome_email_last_attempt_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
@@ -4545,6 +4575,8 @@ def pilot_request():
                 source_ip,
                 user_agent,
                 origin,
+                "pending",
+                None,
                 "pending",
                 None,
             ),
@@ -4566,6 +4598,16 @@ def pilot_request():
         "origin": origin or "",
     })
     update_pilot_delivery_status(request_id, email_result)
+    welcome_email_result = send_pilot_welcome_email({
+        "request_id": request_id,
+        "created_at": created_at,
+        "name": name,
+        "company": company,
+        "email": email,
+        "volume": volume,
+        "notes": notes,
+    })
+    update_pilot_welcome_status(request_id, welcome_email_result)
 
     if email_result.get("status") == "sent":
         record_request_event(
@@ -4575,17 +4617,22 @@ def pilot_request():
             reason_code="EMAIL_SENT",
             network="pilot",
             http_status=200,
-            metadata={"request_id": request_id, "email_notification": "sent"},
+            metadata={
+                "request_id": request_id,
+                "email_notification": "sent",
+                "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
+            },
         )
         return jsonify({
             "ok": True,
-            "message": "Your request was recorded successfully.",
+            "message": "Your request was recorded successfully. A confirmation email is on the way.",
             "stored": True,
             "persisted": True,
             "request_id": request_id,
             "trace_id": current_request_id(),
             "email_notification": "sent",
             "email_id": email_result.get("email_id"),
+            "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
             "submitted_at": created_at,
         })
 
@@ -4597,16 +4644,21 @@ def pilot_request():
             reason_code="EMAIL_NOT_CONFIGURED",
             network="pilot",
             http_status=200,
-            metadata={"request_id": request_id, "email_notification": "not_configured"},
+            metadata={
+                "request_id": request_id,
+                "email_notification": "not_configured",
+                "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
+            },
         )
         return jsonify({
             "ok": True,
-            "message": "Your request was recorded successfully, but email forwarding is not configured yet.",
+            "message": "Your request was recorded successfully, but internal email forwarding is not configured yet.",
             "stored": True,
             "persisted": True,
             "request_id": request_id,
             "trace_id": current_request_id(),
             "email_notification": "not_configured",
+            "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
             "submitted_at": created_at,
         }), 200
 
@@ -4619,16 +4671,21 @@ def pilot_request():
         http_status=200,
         timeout_flag=looks_like_timeout(email_result.get("debug_detail")),
         error_message=str(email_result.get("debug_detail") or ""),
-        metadata={"request_id": request_id, "email_notification": "failed"},
+        metadata={
+            "request_id": request_id,
+            "email_notification": "failed",
+            "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
+        },
     )
     return jsonify({
         "ok": True,
-        "message": "Your request was recorded successfully, but email forwarding is delayed right now.",
+        "message": "Your request was recorded successfully, but internal email forwarding is delayed right now.",
         "stored": True,
         "persisted": True,
         "request_id": request_id,
         "trace_id": current_request_id(),
         "email_notification": "failed",
+        "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
         "submitted_at": created_at,
         "debug_detail": email_result.get("debug_detail"),
     }), 200
@@ -4708,6 +4765,118 @@ def send_pilot_notification(payload: Dict[str, str]) -> Dict[str, Optional[str]]
         "Accept": "application/json",
         "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
         "Idempotency-Key": f"pilot-{_pilot_payload_fingerprint(resend_payload)}",
+    }
+
+    try:
+        response = requests.post(
+            f"{RESEND_API_BASE}/emails",
+            headers=headers,
+            json=resend_payload,
+            timeout=EMAIL_TIMEOUT,
+        )
+        raw_text = response.text[:1000]
+        if response.status_code < 200 or response.status_code >= 300:
+            return {
+                "status": "failed",
+                "email_id": None,
+                "debug_detail": f"RESEND_HTTP_{response.status_code}: {raw_text}",
+            }
+        data = response.json() if response.text else {}
+        return {
+            "status": "sent",
+            "email_id": data.get("id"),
+            "debug_detail": None,
+        }
+    except requests.RequestException as exc:
+        return {
+            "status": "failed",
+            "email_id": None,
+            "debug_detail": f"RESEND_REQUEST_ERROR: {exc}",
+        }
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "email_id": None,
+            "debug_detail": f"RESEND_JSON_ERROR: {exc}",
+        }
+
+
+def send_pilot_welcome_email(payload: Dict[str, str]) -> Dict[str, Optional[str]]:
+    if not PILOT_AUTO_WELCOME_ENABLED:
+        return {"status": "disabled", "email_id": None, "debug_detail": None}
+    if not RESEND_API_KEY or not RESEND_FROM:
+        return {"status": "not_configured", "email_id": None, "debug_detail": None}
+
+    next_step_label = f"within about {PILOT_WELCOME_NEXT_STEP_HOURS} hours" if PILOT_WELCOME_NEXT_STEP_HOURS > 0 else "soon"
+    notes_preview = " ".join((payload.get("notes") or "").split())[:500]
+    if len(notes_preview) == 500:
+        notes_preview = notes_preview.rstrip() + "…"
+
+    subject = f"PayeeProof pilot request received — {payload['company']}"
+    text_body = "\n".join([
+        f"Hi {payload['name']},",
+        "",
+        "Thanks — we received your PayeeProof pilot request.",
+        "",
+        f"Request ID: {payload.get('request_id') or 'pending'}",
+        f"Submitted at: {payload.get('created_at') or utc_now_iso()}",
+        f"Company / team: {payload.get('company') or 'Not provided'}",
+        f"Work email: {payload.get('email') or 'Not provided'}",
+        f"Monthly payout volume: {payload.get('volume') or 'Not provided'}",
+        "",
+        "What happens next:",
+        f"- We review the workflow and the decision you want before approval.",
+        f"- We reply {next_step_label} with either a pilot fit confirmation or a short clarification request.",
+        f"- If the fit is good, we lock the narrow pilot scope and next step.",
+        "",
+        "What we received:",
+        notes_preview or "No notes provided.",
+        "",
+        "If you want to speed up review, just reply to this email with any extra detail on networks, assets, approval logic, or current failure cases.",
+        "",
+        "— PayeeProof",
+        "https://payeeproof.com",
+    ])
+
+    html_body = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111">
+      <h2>PayeeProof pilot request received</h2>
+      <p>Hi {html.escape(payload['name'])},</p>
+      <p>Thanks — we received your PayeeProof pilot request.</p>
+      <p><strong>Request ID:</strong> {html.escape(payload.get('request_id') or 'pending')}<br>
+      <strong>Submitted at:</strong> {html.escape(payload.get('created_at') or utc_now_iso())}<br>
+      <strong>Company / team:</strong> {html.escape(payload.get('company') or 'Not provided')}<br>
+      <strong>Work email:</strong> {html.escape(payload.get('email') or 'Not provided')}<br>
+      <strong>Monthly payout volume:</strong> {html.escape(payload.get('volume') or 'Not provided')}</p>
+      <p><strong>What happens next</strong><br>
+      • We review the workflow and the decision you want before approval.<br>
+      • We reply {html.escape(next_step_label)} with either a pilot fit confirmation or a short clarification request.<br>
+      • If the fit is good, we lock the narrow pilot scope and next step.</p>
+      <p><strong>What we received</strong><br>{html.escape(notes_preview or 'No notes provided.').replace(chr(10), '<br>')}</p>
+      <p>If you want to speed up review, just reply to this email with any extra detail on networks, assets, approval logic, or current failure cases.</p>
+      <p>— PayeeProof<br><a href="https://payeeproof.com">payeeproof.com</a></p>
+    </div>
+    """.strip()
+
+    resend_payload = {
+        "from": RESEND_FROM,
+        "to": [payload["email"]],
+        "subject": subject,
+        "reply_to": PILOT_WELCOME_REPLY_TO or RESEND_TO or RESEND_FROM,
+        "text": text_body,
+        "html": html_body,
+        "tags": [
+            {"name": "source", "value": "pilot_welcome"},
+            {"name": "product", "value": "payeeproof"},
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        "Idempotency-Key": f"pilot-welcome-{payload.get('request_id') or _pilot_payload_fingerprint(resend_payload)}",
     }
 
     try:
