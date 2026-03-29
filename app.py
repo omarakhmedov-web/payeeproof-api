@@ -4625,15 +4625,10 @@ def pilot_request():
         )
         return jsonify({
             "ok": True,
-            "message": "Your request was recorded successfully. A confirmation email is on the way.",
-            "stored": True,
-            "persisted": True,
+            "message": "Your request was received successfully. A confirmation email is on the way.",
             "request_id": request_id,
-            "trace_id": current_request_id(),
-            "email_notification": "sent",
-            "email_id": email_result.get("email_id"),
-            "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
             "submitted_at": created_at,
+            "next_step": f"We will review it within about {PILOT_WELCOME_NEXT_STEP_HOURS} hours." if PILOT_WELCOME_NEXT_STEP_HOURS > 0 else "We will review it soon.",
         })
 
     if email_result.get("status") == "not_configured":
@@ -4652,14 +4647,10 @@ def pilot_request():
         )
         return jsonify({
             "ok": True,
-            "message": "Your request was recorded successfully, but internal email forwarding is not configured yet.",
-            "stored": True,
-            "persisted": True,
+            "message": "Your request was received successfully.",
             "request_id": request_id,
-            "trace_id": current_request_id(),
-            "email_notification": "not_configured",
-            "welcome_email_notification": str(welcome_email_result.get("status") or "unknown"),
             "submitted_at": created_at,
+            "next_step": f"We will review it within about {PILOT_WELCOME_NEXT_STEP_HOURS} hours." if PILOT_WELCOME_NEXT_STEP_HOURS > 0 else "We will review it soon.",
         }), 200
 
     record_request_event(
@@ -4812,9 +4803,12 @@ def send_pilot_welcome_email(payload: Dict[str, str]) -> Dict[str, Optional[str]
     if len(notes_preview) == 500:
         notes_preview = notes_preview.rstrip() + "…"
 
+    full_name = " ".join((payload.get("name") or "").split())
+    greeting_name = (full_name.split()[0] if full_name else "there")
+
     subject = f"PayeeProof pilot request received — {payload['company']}"
     text_body = "\n".join([
-        f"Hi {payload['name']},",
+        f"Hi {greeting_name},",
         "",
         "Thanks — we received your PayeeProof pilot request.",
         "",
@@ -4841,7 +4835,7 @@ def send_pilot_welcome_email(payload: Dict[str, str]) -> Dict[str, Optional[str]
     html_body = f"""
     <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111">
       <h2>PayeeProof pilot request received</h2>
-      <p>Hi {html.escape(payload['name'])},</p>
+      <p>Hi {html.escape(greeting_name)},</p>
       <p>Thanks — we received your PayeeProof pilot request.</p>
       <p><strong>Request ID:</strong> {html.escape(payload.get('request_id') or 'pending')}<br>
       <strong>Submitted at:</strong> {html.escape(payload.get('created_at') or utc_now_iso())}<br>
