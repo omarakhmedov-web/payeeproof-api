@@ -92,7 +92,7 @@ DEFAULT_RPC_URLS = {
 }
 
 SUPPORTED_ASSETS_BY_CHAIN = {
-    "ethereum": {"USDC", "USDT", "DAI", "USDS", "PYUSD"},
+    "ethereum": {"ETH", "USDC", "USDT", "DAI", "USDS", "PYUSD"},
     "arbitrum": {"USDC", "USDT", "DAI", "USDS"},
     "base": {"USDC", "USDT"},
     "polygon": {"USDC", "USDT"},
