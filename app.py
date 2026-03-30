@@ -501,7 +501,7 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
                 normalized_policy = {
                     **normalized_policy,
                     "allowed_networks": ["ethereum"],
-                    "allowed_assets_by_network": {"ethereum": ["USDT", "USDC"]},
+                    "allowed_assets_by_network": {"ethereum": ["ETH", "USDT", "USDC"]},
                 }
         client_value = str(
             item.get("client")
