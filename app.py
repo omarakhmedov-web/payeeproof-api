@@ -1975,6 +1975,7 @@ def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], c
         "provider_invoice_id": provider_invoice_id,
         "invoice_url": invoice_url,
         "payment_status": payment_status,
+        "customer_email": customer_email,
     }
 
 
@@ -2459,11 +2460,65 @@ def enforce_public_origin_if_present() -> None:
         )
 
 
+def _extract_customer_email_from_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    direct_candidates = [
+        payload.get("customer_email"),
+        payload.get("email"),
+        payload.get("customerEmail"),
+        payload.get("customer-email"),
+        payload.get("customer_mail"),
+    ]
+    for value in direct_candidates:
+        email = normalize_text(value, 200).lower()
+        if email:
+            return email
+
+    nested_candidates = []
+    customer_block = payload.get("customer")
+    if isinstance(customer_block, dict):
+        nested_candidates.extend([
+            customer_block.get("email"),
+            customer_block.get("customer_email"),
+        ])
+    contact_block = payload.get("contact")
+    if isinstance(contact_block, dict):
+        nested_candidates.extend([
+            contact_block.get("email"),
+            contact_block.get("customer_email"),
+        ])
+    for value in nested_candidates:
+        email = normalize_text(value, 200).lower()
+        if email:
+            return email
+
+    for key, value in payload.items():
+        normalized_key = str(key or "").strip().lower().replace("-", "_")
+        if normalized_key in {"customer_email", "email", "customeremail", "customer_mail"}:
+            email = normalize_text(value, 200).lower()
+            if email:
+                return email
+
+    try:
+        raw_body = request.get_data(cache=True, as_text=True) or ""
+    except Exception:
+        raw_body = ""
+    if raw_body:
+        match = re.search(r'"(?:customer_email|customerEmail|email)"\s*:\s*"([^"\r\n]+)"', raw_body, re.IGNORECASE)
+        if match:
+            return normalize_text(match.group(1), 200).lower()
+
+    return ""
+
+
+
 def create_nowpayments_invoice_internal(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not nowpayments_is_configured():
         raise ApiError("NOWPayments is not configured.", 503, code="NOWPAYMENTS_NOT_CONFIGURED")
     product = nowpayments_product_or_error(payload.get("sku") or payload.get("product_sku"))
-    customer_email = normalize_text(payload.get("customer_email") or payload.get("email"), 200).lower()
+    customer_email = _extract_customer_email_from_payload(payload)
     if customer_email and not is_valid_email(customer_email):
         raise ApiError("Please enter a valid email address.", 400)
     order_id = nowpayments_checkout_id()
@@ -2476,7 +2531,7 @@ def create_nowpayments_invoice_internal(payload: Dict[str, Any]) -> Dict[str, An
         "payment_status": stored.get("payment_status") or "waiting",
         "provider_invoice_id": stored.get("provider_invoice_id") or "",
         "product": product,
-        "customer_email": customer_email,
+        "customer_email": stored.get("customer_email") or customer_email,
         "success_url": success_url,
         "cancel_url": cancel_url,
     }
