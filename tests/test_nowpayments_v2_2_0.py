@@ -39,32 +39,50 @@ def test_create_nowpayments_invoice_and_store_order(client, app_module, monkeypa
     assert body['ok'] is True
     assert body['checkout_url'] == 'https://nowpayments.test/i/inv_123456'
     assert body['product']['sku'] == 'pilot_399'
+    assert body['customer_email'] == 'buyer@example.com'
     assert captured['url'] == 'https://api.nowpayments.io/v1/invoice'
     assert captured['headers']['x-api-key'] == 'np_test_key'
     assert captured['json']['price_amount'] == 399.0
     assert captured['json']['price_currency'] == 'usd'
     assert captured['json']['ipn_callback_url'].endswith('/api/payments/nowpayments/ipn')
+    assert f"order_id={body['order_id']}" in captured['json']['success_url']
+    assert f"order_id={body['order_id']}" in captured['json']['cancel_url']
 
     order_response = client.get(f"/api/payments/nowpayments/order/{body['order_id']}")
     order_body = order_response.get_json()
     assert order_response.status_code == 200
     assert order_body['order']['payment_status'] == 'waiting'
     assert order_body['order']['paid'] is False
+    assert order_body['order']['customer_receipt_status'] == 'pending'
 
 
-def test_nowpayments_ipn_updates_order_status(client, app_module, monkeypatch):
+
+def test_nowpayments_ipn_updates_order_status_and_sends_postpay_emails(client, app_module, monkeypatch):
+    app_module.RESEND_API_KEY = 're_test'
+    app_module.RESEND_FROM = 'PayeeProof <alerts@notify.payeeproof.com>'
+    app_module.RESEND_TO = 'hello@payeeproof.com'
+    app_module.NOWPAYMENTS_POSTPAY_REPLY_TO = 'hello@payeeproof.com'
+    app_module.NOWPAYMENTS_SUPPORT_EMAIL = 'hello@payeeproof.com'
+
+    sent = []
+
     def _fake_post(url, headers=None, json=None, timeout=None):
-        return _FakeResponse(
-            status_code=200,
-            payload={
-                'id': 'inv_abc',
-                'invoice_url': 'https://nowpayments.test/i/inv_abc',
-                'payment_status': 'waiting',
-            },
-        )
+        if url.endswith('/invoice'):
+            return _FakeResponse(
+                status_code=200,
+                payload={
+                    'id': 'inv_abc',
+                    'invoice_url': 'https://nowpayments.test/i/inv_abc',
+                    'payment_status': 'waiting',
+                },
+            )
+        if url.endswith('/emails'):
+            sent.append({'url': url, 'headers': headers or {}, 'json': json or {}})
+            return _FakeResponse(status_code=200, payload={'id': f"em_{len(sent)}"})
+        raise AssertionError(f'Unexpected URL: {url}')
 
     monkeypatch.setattr(app_module.requests, 'post', _fake_post)
-    create_response = client.post('/api/payments/nowpayments/invoice', json={'sku': 'pilot_399'})
+    create_response = client.post('/api/payments/nowpayments/invoice', json={'sku': 'pilot_399', 'customer_email': 'buyer@example.com'})
     order_id = create_response.get_json()['order_id']
 
     ipn_payload = {
@@ -84,13 +102,20 @@ def test_nowpayments_ipn_updates_order_status(client, app_module, monkeypatch):
     assert ipn_response.status_code == 200
     assert ipn_body['paid'] is True
     assert ipn_body['payment_status'] == 'finished'
+    assert ipn_body['payment_notice_status'] == 'sent'
+    assert ipn_body['customer_receipt_status'] == 'sent'
+    assert len(sent) == 2
+    assert sent[0]['headers']['Idempotency-Key'] == f'nowpayments-admin-{order_id}'
+    assert sent[1]['headers']['Idempotency-Key'] == f'nowpayments-customer-{order_id}'
 
     order_response = client.get(f'/api/payments/nowpayments/order/{order_id}')
     order_body = order_response.get_json()
     assert order_response.status_code == 200
     assert order_body['order']['paid'] is True
     assert order_body['order']['payment_status'] == 'finished'
-    assert order_body['order']['fulfillment_status'] == 'ready_for_manual_fulfillment'
+    assert order_body['order']['fulfillment_status'] == 'payment_confirmed'
+    assert order_body['order']['payment_notice_status'] == 'sent'
+    assert order_body['order']['customer_receipt_status'] == 'sent'
 
 
 
