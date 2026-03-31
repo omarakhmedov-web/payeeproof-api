@@ -2325,6 +2325,8 @@ def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]
         existing = None
         if order_id:
             existing = db_fetchone(conn, "SELECT order_id FROM nowpayments_orders WHERE order_id = ? LIMIT 1", (order_id,))
+        if not existing and provider_invoice_id:
+            existing = db_fetchone(conn, "SELECT order_id FROM nowpayments_orders WHERE provider_invoice_id = ? LIMIT 1", (provider_invoice_id,))
         if not existing and provider_payment_id:
             existing = db_fetchone(conn, "SELECT order_id FROM nowpayments_orders WHERE provider_payment_id = ? LIMIT 1", (provider_payment_id,))
         if not existing and purchase_id:
@@ -2407,6 +2409,26 @@ def fetch_nowpayments_order(order_id: str) -> Dict[str, Any]:
     finally:
         conn.close()
     return row_to_dict(row)
+
+
+def extract_nowpayments_ipn_payload() -> Dict[str, Any]:
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict) and payload:
+        return payload
+    raw = request.get_data(as_text=True) or ""
+    raw = raw.strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except Exception:
+            pass
+    form_payload = request.form.to_dict(flat=True) if request.form else {}
+    if form_payload:
+        return form_payload
+    query_payload = {str(k): str(v) for k, v in request.args.items() if str(k) != "test_bypass"}
+    return query_payload
 
 
 def nowpayments_public_order_view(order: Dict[str, Any]) -> Dict[str, Any]:
@@ -4895,7 +4917,7 @@ def nowpayments_order_status(order_id: str):
 
 @app.post("/api/payments/nowpayments/ipn")
 def nowpayments_ipn_receive():
-    payload = request.get_json(silent=True) or {}
+    payload = extract_nowpayments_ipn_payload()
     bypass_active = NOWPAYMENTS_IPN_TEST_BYPASS and str(request.args.get("test_bypass") or "").strip() == "1"
     signature = str(request.headers.get("x-nowpayments-sig") or request.headers.get("X-NOWPAYMENTS-SIG") or "").strip()
     if not bypass_active:
