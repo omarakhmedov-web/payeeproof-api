@@ -224,6 +224,7 @@ NOWPAYMENTS_BASE_URL = os.getenv("NOWPAYMENTS_BASE_URL", "https://api.nowpayment
 NOWPAYMENTS_SUCCESS_URL = os.getenv("NOWPAYMENTS_SUCCESS_URL", "https://payeeproof.com/payment-success.html").strip()
 NOWPAYMENTS_CANCEL_URL = os.getenv("NOWPAYMENTS_CANCEL_URL", "https://payeeproof.com/payment-cancelled.html").strip()
 NOWPAYMENTS_IPN_PATH = os.getenv("NOWPAYMENTS_IPN_PATH", "/api/payments/nowpayments/ipn").strip() or "/api/payments/nowpayments/ipn"
+NOWPAYMENTS_IPN_TEST_BYPASS = os.getenv("NOWPAYMENTS_IPN_TEST_BYPASS", "0").strip().lower() in {"1", "true", "yes", "on"}
 NOWPAYMENTS_CREATE_RATE_LIMIT = int(os.getenv("NOWPAYMENTS_CREATE_RATE_LIMIT", "8"))
 NOWPAYMENTS_CREATE_RATE_WINDOW_SEC = int(os.getenv("NOWPAYMENTS_CREATE_RATE_WINDOW_SEC", "300"))
 NOWPAYMENTS_DEFAULT_PRODUCT_SKU = os.getenv("NOWPAYMENTS_DEFAULT_PRODUCT_SKU", "pilot_399").strip() or "pilot_399"
@@ -4895,12 +4896,14 @@ def nowpayments_order_status(order_id: str):
 @app.post("/api/payments/nowpayments/ipn")
 def nowpayments_ipn_receive():
     payload = request.get_json(silent=True) or {}
+    bypass_active = NOWPAYMENTS_IPN_TEST_BYPASS and str(request.args.get("test_bypass") or "").strip() == "1"
     signature = str(request.headers.get("x-nowpayments-sig") or request.headers.get("X-NOWPAYMENTS-SIG") or "").strip()
-    if not signature:
-        raise ApiError("Missing NOWPayments signature.", 400, code="NOWPAYMENTS_SIG_MISSING")
-    expected = nowpayments_ipn_signature(payload)
-    if not expected or not hmac.compare_digest(signature.lower(), expected.lower()):
-        raise ApiError("Invalid NOWPayments signature.", 403, code="NOWPAYMENTS_SIG_INVALID")
+    if not bypass_active:
+        if not signature:
+            raise ApiError("Missing NOWPayments signature.", 400, code="NOWPAYMENTS_SIG_MISSING")
+        expected = nowpayments_ipn_signature(payload)
+        if not expected or not hmac.compare_digest(signature.lower(), expected.lower()):
+            raise ApiError("Invalid NOWPayments signature.", 403, code="NOWPAYMENTS_SIG_INVALID")
     updated = upsert_nowpayments_order_from_ipn(payload)
     processed_order = maybe_process_nowpayments_paid_order(str(updated.get("order_id") or "")) if bool(updated.get("paid")) else {}
     record_request_event(
