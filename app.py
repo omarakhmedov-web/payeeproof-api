@@ -29,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.3.0-nowpayments-postpay"
+APP_VERSION = "2.3.1-nowpayments-ipnfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -4906,7 +4906,7 @@ def nowpayments_ipn_receive():
             "test_bypass": bool(bypass_enabled and bypass_requested),
         },
     )
-    return jsonify({
+    response_payload = {
         "ok": True,
         "trace_id": current_request_id(),
         "order_id": updated.get("order_id"),
@@ -4915,7 +4915,16 @@ def nowpayments_ipn_receive():
         "payment_notice_status": (processed_order or {}).get("payment_notice_status") or "pending",
         "customer_receipt_status": (processed_order or {}).get("customer_receipt_status") or "pending",
         "crm_status": (processed_order or {}).get("crm_status") or "pending",
-    })
+    }
+    if bypass_enabled and bypass_requested:
+        response_payload["debug_payload"] = {
+            "order_id": normalize_text(payload.get("order_id"), 120),
+            "invoice_id": normalize_text(payload.get("invoice_id") or payload.get("invoiceId"), 120),
+            "payment_status": normalize_text(payload.get("payment_status") or payload.get("status"), 80),
+            "payload_keys": sorted([str(k) for k in payload.keys()]),
+            "app_version": APP_VERSION,
+        }
+    return jsonify(response_payload)
 
 
 @app.get("/api/account")
