@@ -15,6 +15,13 @@ def app_module(tmp_path_factory):
     db_path = db_dir / 'payeeproof_test.db'
 
     os.environ['DB_PATH'] = str(db_path)
+    os.environ['NOWPAYMENTS_ENABLED'] = '1'
+    os.environ['NOWPAYMENTS_API_KEY'] = 'np_test_key'
+    os.environ['NOWPAYMENTS_IPN_SECRET'] = 'np_test_secret'
+    os.environ['NOWPAYMENTS_BASE_URL'] = 'https://api.nowpayments.io/v1'
+    os.environ['NOWPAYMENTS_SUCCESS_URL'] = 'https://payeeproof.com/payment-success.html'
+    os.environ['NOWPAYMENTS_CANCEL_URL'] = 'https://payeeproof.com/payment-cancelled.html'
+    os.environ['NOWPAYMENTS_IPN_PATH'] = '/api/payments/nowpayments/ipn'
     os.environ['API_KEYS_JSON'] = json.dumps([
         {
             'key': 'pp_test_suite_key',
@@ -72,6 +79,7 @@ def client(app_module):
             'pilot_requests',
             'tenant_api_keys',
             'tenants',
+            'nowpayments_orders',
         ]:
             app_module.db_execute(conn, f'DELETE FROM {table_name}')
         conn.commit()
