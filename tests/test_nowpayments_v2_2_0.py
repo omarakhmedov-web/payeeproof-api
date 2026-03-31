@@ -113,7 +113,7 @@ def test_nowpayments_ipn_updates_order_status_and_sends_postpay_emails(client, a
     assert order_response.status_code == 200
     assert order_body['order']['paid'] is True
     assert order_body['order']['payment_status'] == 'finished'
-    assert order_body['order']['fulfillment_status'] == 'postpay_completed'
+    assert order_body['order']['fulfillment_status'] == 'payment_confirmed'
     assert order_body['order']['payment_notice_status'] == 'sent'
     assert order_body['order']['customer_receipt_status'] == 'sent'
 
@@ -128,73 +128,64 @@ def test_nowpayments_ipn_rejects_bad_signature(client):
     assert body['error'] == 'NOWPAYMENTS_SIG_INVALID'
 
 
+def test_nowpayments_paid_order_backfills_crm_after_later_enable(client, app_module, monkeypatch):
+    app_module.NOWPAYMENTS_POSTPAY_EMAILS_ENABLED = False
+    app_module.RESEND_API_KEY = ''
+    app_module.RESEND_FROM = ''
+    app_module.RESEND_TO = ''
+    app_module.NOWPAYMENTS_POSTPAY_CRM_ENABLED = False
+    app_module.NOWPAYMENTS_POSTPAY_CRM_URL = ''
+    app_module.NOWPAYMENTS_POSTPAY_CRM_SECRET = ''
 
-def test_nowpayments_ipn_test_bypass_reads_raw_json_body_without_content_type(client, app_module, monkeypatch):
-    app_module.RESEND_API_KEY = 're_test'
-    app_module.RESEND_FROM = 'PayeeProof <alerts@notify.payeeproof.com>'
-    app_module.RESEND_TO = 'hello@payeeproof.com'
-    app_module.NOWPAYMENTS_POSTPAY_REPLY_TO = 'hello@payeeproof.com'
-    app_module.NOWPAYMENTS_SUPPORT_EMAIL = 'hello@payeeproof.com'
-
-    sent = []
+    captured = []
 
     def _fake_post(url, headers=None, json=None, timeout=None):
         if url.endswith('/invoice'):
             return _FakeResponse(
                 status_code=200,
                 payload={
-                    'id': '4926723046',
-                    'invoice_url': 'https://nowpayments.test/i/4926723046',
+                    'id': 'inv_backfill',
+                    'invoice_url': 'https://nowpayments.test/i/inv_backfill',
                     'payment_status': 'waiting',
                 },
             )
-        if url.endswith('/emails'):
-            sent.append({'url': url, 'headers': headers or {}, 'json': json or {}})
-            return _FakeResponse(status_code=200, payload={'id': f"em_{len(sent)}"})
+        if url == 'https://crm.example.com/intake':
+            captured.append({'url': url, 'headers': headers or {}, 'json': json or {}, 'timeout': timeout})
+            return _FakeResponse(status_code=200, payload={'ok': True})
         raise AssertionError(f'Unexpected URL: {url}')
 
     monkeypatch.setattr(app_module.requests, 'post', _fake_post)
-    monkeypatch.setenv('NOWPAYMENTS_IPN_TEST_BYPASS', '1')
 
-    create_response = client.post('/api/payments/nowpayments/invoice', json={'sku': 'pilot_399', 'customer_email': 'hello@payeeproof.com'})
+    create_response = client.post('/api/payments/nowpayments/invoice', json={'sku': 'pilot_399'})
     order_id = create_response.get_json()['order_id']
 
     ipn_payload = {
-        'invoice_id': '4926723046',
         'order_id': order_id,
+        'invoice_id': 'inv_backfill',
+        'payment_id': 'pay_backfill',
         'payment_status': 'finished',
     }
-    ipn_response = client.post(
-        '/api/payments/nowpayments/ipn?test_bypass=1',
-        data=json.dumps(ipn_payload),
-    )
+    signature = app_module.nowpayments_ipn_signature(ipn_payload)
+    ipn_response = client.post('/api/payments/nowpayments/ipn', json=ipn_payload, headers={'x-nowpayments-sig': signature})
     ipn_body = ipn_response.get_json()
 
     assert ipn_response.status_code == 200
-    assert ipn_body['order_id'] == order_id
-    assert ipn_body['payment_status'] == 'finished'
     assert ipn_body['paid'] is True
-    assert ipn_body['debug_payload']['invoice_id'] == '4926723046'
-    assert ipn_body['debug_payload']['order_id'] == order_id
-    assert 'invoice_id' in ipn_body['debug_payload']['payload_keys']
-    assert 'order_id' in ipn_body['debug_payload']['payload_keys']
-    assert 'payment_status' in ipn_body['debug_payload']['payload_keys']
-    assert len(sent) == 2
+    assert ipn_body['crm_status'] == 'pending'
+
+    app_module.NOWPAYMENTS_POSTPAY_CRM_ENABLED = True
+    app_module.NOWPAYMENTS_POSTPAY_CRM_URL = 'https://crm.example.com/intake'
+    app_module.NOWPAYMENTS_POSTPAY_CRM_SECRET = 'crm_secret'
 
     order_response = client.get(f'/api/payments/nowpayments/order/{order_id}')
     order_body = order_response.get_json()
+
     assert order_response.status_code == 200
     assert order_body['order']['paid'] is True
-    assert order_body['order']['payment_status'] == 'finished'
-    assert order_body['order']['customer_receipt_status'] == 'sent'
-
-
-
-def test_nowpayments_ipn_test_bypass_rejects_empty_payload(client, app_module, monkeypatch):
-    monkeypatch.setenv('NOWPAYMENTS_IPN_TEST_BYPASS', '1')
-
-    response = client.post('/api/payments/nowpayments/ipn?test_bypass=1')
-    body = response.get_json()
-
-    assert response.status_code == 400
-    assert body['error'] == 'NOWPAYMENTS_IPN_PAYLOAD_INVALID'
+    assert order_body['order']['crm_status'] == 'sent'
+    assert order_body['order']['fulfillment_status'] == 'postpay_completed'
+    assert len(captured) == 1
+    assert captured[0]['headers']['X-PayeeProof-CRM-Secret'] == 'crm_secret'
+    assert captured[0]['headers']['Idempotency-Key'] == f'crm-payment-{order_id}'
+    assert captured[0]['json']['event'] == app_module.NOWPAYMENTS_POSTPAY_CRM_EVENT_NAME
+    assert captured[0]['json']['payment']['order_id'] == order_id
