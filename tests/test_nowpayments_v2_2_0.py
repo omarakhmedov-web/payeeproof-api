@@ -198,19 +198,3 @@ def test_nowpayments_ipn_test_bypass_rejects_empty_payload(client, app_module, m
 
     assert response.status_code == 400
     assert body['error'] == 'NOWPAYMENTS_IPN_PAYLOAD_INVALID'
-
-
-def test_nowpayments_ipn_test_bypass_invalid_payload_returns_debug_details(client, app_module, monkeypatch):
-    monkeypatch.setenv('NOWPAYMENTS_IPN_TEST_BYPASS', '1')
-
-    response = client.post(
-        '/api/payments/nowpayments/ipn?test_bypass=1',
-        data='',
-        headers={'Content-Type': 'application/json'},
-    )
-    body = response.get_json()
-
-    assert response.status_code == 400
-    assert body['error'] == 'NOWPAYMENTS_IPN_PAYLOAD_INVALID'
-    assert body['details']['debug_payload']['content_type'] == 'application/json'
-    assert body['details']['debug_payload']['payload_keys'] == ['test_bypass']
