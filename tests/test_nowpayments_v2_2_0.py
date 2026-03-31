@@ -113,7 +113,7 @@ def test_nowpayments_ipn_updates_order_status_and_sends_postpay_emails(client, a
     assert order_response.status_code == 200
     assert order_body['order']['paid'] is True
     assert order_body['order']['payment_status'] == 'finished'
-    assert order_body['order']['fulfillment_status'] == 'payment_confirmed'
+    assert order_body['order']['fulfillment_status'] == 'postpay_completed'
     assert order_body['order']['payment_notice_status'] == 'sent'
     assert order_body['order']['customer_receipt_status'] == 'sent'
 
@@ -126,3 +126,75 @@ def test_nowpayments_ipn_rejects_bad_signature(client):
 
     assert response.status_code == 403
     assert body['error'] == 'NOWPAYMENTS_SIG_INVALID'
+
+
+
+def test_nowpayments_ipn_test_bypass_reads_raw_json_body_without_content_type(client, app_module, monkeypatch):
+    app_module.RESEND_API_KEY = 're_test'
+    app_module.RESEND_FROM = 'PayeeProof <alerts@notify.payeeproof.com>'
+    app_module.RESEND_TO = 'hello@payeeproof.com'
+    app_module.NOWPAYMENTS_POSTPAY_REPLY_TO = 'hello@payeeproof.com'
+    app_module.NOWPAYMENTS_SUPPORT_EMAIL = 'hello@payeeproof.com'
+
+    sent = []
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        if url.endswith('/invoice'):
+            return _FakeResponse(
+                status_code=200,
+                payload={
+                    'id': '4926723046',
+                    'invoice_url': 'https://nowpayments.test/i/4926723046',
+                    'payment_status': 'waiting',
+                },
+            )
+        if url.endswith('/emails'):
+            sent.append({'url': url, 'headers': headers or {}, 'json': json or {}})
+            return _FakeResponse(status_code=200, payload={'id': f"em_{len(sent)}"})
+        raise AssertionError(f'Unexpected URL: {url}')
+
+    monkeypatch.setattr(app_module.requests, 'post', _fake_post)
+    monkeypatch.setenv('NOWPAYMENTS_IPN_TEST_BYPASS', '1')
+
+    create_response = client.post('/api/payments/nowpayments/invoice', json={'sku': 'pilot_399', 'customer_email': 'hello@payeeproof.com'})
+    order_id = create_response.get_json()['order_id']
+
+    ipn_payload = {
+        'invoice_id': '4926723046',
+        'order_id': order_id,
+        'payment_status': 'finished',
+    }
+    ipn_response = client.post(
+        '/api/payments/nowpayments/ipn?test_bypass=1',
+        data=json.dumps(ipn_payload),
+    )
+    ipn_body = ipn_response.get_json()
+
+    assert ipn_response.status_code == 200
+    assert ipn_body['order_id'] == order_id
+    assert ipn_body['payment_status'] == 'finished'
+    assert ipn_body['paid'] is True
+    assert ipn_body['debug_payload']['invoice_id'] == '4926723046'
+    assert ipn_body['debug_payload']['order_id'] == order_id
+    assert 'invoice_id' in ipn_body['debug_payload']['payload_keys']
+    assert 'order_id' in ipn_body['debug_payload']['payload_keys']
+    assert 'payment_status' in ipn_body['debug_payload']['payload_keys']
+    assert len(sent) == 2
+
+    order_response = client.get(f'/api/payments/nowpayments/order/{order_id}')
+    order_body = order_response.get_json()
+    assert order_response.status_code == 200
+    assert order_body['order']['paid'] is True
+    assert order_body['order']['payment_status'] == 'finished'
+    assert order_body['order']['customer_receipt_status'] == 'sent'
+
+
+
+def test_nowpayments_ipn_test_bypass_rejects_empty_payload(client, app_module, monkeypatch):
+    monkeypatch.setenv('NOWPAYMENTS_IPN_TEST_BYPASS', '1')
+
+    response = client.post('/api/payments/nowpayments/ipn?test_bypass=1')
+    body = response.get_json()
+
+    assert response.status_code == 400
+    assert body['error'] == 'NOWPAYMENTS_IPN_PAYLOAD_INVALID'
