@@ -232,6 +232,12 @@ NOWPAYMENTS_POSTPAY_EMAILS_ENABLED = str(os.getenv("NOWPAYMENTS_POSTPAY_EMAILS_E
 NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS = int(os.getenv("NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS", "24"))
 NOWPAYMENTS_POSTPAY_REPLY_TO = os.getenv("NOWPAYMENTS_POSTPAY_REPLY_TO", RESEND_TO or "hello@payeeproof.com").strip()
 NOWPAYMENTS_SUPPORT_EMAIL = os.getenv("NOWPAYMENTS_SUPPORT_EMAIL", RESEND_TO or "hello@payeeproof.com").strip()
+NOWPAYMENTS_POSTPAY_CRM_ENABLED = str(os.getenv("NOWPAYMENTS_POSTPAY_CRM_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+NOWPAYMENTS_POSTPAY_CRM_URL = os.getenv("NOWPAYMENTS_POSTPAY_CRM_URL", CRM_INTAKE_URL).strip()
+NOWPAYMENTS_POSTPAY_CRM_SECRET = os.getenv("NOWPAYMENTS_POSTPAY_CRM_SECRET", CRM_INTAKE_SECRET).strip()
+NOWPAYMENTS_POSTPAY_CRM_AUTH_HEADER = os.getenv("NOWPAYMENTS_POSTPAY_CRM_AUTH_HEADER", CRM_INTAKE_AUTH_HEADER or "X-PayeeProof-CRM-Secret").strip() or "X-PayeeProof-CRM-Secret"
+NOWPAYMENTS_POSTPAY_CRM_TIMEOUT = float(os.getenv("NOWPAYMENTS_POSTPAY_CRM_TIMEOUT_SEC", str(CRM_INTAKE_TIMEOUT or 6)))
+NOWPAYMENTS_POSTPAY_CRM_EVENT_NAME = os.getenv("NOWPAYMENTS_POSTPAY_CRM_EVENT_NAME", "payment_confirmed").strip() or "payment_confirmed"
 DEFAULT_NOWPAYMENTS_PRODUCTS = {
     "pilot_399": {
         "amount_usd": 399.0,
@@ -1933,8 +1939,8 @@ def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], c
                 order_id, created_at, updated_at, status, payment_status, fulfillment_status,
                 customer_email, product_sku, product_title, amount_usd, price_currency, order_description,
                 provider_invoice_id, invoice_url, success_url, cancel_url, source_ip, origin, raw_create_json,
-                payment_notice_status, customer_receipt_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                payment_notice_status, customer_receipt_status, crm_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -1958,6 +1964,7 @@ def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], c
                 json_dumps_safe(provider_response),
                 "pending",
                 "pending" if customer_email else "skipped",
+                "pending",
             ),
         )
         conn.commit()
@@ -1973,6 +1980,18 @@ def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], c
 
 def _nowpayments_paid_flag(status: str) -> bool:
     return str(status or "").strip().lower() in {"finished", "confirmed"}
+
+
+def _nowpayments_terminal_status(status: Any) -> bool:
+    return str(status or "").strip().lower() in {"sent", "skipped", "disabled", "not_configured"}
+
+
+def _nowpayments_postpay_complete(admin_status: Any, customer_status: Any, crm_status: Any) -> bool:
+    return all([
+        _nowpayments_terminal_status(admin_status),
+        _nowpayments_terminal_status(customer_status),
+        _nowpayments_terminal_status(crm_status),
+    ])
 
 
 def send_nowpayments_internal_paid_email(order: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -2119,9 +2138,89 @@ def send_nowpayments_customer_paid_email(order: Dict[str, Any]) -> Dict[str, Opt
         return {"status": "failed", "email_id": None, "debug_detail": f"RESEND_JSON_ERROR: {exc}"}
 
 
-def update_nowpayments_postpay_delivery(order_id: str, admin_result: Dict[str, Optional[str]], customer_result: Dict[str, Optional[str]]) -> Dict[str, Any]:
+
+def send_nowpayments_crm_intake(order: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    if not NOWPAYMENTS_POSTPAY_CRM_ENABLED:
+        return {"status": "disabled", "delivery_id": None, "debug_detail": None, "response_code": None}
+    if not NOWPAYMENTS_POSTPAY_CRM_URL:
+        return {"status": "not_configured", "delivery_id": None, "debug_detail": None, "response_code": None}
+    order_id = normalize_text(order.get("order_id"), 120)
+    crm_payload = {
+        "event": NOWPAYMENTS_POSTPAY_CRM_EVENT_NAME,
+        "product": "payeeproof",
+        "payment": {
+            "order_id": order_id,
+            "created_at": order.get("created_at") or "",
+            "updated_at": order.get("updated_at") or "",
+            "product_sku": order.get("product_sku") or "",
+            "product_title": order.get("product_title") or "",
+            "amount_usd": order.get("amount_usd"),
+            "payment_status": order.get("payment_status") or "",
+            "fulfillment_status": order.get("fulfillment_status") or "",
+            "provider_invoice_id": order.get("provider_invoice_id") or "",
+            "provider_payment_id": order.get("provider_payment_id") or "",
+            "invoice_url": order.get("invoice_url") or "",
+            "pay_currency": order.get("pay_currency") or "",
+            "pay_amount": order.get("pay_amount") or order.get("actually_paid") or "",
+            "customer_email": order.get("customer_email") or "",
+        },
+        "meta": {
+            "origin": order.get("origin") or "",
+            "source_ip": order.get("source_ip") or "",
+            "support_email": NOWPAYMENTS_SUPPORT_EMAIL,
+            "next_step_hours": NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS,
+        },
+        "links": {
+            "site": "https://payeeproof.com",
+            "api_base": PUBLIC_API_BASE,
+            "success_url": order.get("success_url") or NOWPAYMENTS_SUCCESS_URL,
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        "Idempotency-Key": f"crm-payment-{order_id or uuid.uuid4().hex[:12]}",
+    }
+    if NOWPAYMENTS_POSTPAY_CRM_SECRET:
+        headers[NOWPAYMENTS_POSTPAY_CRM_AUTH_HEADER] = NOWPAYMENTS_POSTPAY_CRM_SECRET
+    try:
+        response = requests.post(
+            NOWPAYMENTS_POSTPAY_CRM_URL,
+            headers=headers,
+            json=crm_payload,
+            timeout=NOWPAYMENTS_POSTPAY_CRM_TIMEOUT,
+        )
+        raw_text = response.text[:1000]
+        if response.status_code < 200 or response.status_code >= 300:
+            return {
+                "status": "failed",
+                "delivery_id": order_id,
+                "debug_detail": f"CRM_HTTP_{response.status_code}: {raw_text}",
+                "response_code": response.status_code,
+            }
+        return {
+            "status": "sent",
+            "delivery_id": order_id,
+            "debug_detail": None,
+            "response_code": response.status_code,
+        }
+    except requests.RequestException as exc:
+        return {
+            "status": "failed",
+            "delivery_id": order_id,
+            "debug_detail": f"CRM_REQUEST_ERROR: {exc}",
+            "response_code": None,
+        }
+
+
+def update_nowpayments_postpay_delivery(order_id: str, admin_result: Dict[str, Optional[str]], customer_result: Dict[str, Optional[str]], crm_result: Dict[str, Optional[str]]) -> Dict[str, Any]:
     order_id = normalize_text(order_id, 120)
     updated_at = utc_now_iso()
+    admin_status = str(admin_result.get("status") or "unknown")
+    customer_status = str(customer_result.get("status") or "unknown")
+    crm_status = str(crm_result.get("status") or "unknown")
+    fulfillment_status = "postpay_completed" if _nowpayments_postpay_complete(admin_status, customer_status, crm_status) else "payment_confirmed"
     conn = get_db()
     try:
         db_execute(
@@ -2138,20 +2237,32 @@ def update_nowpayments_postpay_delivery(order_id: str, admin_result: Dict[str, O
                 customer_receipt_sent_at = ?,
                 customer_receipt_email_id = ?,
                 customer_receipt_debug = ?,
+                crm_status = ?,
+                crm_delivery_id = ?,
+                crm_error = ?,
+                crm_last_attempt_at = ?,
+                crm_response_code = ?,
+                crm_recorded_at = ?,
                 postpay_processed_at = ?
             WHERE order_id = ?
             """,
             (
                 updated_at,
-                "payment_confirmed",
-                str(admin_result.get("status") or "unknown"),
-                updated_at if str(admin_result.get("status") or "") == "sent" else None,
+                fulfillment_status,
+                admin_status,
+                updated_at if admin_status == "sent" else None,
                 normalize_text(admin_result.get("email_id"), 120),
                 normalize_text(admin_result.get("debug_detail"), 500),
-                str(customer_result.get("status") or "unknown"),
-                updated_at if str(customer_result.get("status") or "") == "sent" else None,
+                customer_status,
+                updated_at if customer_status == "sent" else None,
                 normalize_text(customer_result.get("email_id"), 120),
                 normalize_text(customer_result.get("debug_detail"), 500),
+                crm_status,
+                normalize_text(crm_result.get("delivery_id"), 120),
+                normalize_text(crm_result.get("debug_detail"), 500),
+                updated_at,
+                crm_result.get("response_code"),
+                updated_at if crm_status == "sent" else None,
                 updated_at,
                 order_id,
             ),
@@ -2169,18 +2280,36 @@ def maybe_process_nowpayments_paid_order(order_id: str) -> Dict[str, Any]:
         return order
     admin_status = str(order.get("payment_notice_status") or "").strip().lower()
     customer_status = str(order.get("customer_receipt_status") or "").strip().lower()
+    crm_status = str(order.get("crm_status") or "").strip().lower()
     customer_email = normalize_text(order.get("customer_email"), 200).lower()
     needs_admin = admin_status not in {"sent", "not_configured", "disabled"}
     needs_customer = bool(customer_email) and customer_status not in {"sent", "skipped", "not_configured", "disabled"}
-    if not needs_admin and not needs_customer:
+    needs_crm = crm_status not in {"sent", "not_configured", "disabled"}
+    if not needs_admin and not needs_customer and not needs_crm:
         return order
-    admin_result = {"status": admin_status or ("disabled" if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED else "not_configured" if not (RESEND_API_KEY and RESEND_FROM and RESEND_TO) else "skipped"), "email_id": order.get("payment_notice_email_id"), "debug_detail": order.get("payment_notice_debug")}
-    customer_result = {"status": customer_status or ("skipped" if not customer_email else "disabled" if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED else "not_configured" if not (RESEND_API_KEY and RESEND_FROM) else "skipped"), "email_id": order.get("customer_receipt_email_id"), "debug_detail": order.get("customer_receipt_debug")}
+    admin_result = {
+        "status": admin_status or ("disabled" if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED else "not_configured" if not (RESEND_API_KEY and RESEND_FROM and RESEND_TO) else "skipped"),
+        "email_id": order.get("payment_notice_email_id"),
+        "debug_detail": order.get("payment_notice_debug"),
+    }
+    customer_result = {
+        "status": customer_status or ("skipped" if not customer_email else "disabled" if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED else "not_configured" if not (RESEND_API_KEY and RESEND_FROM) else "skipped"),
+        "email_id": order.get("customer_receipt_email_id"),
+        "debug_detail": order.get("customer_receipt_debug"),
+    }
+    crm_result = {
+        "status": crm_status or ("disabled" if not NOWPAYMENTS_POSTPAY_CRM_ENABLED else "not_configured" if not NOWPAYMENTS_POSTPAY_CRM_URL else "skipped"),
+        "delivery_id": order.get("crm_delivery_id"),
+        "debug_detail": order.get("crm_error"),
+        "response_code": order.get("crm_response_code"),
+    }
     if needs_admin:
         admin_result = send_nowpayments_internal_paid_email(order)
     if needs_customer:
         customer_result = send_nowpayments_customer_paid_email(order)
-    return update_nowpayments_postpay_delivery(order_id, admin_result, customer_result)
+    if needs_crm:
+        crm_result = send_nowpayments_crm_intake(order)
+    return update_nowpayments_postpay_delivery(order_id, admin_result, customer_result, crm_result)
 
 
 def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2236,8 +2365,8 @@ def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]
                     order_id, created_at, updated_at, status, payment_status, fulfillment_status,
                     provider_invoice_id, provider_payment_id, pay_currency, pay_amount, actually_paid, actually_paid_at_fiat,
                     purchase_id, raw_last_ipn_json, last_ipn_at,
-                    payment_notice_status, customer_receipt_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payment_notice_status, customer_receipt_status, crm_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_order_id,
@@ -2255,6 +2384,7 @@ def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]
                     purchase_id,
                     json_dumps_safe(payload),
                     updated_at,
+                    "pending",
                     "pending",
                     "pending",
                 ),
@@ -2282,11 +2412,21 @@ def nowpayments_public_order_view(order: Dict[str, Any]) -> Dict[str, Any]:
     paid = _nowpayments_paid_flag(str(order.get("payment_status") or ""))
     customer_email = normalize_text(order.get("customer_email"), 200).lower()
     support_email = NOWPAYMENTS_SUPPORT_EMAIL or RESEND_TO or RESEND_FROM
+    internal_alert_status = order.get("payment_notice_status") or "pending"
+    customer_receipt_status = order.get("customer_receipt_status") or ("skipped" if not customer_email else "pending")
+    crm_status = order.get("crm_status") or "pending"
+    postpay_complete = _nowpayments_postpay_complete(internal_alert_status, customer_receipt_status, crm_status)
+    if paid and postpay_complete:
+        message = "Payment confirmed. Confirmation flow is complete."
+    elif paid:
+        message = "Payment confirmed. Finalizing confirmation flow now."
+    else:
+        message = "Payment is not confirmed yet. If you already paid, wait a few seconds and refresh."
     return {
         "order_id": order.get("order_id"),
         "status": order.get("status") or "created",
         "payment_status": order.get("payment_status") or "waiting",
-        "fulfillment_status": order.get("fulfillment_status") or ("payment_confirmed" if paid else "pending_payment"),
+        "fulfillment_status": order.get("fulfillment_status") or ("postpay_completed" if postpay_complete else "payment_confirmed" if paid else "pending_payment"),
         "paid": paid,
         "product": {
             "sku": order.get("product_sku") or "",
@@ -2297,13 +2437,14 @@ def nowpayments_public_order_view(order: Dict[str, Any]) -> Dict[str, Any]:
         "provider_invoice_id": order.get("provider_invoice_id") or "",
         "updated_at": order.get("updated_at") or order.get("created_at") or "",
         "customer_email_present": bool(customer_email),
-        "payment_notice_status": order.get("payment_notice_status") or "pending",
-        "customer_receipt_status": order.get("customer_receipt_status") or ("skipped" if not customer_email else "pending"),
+        "internal_alert_status": internal_alert_status,
+        "payment_notice_status": internal_alert_status,
+        "customer_receipt_status": customer_receipt_status,
+        "crm_status": crm_status,
+        "postpay_complete": postpay_complete,
+        "journal_status": "recorded" if paid else "pending",
         "support_email": support_email,
-        "message": (
-            f"Payment confirmed. We will follow up within about {NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS} hours." if paid
-            else "Payment is not confirmed yet. If you already paid, wait a few seconds and refresh."
-        ),
+        "message": message,
     }
 
 
@@ -4249,6 +4390,12 @@ def ensure_db() -> None:
                   customer_receipt_sent_at TEXT,
                   customer_receipt_email_id TEXT,
                   customer_receipt_debug TEXT,
+                  crm_status TEXT,
+                  crm_delivery_id TEXT,
+                  crm_error TEXT,
+                  crm_last_attempt_at TEXT,
+                  crm_response_code INTEGER,
+                  crm_recorded_at TEXT,
                   postpay_processed_at TEXT
                 )
                 """
@@ -4294,6 +4441,12 @@ def ensure_db() -> None:
                   customer_receipt_sent_at TEXT,
                   customer_receipt_email_id TEXT,
                   customer_receipt_debug TEXT,
+                  crm_status TEXT,
+                  crm_delivery_id TEXT,
+                  crm_error TEXT,
+                  crm_last_attempt_at TEXT,
+                  crm_response_code INTEGER,
+                  crm_recorded_at TEXT,
                   postpay_processed_at TEXT
                 )
                 """
@@ -4333,6 +4486,12 @@ def ensure_db() -> None:
         ensure_column(conn, "nowpayments_orders", "customer_receipt_sent_at", "TEXT")
         ensure_column(conn, "nowpayments_orders", "customer_receipt_email_id", "TEXT")
         ensure_column(conn, "nowpayments_orders", "customer_receipt_debug", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "crm_status", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "crm_delivery_id", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "crm_error", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "crm_last_attempt_at", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "crm_response_code", "INTEGER")
+        ensure_column(conn, "nowpayments_orders", "crm_recorded_at", "TEXT")
         ensure_column(conn, "nowpayments_orders", "postpay_processed_at", "TEXT")
         db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_nowpayments_orders_order_id ON nowpayments_orders(order_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_nowpayments_orders_payment_id ON nowpayments_orders(provider_payment_id)")
@@ -4710,6 +4869,7 @@ def nowpayments_ipn_receive():
             "paid": bool(updated.get("paid")),
             "payment_notice_status": (processed_order or {}).get("payment_notice_status") or "pending",
             "customer_receipt_status": (processed_order or {}).get("customer_receipt_status") or "pending",
+            "crm_status": (processed_order or {}).get("crm_status") or "pending",
         },
     )
     return jsonify({
@@ -4720,6 +4880,7 @@ def nowpayments_ipn_receive():
         "paid": bool(updated.get("paid")),
         "payment_notice_status": (processed_order or {}).get("payment_notice_status") or "pending",
         "customer_receipt_status": (processed_order or {}).get("customer_receipt_status") or "pending",
+        "crm_status": (processed_order or {}).get("crm_status") or "pending",
     })
 
 
