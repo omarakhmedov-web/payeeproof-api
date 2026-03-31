@@ -29,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.1.0-crm-intake-light"
+APP_VERSION = "2.2.0-nowpayments-invoices"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -216,6 +216,25 @@ WEBHOOK_RETRY_SCHEDULE_SEC = [
 ]
 WEBHOOK_PROCESS_BATCH_SIZE = int(os.getenv("WEBHOOK_PROCESS_BATCH_SIZE", "5"))
 WEBHOOK_PROCESS_MIN_INTERVAL_SEC = float(os.getenv("WEBHOOK_PROCESS_MIN_INTERVAL_SEC", "5"))
+
+NOWPAYMENTS_ENABLED = str(os.getenv("NOWPAYMENTS_ENABLED", "0")).strip().lower() not in {"0", "false", "no", "off"}
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
+NOWPAYMENTS_BASE_URL = os.getenv("NOWPAYMENTS_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/")
+NOWPAYMENTS_SUCCESS_URL = os.getenv("NOWPAYMENTS_SUCCESS_URL", "https://payeeproof.com/payment-success.html").strip()
+NOWPAYMENTS_CANCEL_URL = os.getenv("NOWPAYMENTS_CANCEL_URL", "https://payeeproof.com/payment-cancelled.html").strip()
+NOWPAYMENTS_IPN_PATH = os.getenv("NOWPAYMENTS_IPN_PATH", "/api/payments/nowpayments/ipn").strip() or "/api/payments/nowpayments/ipn"
+NOWPAYMENTS_CREATE_RATE_LIMIT = int(os.getenv("NOWPAYMENTS_CREATE_RATE_LIMIT", "8"))
+NOWPAYMENTS_CREATE_RATE_WINDOW_SEC = int(os.getenv("NOWPAYMENTS_CREATE_RATE_WINDOW_SEC", "300"))
+NOWPAYMENTS_DEFAULT_PRODUCT_SKU = os.getenv("NOWPAYMENTS_DEFAULT_PRODUCT_SKU", "pilot_399").strip() or "pilot_399"
+NOWPAYMENTS_PRODUCTS_JSON = os.getenv("NOWPAYMENTS_PRODUCTS_JSON", "").strip()
+DEFAULT_NOWPAYMENTS_PRODUCTS = {
+    "pilot_399": {
+        "amount_usd": 399.0,
+        "title": "PayeeProof Pilot",
+        "description": "30-day pilot setup and access",
+    }
+}
 
 RATE_LIMIT_BUCKETS: Dict[str, deque] = {}
 RATE_LIMIT_LOCK = Lock()
@@ -541,9 +560,42 @@ def load_api_keys() -> Dict[str, Dict[str, Any]]:
     return loaded
 
 
+def load_nowpayments_products() -> Dict[str, Dict[str, Any]]:
+    parsed: Any = {}
+    if NOWPAYMENTS_PRODUCTS_JSON:
+        try:
+            parsed = json.loads(NOWPAYMENTS_PRODUCTS_JSON)
+        except Exception:
+            parsed = {}
+    source = parsed if isinstance(parsed, dict) and parsed else DEFAULT_NOWPAYMENTS_PRODUCTS
+    out: Dict[str, Dict[str, Any]] = {}
+    for raw_sku, raw_item in source.items():
+        if not isinstance(raw_item, dict):
+            continue
+        sku = str(raw_sku or "").strip().lower()[:80] or NOWPAYMENTS_DEFAULT_PRODUCT_SKU
+        try:
+            amount_usd = float(raw_item.get("amount_usd") or raw_item.get("amount") or 0)
+        except Exception:
+            amount_usd = 0.0
+        if amount_usd <= 0:
+            continue
+        title = str(raw_item.get("title") or raw_item.get("name") or sku.replace("_", " ").title()).strip()[:160]
+        description = str(raw_item.get("description") or title).strip()[:500]
+        out[sku] = {
+            "sku": sku,
+            "amount_usd": round(amount_usd, 2),
+            "title": title,
+            "description": description,
+        }
+    if not out:
+        out = dict(DEFAULT_NOWPAYMENTS_PRODUCTS)
+    return out
+
+
 PLAN_LIMITS = load_plan_limits()
 PUBLIC_DEMO_HOSTS = _split_origin_hosts(PUBLIC_DEMO_ORIGINS)
 API_KEYS = load_api_keys()
+NOWPAYMENTS_PRODUCTS = load_nowpayments_products()
 
 
 def current_request_id() -> str:
@@ -1748,6 +1800,293 @@ def build_recovery_support_message(packet: Dict[str, Any]) -> str:
         "3) what exact information or steps you need from me next.",
     ])
     return "\n".join(lines)
+
+
+def nowpayments_is_configured() -> bool:
+    return bool(NOWPAYMENTS_ENABLED and NOWPAYMENTS_API_KEY and NOWPAYMENTS_IPN_SECRET)
+
+
+def nowpayments_ipn_url() -> str:
+    path = str(NOWPAYMENTS_IPN_PATH or "").strip()
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    normalized = path if path.startswith("/") else f"/{path}"
+    return f"{PUBLIC_API_BASE}{normalized}"
+
+
+def sort_object_deep(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: sort_object_deep(value[key]) for key in sorted(value.keys())}
+    if isinstance(value, list):
+        return [sort_object_deep(item) for item in value]
+    return value
+
+
+def nowpayments_ipn_signature(payload: Dict[str, Any]) -> str:
+    if not NOWPAYMENTS_IPN_SECRET:
+        return ""
+    sorted_payload = sort_object_deep(payload or {})
+    serialized = json.dumps(sorted_payload, ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(NOWPAYMENTS_IPN_SECRET.encode("utf-8"), serialized.encode("utf-8"), hashlib.sha512).hexdigest()
+
+
+def normalize_nowpayments_sku(value: Any) -> str:
+    raw = re.sub(r"[^a-zA-Z0-9_-]", "", str(value or "").strip().lower())
+    if raw and raw in NOWPAYMENTS_PRODUCTS:
+        return raw
+    return NOWPAYMENTS_DEFAULT_PRODUCT_SKU if NOWPAYMENTS_DEFAULT_PRODUCT_SKU in NOWPAYMENTS_PRODUCTS else next(iter(NOWPAYMENTS_PRODUCTS.keys()))
+
+
+def nowpayments_product_or_error(value: Any) -> Dict[str, Any]:
+    sku = normalize_nowpayments_sku(value)
+    product = NOWPAYMENTS_PRODUCTS.get(sku)
+    if not product:
+        raise ApiError("Unknown product SKU.", 400)
+    return product
+
+
+def nowpayments_headers() -> Dict[str, str]:
+    return {
+        "x-api-key": NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+    }
+
+
+def nowpayments_checkout_id() -> str:
+    return f"ppo_{uuid.uuid4().hex[:16]}"
+
+
+def create_nowpayments_invoice_remote(*, order_id: str, product: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        "price_amount": float(product["amount_usd"]),
+        "price_currency": "usd",
+        "order_id": order_id,
+        "order_description": str(product.get("description") or product.get("title") or "PayeeProof order"),
+        "ipn_callback_url": nowpayments_ipn_url(),
+        "success_url": NOWPAYMENTS_SUCCESS_URL or "",
+        "cancel_url": NOWPAYMENTS_CANCEL_URL or "",
+    }
+    response = requests.post(
+        f"{NOWPAYMENTS_BASE_URL}/invoice",
+        headers=nowpayments_headers(),
+        json=payload,
+        timeout=EMAIL_TIMEOUT,
+    )
+    body = response.text[:2000]
+    if response.status_code < 200 or response.status_code >= 300:
+        raise ApiError(
+            "NOWPayments invoice creation failed.",
+            502,
+            code="NOWPAYMENTS_CREATE_FAILED",
+            details={"provider_status": response.status_code, "provider_body": body},
+        )
+    try:
+        data = response.json() if response.text else {}
+    except ValueError as exc:
+        raise ApiError(
+            "NOWPayments returned invalid JSON.",
+            502,
+            code="NOWPAYMENTS_BAD_JSON",
+            details={"error": str(exc)},
+        )
+    if not isinstance(data, dict):
+        raise ApiError("NOWPayments returned an unexpected response.", 502, code="NOWPAYMENTS_BAD_RESPONSE")
+    return data
+
+
+def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], customer_email: str, provider_response: Dict[str, Any]) -> Dict[str, Any]:
+    created_at = utc_now_iso()
+    provider_invoice_id = normalize_text(provider_response.get("id") or provider_response.get("invoice_id") or provider_response.get("invoiceId"), 120)
+    invoice_url = normalize_text(provider_response.get("invoice_url") or provider_response.get("url") or provider_response.get("link"), 1000)
+    payment_status = normalize_text(provider_response.get("payment_status") or provider_response.get("status") or "waiting", 80) or "waiting"
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            INSERT INTO nowpayments_orders(
+                order_id, created_at, updated_at, status, payment_status, fulfillment_status,
+                customer_email, product_sku, product_title, amount_usd, price_currency, order_description,
+                provider_invoice_id, invoice_url, success_url, cancel_url, source_ip, origin, raw_create_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                created_at,
+                created_at,
+                "created",
+                payment_status,
+                "pending_payment",
+                customer_email,
+                str(product.get("sku") or ""),
+                str(product.get("title") or ""),
+                float(product.get("amount_usd") or 0),
+                "usd",
+                str(product.get("description") or product.get("title") or ""),
+                provider_invoice_id,
+                invoice_url,
+                NOWPAYMENTS_SUCCESS_URL,
+                NOWPAYMENTS_CANCEL_URL,
+                get_client_ip(),
+                request.headers.get("Origin", ""),
+                json_dumps_safe(provider_response),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "order_id": order_id,
+        "provider_invoice_id": provider_invoice_id,
+        "invoice_url": invoice_url,
+        "payment_status": payment_status,
+    }
+
+
+def _nowpayments_paid_flag(status: str) -> bool:
+    return str(status or "").strip().lower() in {"finished"}
+
+
+def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]:
+    order_id = normalize_text(payload.get("order_id"), 120)
+    provider_payment_id = normalize_text(payload.get("payment_id") or payload.get("id"), 120)
+    provider_invoice_id = normalize_text(payload.get("invoice_id") or payload.get("invoiceId"), 120)
+    purchase_id = normalize_text(payload.get("purchase_id"), 120)
+    payment_status = normalize_text(payload.get("payment_status") or payload.get("status") or "unknown", 80) or "unknown"
+    updated_at = utc_now_iso()
+    conn = get_db()
+    try:
+        existing = None
+        if order_id:
+            existing = db_fetchone(conn, "SELECT order_id FROM nowpayments_orders WHERE order_id = ? LIMIT 1", (order_id,))
+        if not existing and provider_payment_id:
+            existing = db_fetchone(conn, "SELECT order_id FROM nowpayments_orders WHERE provider_payment_id = ? LIMIT 1", (provider_payment_id,))
+        if not existing and purchase_id:
+            existing = db_fetchone(conn, "SELECT order_id FROM nowpayments_orders WHERE order_id = ? LIMIT 1", (purchase_id,))
+        resolved_order_id = order_id or purchase_id or normalize_text((row_to_dict(existing).get("order_id") if existing else ""), 120) or nowpayments_checkout_id()
+        existing_row = db_fetchone(conn, "SELECT order_id FROM nowpayments_orders WHERE order_id = ? LIMIT 1", (resolved_order_id,))
+        if existing_row:
+            db_execute(
+                conn,
+                """
+                UPDATE nowpayments_orders
+                SET updated_at = ?, status = ?, payment_status = ?, fulfillment_status = ?, provider_invoice_id = ?,
+                    provider_payment_id = ?, pay_currency = ?, pay_amount = ?, actually_paid = ?, actually_paid_at_fiat = ?,
+                    purchase_id = ?, raw_last_ipn_json = ?, last_ipn_at = ?
+                WHERE order_id = ?
+                """,
+                (
+                    updated_at,
+                    "paid" if _nowpayments_paid_flag(payment_status) else "updated",
+                    payment_status,
+                    "ready_for_manual_fulfillment" if _nowpayments_paid_flag(payment_status) else "pending_payment",
+                    provider_invoice_id,
+                    provider_payment_id,
+                    normalize_text(payload.get("pay_currency"), 80),
+                    normalize_text(payload.get("pay_amount"), 80),
+                    normalize_text(payload.get("actually_paid"), 80),
+                    normalize_text(payload.get("actually_paid_at_fiat"), 80),
+                    purchase_id,
+                    json_dumps_safe(payload),
+                    updated_at,
+                    resolved_order_id,
+                ),
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                INSERT INTO nowpayments_orders(
+                    order_id, created_at, updated_at, status, payment_status, fulfillment_status,
+                    provider_invoice_id, provider_payment_id, pay_currency, pay_amount, actually_paid, actually_paid_at_fiat,
+                    purchase_id, raw_last_ipn_json, last_ipn_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resolved_order_id,
+                    updated_at,
+                    updated_at,
+                    "paid" if _nowpayments_paid_flag(payment_status) else "updated",
+                    payment_status,
+                    "ready_for_manual_fulfillment" if _nowpayments_paid_flag(payment_status) else "pending_payment",
+                    provider_invoice_id,
+                    provider_payment_id,
+                    normalize_text(payload.get("pay_currency"), 80),
+                    normalize_text(payload.get("pay_amount"), 80),
+                    normalize_text(payload.get("actually_paid"), 80),
+                    normalize_text(payload.get("actually_paid_at_fiat"), 80),
+                    purchase_id,
+                    json_dumps_safe(payload),
+                    updated_at,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "order_id": resolved_order_id,
+        "payment_status": payment_status,
+        "paid": _nowpayments_paid_flag(payment_status),
+    }
+
+
+def fetch_nowpayments_order(order_id: str) -> Dict[str, Any]:
+    conn = get_db()
+    try:
+        row = db_fetchone(conn, "SELECT * FROM nowpayments_orders WHERE order_id = ? LIMIT 1", (order_id,))
+    finally:
+        conn.close()
+    return row_to_dict(row)
+
+
+def nowpayments_public_order_view(order: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "order_id": order.get("order_id"),
+        "status": order.get("status") or "created",
+        "payment_status": order.get("payment_status") or "waiting",
+        "fulfillment_status": order.get("fulfillment_status") or "pending_payment",
+        "paid": _nowpayments_paid_flag(str(order.get("payment_status") or "")),
+        "product": {
+            "sku": order.get("product_sku") or "",
+            "title": order.get("product_title") or "",
+            "amount_usd": order.get("amount_usd"),
+        },
+        "checkout_url": order.get("invoice_url") or "",
+        "provider_invoice_id": order.get("provider_invoice_id") or "",
+        "updated_at": order.get("updated_at") or order.get("created_at") or "",
+    }
+
+
+def enforce_public_origin_if_present() -> None:
+    origin_host = _extract_host(request.headers.get("Origin", ""))
+    if origin_host and PUBLIC_DEMO_HOSTS and origin_host not in PUBLIC_DEMO_HOSTS:
+        raise ApiError(
+            "Request origin is not allowed.",
+            403,
+            code="POLICY_ORIGIN_NOT_ALLOWED",
+            details={"origin_host": origin_host, "allowed_origin_hosts": PUBLIC_DEMO_HOSTS},
+        )
+
+
+def create_nowpayments_invoice_internal(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not nowpayments_is_configured():
+        raise ApiError("NOWPayments is not configured.", 503, code="NOWPAYMENTS_NOT_CONFIGURED")
+    product = nowpayments_product_or_error(payload.get("sku") or payload.get("product_sku"))
+    customer_email = normalize_text(payload.get("customer_email") or payload.get("email"), 200).lower()
+    if customer_email and not is_valid_email(customer_email):
+        raise ApiError("Please enter a valid email address.", 400)
+    order_id = nowpayments_checkout_id()
+    provider_response = create_nowpayments_invoice_remote(order_id=order_id, product=product)
+    stored = store_nowpayments_order_created(order_id=order_id, product=product, customer_email=customer_email, provider_response=provider_response)
+    return {
+        "order_id": order_id,
+        "checkout_url": stored.get("invoice_url") or "",
+        "payment_status": stored.get("payment_status") or "waiting",
+        "provider_invoice_id": stored.get("provider_invoice_id") or "",
+        "product": product,
+    }
 
 
 def now_epoch() -> float:
@@ -3617,6 +3956,109 @@ def ensure_db() -> None:
                 )
                 """
             )
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS nowpayments_orders (
+                  id BIGSERIAL PRIMARY KEY,
+                  order_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  status TEXT,
+                  payment_status TEXT,
+                  fulfillment_status TEXT,
+                  customer_email TEXT,
+                  product_sku TEXT,
+                  product_title TEXT,
+                  amount_usd DOUBLE PRECISION,
+                  price_currency TEXT,
+                  order_description TEXT,
+                  provider_invoice_id TEXT,
+                  provider_payment_id TEXT,
+                  invoice_url TEXT,
+                  pay_currency TEXT,
+                  pay_amount TEXT,
+                  actually_paid TEXT,
+                  actually_paid_at_fiat TEXT,
+                  purchase_id TEXT,
+                  source_ip TEXT,
+                  origin TEXT,
+                  success_url TEXT,
+                  cancel_url TEXT,
+                  raw_create_json TEXT,
+                  raw_last_ipn_json TEXT,
+                  last_ipn_at TEXT
+                )
+                """
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS nowpayments_orders (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  order_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  status TEXT,
+                  payment_status TEXT,
+                  fulfillment_status TEXT,
+                  customer_email TEXT,
+                  product_sku TEXT,
+                  product_title TEXT,
+                  amount_usd REAL,
+                  price_currency TEXT,
+                  order_description TEXT,
+                  provider_invoice_id TEXT,
+                  provider_payment_id TEXT,
+                  invoice_url TEXT,
+                  pay_currency TEXT,
+                  pay_amount TEXT,
+                  actually_paid TEXT,
+                  actually_paid_at_fiat TEXT,
+                  purchase_id TEXT,
+                  source_ip TEXT,
+                  origin TEXT,
+                  success_url TEXT,
+                  cancel_url TEXT,
+                  raw_create_json TEXT,
+                  raw_last_ipn_json TEXT,
+                  last_ipn_at TEXT
+                )
+                """
+            )
+        ensure_column(conn, "nowpayments_orders", "order_id", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "created_at", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "updated_at", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "status", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "payment_status", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "fulfillment_status", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "customer_email", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "product_sku", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "product_title", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "amount_usd", "REAL")
+        ensure_column(conn, "nowpayments_orders", "price_currency", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "order_description", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "provider_invoice_id", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "provider_payment_id", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "invoice_url", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "pay_currency", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "pay_amount", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "actually_paid", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "actually_paid_at_fiat", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "purchase_id", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "source_ip", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "origin", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "success_url", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "cancel_url", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "raw_create_json", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "raw_last_ipn_json", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "last_ipn_at", "TEXT")
+        db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_nowpayments_orders_order_id ON nowpayments_orders(order_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_nowpayments_orders_payment_id ON nowpayments_orders(provider_payment_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_nowpayments_orders_invoice_id ON nowpayments_orders(provider_invoice_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_nowpayments_orders_created_at ON nowpayments_orders(created_at)")
         ensure_column(conn, "verification_records", "record_id", "TEXT")
         ensure_column(conn, "verification_records", "request_id", "TEXT")
         ensure_column(conn, "verification_records", "service", "TEXT")
@@ -3774,6 +4216,22 @@ def apply_access_controls():
             response.headers["X-RateLimit-Remaining"] = str(meta["remaining"])
             response.headers["X-RateLimit-Window"] = str(meta["window_sec"])
             return response
+    elif path == "/api/payments/nowpayments/invoice" and request.method == "POST":
+        bucket = f"nowpayments:create:{get_client_ip()}"
+        allowed, meta = consume_rate_limit(bucket, NOWPAYMENTS_CREATE_RATE_LIMIT, NOWPAYMENTS_CREATE_RATE_WINDOW_SEC)
+        g.rate_limit_meta = meta
+        if not allowed:
+            response = jsonify({
+                "ok": False,
+                "error": "RATE_LIMITED",
+                "message": "Too many payment attempts from this source. Retry later.",
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(meta["retry_after"])
+            response.headers["X-RateLimit-Limit"] = str(meta["limit"])
+            response.headers["X-RateLimit-Remaining"] = str(meta["remaining"])
+            response.headers["X-RateLimit-Window"] = str(meta["window_sec"])
+            return response
 
     return None
 
@@ -3865,6 +4323,11 @@ def health():
         "configured_networks": live_networks,
         "api_status": "live",
         "db_backend": DB_BACKEND,
+        "payments": {
+            "nowpayments_enabled": bool(NOWPAYMENTS_ENABLED),
+            "nowpayments_configured": bool(nowpayments_is_configured()),
+            "nowpayments_products": sorted(list(NOWPAYMENTS_PRODUCTS.keys())),
+        },
         "trace_id": current_request_id(),
         "observability": {
             "request_id_header": "X-Request-ID",
@@ -3890,7 +4353,85 @@ def root():
             "/pilot-request",
             "/api/verification-records",
             "/api/webhooks/ack",
+            "/api/payments/nowpayments/invoice",
+            "/api/payments/nowpayments/order/<order_id>",
+            "/api/payments/nowpayments/ipn",
         ]
+    })
+
+
+@app.post("/api/payments/nowpayments/invoice")
+def nowpayments_invoice_create():
+    enforce_public_origin_if_present()
+    payload = request.get_json(silent=True) or {}
+    created = create_nowpayments_invoice_internal(payload)
+    record_request_event(
+        event_name="nowpayments_invoice_create",
+        endpoint="/api/payments/nowpayments/invoice",
+        status="success",
+        reason_code="INVOICE_CREATED",
+        network="payments",
+        http_status=200,
+        metadata={
+            "order_id": created.get("order_id"),
+            "product_sku": (created.get("product") or {}).get("sku"),
+            "provider_invoice_id": created.get("provider_invoice_id"),
+        },
+    )
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "order_id": created.get("order_id"),
+        "checkout_url": created.get("checkout_url"),
+        "provider_invoice_id": created.get("provider_invoice_id"),
+        "payment_status": created.get("payment_status"),
+        "product": created.get("product"),
+        "success_url": NOWPAYMENTS_SUCCESS_URL,
+        "cancel_url": NOWPAYMENTS_CANCEL_URL,
+    })
+
+
+@app.get("/api/payments/nowpayments/order/<order_id>")
+def nowpayments_order_status(order_id: str):
+    order = fetch_nowpayments_order(normalize_text(order_id, 120))
+    if not order:
+        raise ApiError("Order not found.", 404)
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "order": nowpayments_public_order_view(order),
+    })
+
+
+@app.post("/api/payments/nowpayments/ipn")
+def nowpayments_ipn_receive():
+    payload = request.get_json(silent=True) or {}
+    signature = str(request.headers.get("x-nowpayments-sig") or request.headers.get("X-NOWPAYMENTS-SIG") or "").strip()
+    if not signature:
+        raise ApiError("Missing NOWPayments signature.", 400, code="NOWPAYMENTS_SIG_MISSING")
+    expected = nowpayments_ipn_signature(payload)
+    if not expected or not hmac.compare_digest(signature.lower(), expected.lower()):
+        raise ApiError("Invalid NOWPayments signature.", 403, code="NOWPAYMENTS_SIG_INVALID")
+    updated = upsert_nowpayments_order_from_ipn(payload)
+    record_request_event(
+        event_name="nowpayments_ipn",
+        endpoint="/api/payments/nowpayments/ipn",
+        status="success",
+        reason_code=str(updated.get("payment_status") or "unknown").upper(),
+        network="payments",
+        http_status=200,
+        metadata={
+            "order_id": updated.get("order_id"),
+            "payment_status": updated.get("payment_status"),
+            "paid": bool(updated.get("paid")),
+        },
+    )
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "order_id": updated.get("order_id"),
+        "payment_status": updated.get("payment_status"),
+        "paid": bool(updated.get("paid")),
     })
 
 
