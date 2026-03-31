@@ -23,13 +23,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from threading import Lock, Thread
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.2.0-nowpayments-invoices"
+APP_VERSION = "2.3.0-nowpayments-postpay"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -228,6 +228,10 @@ NOWPAYMENTS_CREATE_RATE_LIMIT = int(os.getenv("NOWPAYMENTS_CREATE_RATE_LIMIT", "
 NOWPAYMENTS_CREATE_RATE_WINDOW_SEC = int(os.getenv("NOWPAYMENTS_CREATE_RATE_WINDOW_SEC", "300"))
 NOWPAYMENTS_DEFAULT_PRODUCT_SKU = os.getenv("NOWPAYMENTS_DEFAULT_PRODUCT_SKU", "pilot_399").strip() or "pilot_399"
 NOWPAYMENTS_PRODUCTS_JSON = os.getenv("NOWPAYMENTS_PRODUCTS_JSON", "").strip()
+NOWPAYMENTS_POSTPAY_EMAILS_ENABLED = str(os.getenv("NOWPAYMENTS_POSTPAY_EMAILS_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS = int(os.getenv("NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS", "24"))
+NOWPAYMENTS_POSTPAY_REPLY_TO = os.getenv("NOWPAYMENTS_POSTPAY_REPLY_TO", RESEND_TO or "hello@payeeproof.com").strip()
+NOWPAYMENTS_SUPPORT_EMAIL = os.getenv("NOWPAYMENTS_SUPPORT_EMAIL", RESEND_TO or "hello@payeeproof.com").strip()
 DEFAULT_NOWPAYMENTS_PRODUCTS = {
     "pilot_399": {
         "amount_usd": 399.0,
@@ -1858,15 +1862,34 @@ def nowpayments_checkout_id() -> str:
     return f"ppo_{uuid.uuid4().hex[:16]}"
 
 
-def create_nowpayments_invoice_remote(*, order_id: str, product: Dict[str, Any]) -> Dict[str, Any]:
+def append_url_query(url: str, params: Dict[str, Any]) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in (params or {}).items():
+        if value is None:
+            continue
+        query[str(key)] = str(value)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def nowpayments_redirect_urls(order_id: str) -> Tuple[str, str]:
+    success_url = append_url_query(NOWPAYMENTS_SUCCESS_URL, {"order_id": order_id, "source": "nowpayments"})
+    cancel_url = append_url_query(NOWPAYMENTS_CANCEL_URL, {"order_id": order_id, "source": "nowpayments"})
+    return success_url, cancel_url
+
+
+def create_nowpayments_invoice_remote(*, order_id: str, product: Dict[str, Any], success_url: str, cancel_url: str) -> Dict[str, Any]:
     payload = {
         "price_amount": float(product["amount_usd"]),
         "price_currency": "usd",
         "order_id": order_id,
         "order_description": str(product.get("description") or product.get("title") or "PayeeProof order"),
         "ipn_callback_url": nowpayments_ipn_url(),
-        "success_url": NOWPAYMENTS_SUCCESS_URL or "",
-        "cancel_url": NOWPAYMENTS_CANCEL_URL or "",
+        "success_url": success_url or "",
+        "cancel_url": cancel_url or "",
     }
     response = requests.post(
         f"{NOWPAYMENTS_BASE_URL}/invoice",
@@ -1896,7 +1919,7 @@ def create_nowpayments_invoice_remote(*, order_id: str, product: Dict[str, Any])
     return data
 
 
-def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], customer_email: str, provider_response: Dict[str, Any]) -> Dict[str, Any]:
+def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], customer_email: str, provider_response: Dict[str, Any], success_url: str, cancel_url: str) -> Dict[str, Any]:
     created_at = utc_now_iso()
     provider_invoice_id = normalize_text(provider_response.get("id") or provider_response.get("invoice_id") or provider_response.get("invoiceId"), 120)
     invoice_url = normalize_text(provider_response.get("invoice_url") or provider_response.get("url") or provider_response.get("link"), 1000)
@@ -1909,8 +1932,9 @@ def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], c
             INSERT INTO nowpayments_orders(
                 order_id, created_at, updated_at, status, payment_status, fulfillment_status,
                 customer_email, product_sku, product_title, amount_usd, price_currency, order_description,
-                provider_invoice_id, invoice_url, success_url, cancel_url, source_ip, origin, raw_create_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provider_invoice_id, invoice_url, success_url, cancel_url, source_ip, origin, raw_create_json,
+                payment_notice_status, customer_receipt_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -1927,11 +1951,13 @@ def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], c
                 str(product.get("description") or product.get("title") or ""),
                 provider_invoice_id,
                 invoice_url,
-                NOWPAYMENTS_SUCCESS_URL,
-                NOWPAYMENTS_CANCEL_URL,
+                success_url,
+                cancel_url,
                 get_client_ip(),
                 request.headers.get("Origin", ""),
                 json_dumps_safe(provider_response),
+                "pending",
+                "pending" if customer_email else "skipped",
             ),
         )
         conn.commit()
@@ -1946,7 +1972,215 @@ def store_nowpayments_order_created(*, order_id: str, product: Dict[str, Any], c
 
 
 def _nowpayments_paid_flag(status: str) -> bool:
-    return str(status or "").strip().lower() in {"finished"}
+    return str(status or "").strip().lower() in {"finished", "confirmed"}
+
+
+def send_nowpayments_internal_paid_email(order: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED:
+        return {"status": "disabled", "email_id": None, "debug_detail": None}
+    if not RESEND_API_KEY or not RESEND_FROM or not RESEND_TO:
+        return {"status": "not_configured", "email_id": None, "debug_detail": None}
+    order_id = normalize_text(order.get("order_id"), 120)
+    subject = f"PayeeProof payment confirmed — {order.get('product_title') or 'Order'} ({order_id})"
+    text_body = "\n".join([
+        "PayeeProof payment confirmed",
+        "",
+        f"Order ID: {order_id or 'unknown'}",
+        f"Product: {order.get('product_title') or 'Not provided'}",
+        f"SKU: {order.get('product_sku') or 'Not provided'}",
+        f"Amount USD: {order.get('amount_usd') or 'Not provided'}",
+        f"Payment status: {order.get('payment_status') or 'unknown'}",
+        f"Pay currency: {order.get('pay_currency') or 'Not provided'}",
+        f"Pay amount: {order.get('pay_amount') or order.get('actually_paid') or 'Not provided'}",
+        f"Customer email: {order.get('customer_email') or 'Not provided'}",
+        f"Invoice URL: {order.get('invoice_url') or 'Not provided'}",
+        "",
+        "Next action: send onboarding / client package manually or continue the paid pilot workflow.",
+    ])
+    html_body = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111">
+      <h2>PayeeProof payment confirmed</h2>
+      <p><strong>Order ID:</strong> {html.escape(order_id or 'unknown')}<br>
+      <strong>Product:</strong> {html.escape(str(order.get('product_title') or 'Not provided'))}<br>
+      <strong>SKU:</strong> {html.escape(str(order.get('product_sku') or 'Not provided'))}<br>
+      <strong>Amount USD:</strong> {html.escape(str(order.get('amount_usd') or 'Not provided'))}<br>
+      <strong>Payment status:</strong> {html.escape(str(order.get('payment_status') or 'unknown'))}<br>
+      <strong>Pay currency:</strong> {html.escape(str(order.get('pay_currency') or 'Not provided'))}<br>
+      <strong>Pay amount:</strong> {html.escape(str(order.get('pay_amount') or order.get('actually_paid') or 'Not provided'))}<br>
+      <strong>Customer email:</strong> {html.escape(str(order.get('customer_email') or 'Not provided'))}</p>
+      <p><strong>Invoice URL:</strong> <a href="{html.escape(str(order.get('invoice_url') or ''))}">open invoice</a></p>
+      <p>Next action: send onboarding / client package manually or continue the paid pilot workflow.</p>
+    </div>
+    """.strip()
+    resend_payload = {
+        "from": RESEND_FROM,
+        "to": [RESEND_TO],
+        "subject": subject,
+        "reply_to": (order.get("customer_email") or NOWPAYMENTS_POSTPAY_REPLY_TO or RESEND_TO or RESEND_FROM),
+        "text": text_body,
+        "html": html_body,
+        "tags": [
+            {"name": "source", "value": "nowpayments_paid_internal"},
+            {"name": "product", "value": "payeeproof"},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        "Idempotency-Key": f"nowpayments-admin-{order_id}",
+    }
+    try:
+        response = requests.post(f"{RESEND_API_BASE}/emails", headers=headers, json=resend_payload, timeout=EMAIL_TIMEOUT)
+        raw_text = response.text[:1000]
+        if response.status_code < 200 or response.status_code >= 300:
+            return {"status": "failed", "email_id": None, "debug_detail": f"RESEND_HTTP_{response.status_code}: {raw_text}"}
+        data = response.json() if response.text else {}
+        return {"status": "sent", "email_id": data.get("id"), "debug_detail": None}
+    except requests.RequestException as exc:
+        return {"status": "failed", "email_id": None, "debug_detail": f"RESEND_REQUEST_ERROR: {exc}"}
+    except ValueError as exc:
+        return {"status": "failed", "email_id": None, "debug_detail": f"RESEND_JSON_ERROR: {exc}"}
+
+
+def send_nowpayments_customer_paid_email(order: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    customer_email = normalize_text(order.get("customer_email"), 200).lower()
+    if not customer_email:
+        return {"status": "skipped", "email_id": None, "debug_detail": None}
+    if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED:
+        return {"status": "disabled", "email_id": None, "debug_detail": None}
+    if not RESEND_API_KEY or not RESEND_FROM:
+        return {"status": "not_configured", "email_id": None, "debug_detail": None}
+    order_id = normalize_text(order.get("order_id"), 120)
+    greeting_name = customer_email.split("@")[0].split(".")[0].replace("_", " ").title() or "there"
+    next_step_label = f"within about {NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS} hours" if NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS > 0 else "soon"
+    support_email = NOWPAYMENTS_SUPPORT_EMAIL or RESEND_TO or RESEND_FROM
+    subject = f"Payment confirmed — {order.get('product_title') or 'PayeeProof'}"
+    text_body = "\n".join([
+        f"Hi {greeting_name},",
+        "",
+        "Your PayeeProof payment was confirmed.",
+        "",
+        f"Order ID: {order_id or 'unknown'}",
+        f"Product: {order.get('product_title') or 'Not provided'}",
+        f"Amount: ${order.get('amount_usd') or 'Not provided'}",
+        f"Payment status: {order.get('payment_status') or 'unknown'}",
+        "",
+        f"What happens next: we will review the paid order and follow up {next_step_label} with onboarding / next-step details.",
+        f"Support: {support_email}",
+        "",
+        "— PayeeProof",
+        "https://payeeproof.com",
+    ])
+    html_body = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111">
+      <h2>Payment confirmed</h2>
+      <p>Hi {html.escape(greeting_name)},</p>
+      <p>Your PayeeProof payment was confirmed.</p>
+      <p><strong>Order ID:</strong> {html.escape(order_id or 'unknown')}<br>
+      <strong>Product:</strong> {html.escape(str(order.get('product_title') or 'Not provided'))}<br>
+      <strong>Amount:</strong> ${html.escape(str(order.get('amount_usd') or 'Not provided'))}<br>
+      <strong>Payment status:</strong> {html.escape(str(order.get('payment_status') or 'unknown'))}</p>
+      <p>What happens next: we will review the paid order and follow up {html.escape(next_step_label)} with onboarding / next-step details.</p>
+      <p>Support: <a href="mailto:{html.escape(support_email)}">{html.escape(support_email)}</a></p>
+      <p>— PayeeProof<br><a href="https://payeeproof.com">payeeproof.com</a></p>
+    </div>
+    """.strip()
+    resend_payload = {
+        "from": RESEND_FROM,
+        "to": [customer_email],
+        "subject": subject,
+        "reply_to": NOWPAYMENTS_POSTPAY_REPLY_TO or support_email,
+        "text": text_body,
+        "html": html_body,
+        "tags": [
+            {"name": "source", "value": "nowpayments_paid_customer"},
+            {"name": "product", "value": "payeeproof"},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        "Idempotency-Key": f"nowpayments-customer-{order_id}",
+    }
+    try:
+        response = requests.post(f"{RESEND_API_BASE}/emails", headers=headers, json=resend_payload, timeout=EMAIL_TIMEOUT)
+        raw_text = response.text[:1000]
+        if response.status_code < 200 or response.status_code >= 300:
+            return {"status": "failed", "email_id": None, "debug_detail": f"RESEND_HTTP_{response.status_code}: {raw_text}"}
+        data = response.json() if response.text else {}
+        return {"status": "sent", "email_id": data.get("id"), "debug_detail": None}
+    except requests.RequestException as exc:
+        return {"status": "failed", "email_id": None, "debug_detail": f"RESEND_REQUEST_ERROR: {exc}"}
+    except ValueError as exc:
+        return {"status": "failed", "email_id": None, "debug_detail": f"RESEND_JSON_ERROR: {exc}"}
+
+
+def update_nowpayments_postpay_delivery(order_id: str, admin_result: Dict[str, Optional[str]], customer_result: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    order_id = normalize_text(order_id, 120)
+    updated_at = utc_now_iso()
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            UPDATE nowpayments_orders
+            SET updated_at = ?,
+                fulfillment_status = ?,
+                payment_notice_status = ?,
+                payment_notice_sent_at = ?,
+                payment_notice_email_id = ?,
+                payment_notice_debug = ?,
+                customer_receipt_status = ?,
+                customer_receipt_sent_at = ?,
+                customer_receipt_email_id = ?,
+                customer_receipt_debug = ?,
+                postpay_processed_at = ?
+            WHERE order_id = ?
+            """,
+            (
+                updated_at,
+                "payment_confirmed",
+                str(admin_result.get("status") or "unknown"),
+                updated_at if str(admin_result.get("status") or "") == "sent" else None,
+                normalize_text(admin_result.get("email_id"), 120),
+                normalize_text(admin_result.get("debug_detail"), 500),
+                str(customer_result.get("status") or "unknown"),
+                updated_at if str(customer_result.get("status") or "") == "sent" else None,
+                normalize_text(customer_result.get("email_id"), 120),
+                normalize_text(customer_result.get("debug_detail"), 500),
+                updated_at,
+                order_id,
+            ),
+        )
+        conn.commit()
+        row = db_fetchone(conn, "SELECT * FROM nowpayments_orders WHERE order_id = ? LIMIT 1", (order_id,))
+    finally:
+        conn.close()
+    return row_to_dict(row)
+
+
+def maybe_process_nowpayments_paid_order(order_id: str) -> Dict[str, Any]:
+    order = fetch_nowpayments_order(order_id)
+    if not order or not _nowpayments_paid_flag(str(order.get("payment_status") or "")):
+        return order
+    admin_status = str(order.get("payment_notice_status") or "").strip().lower()
+    customer_status = str(order.get("customer_receipt_status") or "").strip().lower()
+    customer_email = normalize_text(order.get("customer_email"), 200).lower()
+    needs_admin = admin_status not in {"sent", "not_configured", "disabled"}
+    needs_customer = bool(customer_email) and customer_status not in {"sent", "skipped", "not_configured", "disabled"}
+    if not needs_admin and not needs_customer:
+        return order
+    admin_result = {"status": admin_status or ("disabled" if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED else "not_configured" if not (RESEND_API_KEY and RESEND_FROM and RESEND_TO) else "skipped"), "email_id": order.get("payment_notice_email_id"), "debug_detail": order.get("payment_notice_debug")}
+    customer_result = {"status": customer_status or ("skipped" if not customer_email else "disabled" if not NOWPAYMENTS_POSTPAY_EMAILS_ENABLED else "not_configured" if not (RESEND_API_KEY and RESEND_FROM) else "skipped"), "email_id": order.get("customer_receipt_email_id"), "debug_detail": order.get("customer_receipt_debug")}
+    if needs_admin:
+        admin_result = send_nowpayments_internal_paid_email(order)
+    if needs_customer:
+        customer_result = send_nowpayments_customer_paid_email(order)
+    return update_nowpayments_postpay_delivery(order_id, admin_result, customer_result)
 
 
 def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2001,8 +2235,9 @@ def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]
                 INSERT INTO nowpayments_orders(
                     order_id, created_at, updated_at, status, payment_status, fulfillment_status,
                     provider_invoice_id, provider_payment_id, pay_currency, pay_amount, actually_paid, actually_paid_at_fiat,
-                    purchase_id, raw_last_ipn_json, last_ipn_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    purchase_id, raw_last_ipn_json, last_ipn_at,
+                    payment_notice_status, customer_receipt_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_order_id,
@@ -2020,6 +2255,8 @@ def upsert_nowpayments_order_from_ipn(payload: Dict[str, Any]) -> Dict[str, Any]
                     purchase_id,
                     json_dumps_safe(payload),
                     updated_at,
+                    "pending",
+                    "pending",
                 ),
             )
         conn.commit()
@@ -2042,12 +2279,15 @@ def fetch_nowpayments_order(order_id: str) -> Dict[str, Any]:
 
 
 def nowpayments_public_order_view(order: Dict[str, Any]) -> Dict[str, Any]:
+    paid = _nowpayments_paid_flag(str(order.get("payment_status") or ""))
+    customer_email = normalize_text(order.get("customer_email"), 200).lower()
+    support_email = NOWPAYMENTS_SUPPORT_EMAIL or RESEND_TO or RESEND_FROM
     return {
         "order_id": order.get("order_id"),
         "status": order.get("status") or "created",
         "payment_status": order.get("payment_status") or "waiting",
-        "fulfillment_status": order.get("fulfillment_status") or "pending_payment",
-        "paid": _nowpayments_paid_flag(str(order.get("payment_status") or "")),
+        "fulfillment_status": order.get("fulfillment_status") or ("payment_confirmed" if paid else "pending_payment"),
+        "paid": paid,
         "product": {
             "sku": order.get("product_sku") or "",
             "title": order.get("product_title") or "",
@@ -2056,6 +2296,14 @@ def nowpayments_public_order_view(order: Dict[str, Any]) -> Dict[str, Any]:
         "checkout_url": order.get("invoice_url") or "",
         "provider_invoice_id": order.get("provider_invoice_id") or "",
         "updated_at": order.get("updated_at") or order.get("created_at") or "",
+        "customer_email_present": bool(customer_email),
+        "payment_notice_status": order.get("payment_notice_status") or "pending",
+        "customer_receipt_status": order.get("customer_receipt_status") or ("skipped" if not customer_email else "pending"),
+        "support_email": support_email,
+        "message": (
+            f"Payment confirmed. We will follow up within about {NOWPAYMENTS_POSTPAY_NEXT_STEP_HOURS} hours." if paid
+            else "Payment is not confirmed yet. If you already paid, wait a few seconds and refresh."
+        ),
     }
 
 
@@ -2078,14 +2326,18 @@ def create_nowpayments_invoice_internal(payload: Dict[str, Any]) -> Dict[str, An
     if customer_email and not is_valid_email(customer_email):
         raise ApiError("Please enter a valid email address.", 400)
     order_id = nowpayments_checkout_id()
-    provider_response = create_nowpayments_invoice_remote(order_id=order_id, product=product)
-    stored = store_nowpayments_order_created(order_id=order_id, product=product, customer_email=customer_email, provider_response=provider_response)
+    success_url, cancel_url = nowpayments_redirect_urls(order_id)
+    provider_response = create_nowpayments_invoice_remote(order_id=order_id, product=product, success_url=success_url, cancel_url=cancel_url)
+    stored = store_nowpayments_order_created(order_id=order_id, product=product, customer_email=customer_email, provider_response=provider_response, success_url=success_url, cancel_url=cancel_url)
     return {
         "order_id": order_id,
         "checkout_url": stored.get("invoice_url") or "",
         "payment_status": stored.get("payment_status") or "waiting",
         "provider_invoice_id": stored.get("provider_invoice_id") or "",
         "product": product,
+        "customer_email": customer_email,
+        "success_url": success_url,
+        "cancel_url": cancel_url,
     }
 
 
@@ -3988,7 +4240,16 @@ def ensure_db() -> None:
                   cancel_url TEXT,
                   raw_create_json TEXT,
                   raw_last_ipn_json TEXT,
-                  last_ipn_at TEXT
+                  last_ipn_at TEXT,
+                  payment_notice_status TEXT,
+                  payment_notice_sent_at TEXT,
+                  payment_notice_email_id TEXT,
+                  payment_notice_debug TEXT,
+                  customer_receipt_status TEXT,
+                  customer_receipt_sent_at TEXT,
+                  customer_receipt_email_id TEXT,
+                  customer_receipt_debug TEXT,
+                  postpay_processed_at TEXT
                 )
                 """
             )
@@ -4024,7 +4285,16 @@ def ensure_db() -> None:
                   cancel_url TEXT,
                   raw_create_json TEXT,
                   raw_last_ipn_json TEXT,
-                  last_ipn_at TEXT
+                  last_ipn_at TEXT,
+                  payment_notice_status TEXT,
+                  payment_notice_sent_at TEXT,
+                  payment_notice_email_id TEXT,
+                  payment_notice_debug TEXT,
+                  customer_receipt_status TEXT,
+                  customer_receipt_sent_at TEXT,
+                  customer_receipt_email_id TEXT,
+                  customer_receipt_debug TEXT,
+                  postpay_processed_at TEXT
                 )
                 """
             )
@@ -4055,6 +4325,15 @@ def ensure_db() -> None:
         ensure_column(conn, "nowpayments_orders", "raw_create_json", "TEXT")
         ensure_column(conn, "nowpayments_orders", "raw_last_ipn_json", "TEXT")
         ensure_column(conn, "nowpayments_orders", "last_ipn_at", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "payment_notice_status", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "payment_notice_sent_at", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "payment_notice_email_id", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "payment_notice_debug", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "customer_receipt_status", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "customer_receipt_sent_at", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "customer_receipt_email_id", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "customer_receipt_debug", "TEXT")
+        ensure_column(conn, "nowpayments_orders", "postpay_processed_at", "TEXT")
         db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_nowpayments_orders_order_id ON nowpayments_orders(order_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_nowpayments_orders_payment_id ON nowpayments_orders(provider_payment_id)")
         db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_nowpayments_orders_invoice_id ON nowpayments_orders(provider_invoice_id)")
@@ -4386,14 +4665,18 @@ def nowpayments_invoice_create():
         "provider_invoice_id": created.get("provider_invoice_id"),
         "payment_status": created.get("payment_status"),
         "product": created.get("product"),
-        "success_url": NOWPAYMENTS_SUCCESS_URL,
-        "cancel_url": NOWPAYMENTS_CANCEL_URL,
+        "customer_email": created.get("customer_email") or "",
+        "success_url": created.get("success_url") or NOWPAYMENTS_SUCCESS_URL,
+        "cancel_url": created.get("cancel_url") or NOWPAYMENTS_CANCEL_URL,
     })
 
 
 @app.get("/api/payments/nowpayments/order/<order_id>")
 def nowpayments_order_status(order_id: str):
-    order = fetch_nowpayments_order(normalize_text(order_id, 120))
+    order_id = normalize_text(order_id, 120)
+    order = maybe_process_nowpayments_paid_order(order_id)
+    if not order:
+        order = fetch_nowpayments_order(order_id)
     if not order:
         raise ApiError("Order not found.", 404)
     return jsonify({
@@ -4413,6 +4696,7 @@ def nowpayments_ipn_receive():
     if not expected or not hmac.compare_digest(signature.lower(), expected.lower()):
         raise ApiError("Invalid NOWPayments signature.", 403, code="NOWPAYMENTS_SIG_INVALID")
     updated = upsert_nowpayments_order_from_ipn(payload)
+    processed_order = maybe_process_nowpayments_paid_order(str(updated.get("order_id") or "")) if bool(updated.get("paid")) else {}
     record_request_event(
         event_name="nowpayments_ipn",
         endpoint="/api/payments/nowpayments/ipn",
@@ -4424,6 +4708,8 @@ def nowpayments_ipn_receive():
             "order_id": updated.get("order_id"),
             "payment_status": updated.get("payment_status"),
             "paid": bool(updated.get("paid")),
+            "payment_notice_status": (processed_order or {}).get("payment_notice_status") or "pending",
+            "customer_receipt_status": (processed_order or {}).get("customer_receipt_status") or "pending",
         },
     )
     return jsonify({
@@ -4432,6 +4718,8 @@ def nowpayments_ipn_receive():
         "order_id": updated.get("order_id"),
         "payment_status": updated.get("payment_status"),
         "paid": bool(updated.get("paid")),
+        "payment_notice_status": (processed_order or {}).get("payment_notice_status") or "pending",
+        "customer_receipt_status": (processed_order or {}).get("customer_receipt_status") or "pending",
     })
 
 
