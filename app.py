@@ -29,7 +29,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context
 from flask_cors import CORS
 
-APP_VERSION = "2.3.3-nowpayments-ipnstreamfix"
+APP_VERSION = "2.3.1-nowpayments-ipnfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -4848,72 +4848,19 @@ def nowpayments_order_status(order_id: str):
     })
 
 
-def parse_nowpayments_ipn_payload() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def parse_nowpayments_ipn_payload() -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
-    debug: Dict[str, Any] = {}
 
-    raw_bytes = b""
-    try:
-        raw_bytes = request.get_data(cache=True, as_text=False, parse_form_data=False) or b""
-    except TypeError:
-        raw_bytes = request.get_data(cache=True, as_text=False) or b""
-    except Exception:
-        raw_bytes = b""
-
-    if not raw_bytes:
+    raw = request.get_data(cache=True, as_text=True) or ""
+    if raw:
         try:
-            content_length = int(request.environ.get("CONTENT_LENGTH") or 0)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload.update(parsed)
         except Exception:
-            content_length = 0
-        if content_length > 0:
-            try:
-                stream = request.environ.get("wsgi.input")
-                if stream is not None:
-                    raw_bytes = stream.read(content_length) or b""
-            except Exception:
-                raw_bytes = b""
+            pass
 
-    raw_text = ""
-    if raw_bytes:
-        try:
-            raw_text = raw_bytes.decode("utf-8-sig", errors="replace")
-        except Exception:
-            raw_text = str(raw_bytes)
-
-    if raw_text:
-        parsed = None
-        try:
-            parsed = json.loads(raw_text)
-        except Exception:
-            parsed = None
-        if isinstance(parsed, str) and parsed.strip():
-            try:
-                parsed = json.loads(parsed)
-            except Exception:
-                parsed = None
-        if isinstance(parsed, dict):
-            payload.update(parsed)
-        else:
-            try:
-                form_like = urllib.parse.parse_qs(raw_text, keep_blank_values=True)
-                for key, values in form_like.items():
-                    if not values:
-                        continue
-                    field_value = values[-1]
-                    if key in {"payload", "body", "data"} and isinstance(field_value, str) and field_value.strip():
-                        try:
-                            nested = json.loads(field_value)
-                            if isinstance(nested, dict):
-                                payload.update(nested)
-                                continue
-                        except Exception:
-                            pass
-                    if key not in payload:
-                        payload[str(key)] = field_value
-            except Exception:
-                pass
-
-    json_payload = request.get_json(silent=True, force=False)
+    json_payload = request.get_json(silent=True)
     if isinstance(json_payload, dict):
         payload.update(json_payload)
 
@@ -4942,37 +4889,25 @@ def parse_nowpayments_ipn_payload() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     except Exception:
         pass
 
-    debug.update({
-        "content_type": str(request.content_type or ""),
-        "mimetype": str(request.mimetype or ""),
-        "content_length": int(request.content_length or 0),
-        "raw_len": len(raw_bytes),
-        "raw_preview": raw_text[:200],
-        "payload_keys": sorted([str(k) for k in payload.keys()]),
-    })
-
-    return payload, debug
+    return payload
 
 
 @app.post("/api/payments/nowpayments/ipn")
 def nowpayments_ipn_receive():
-    payload, payload_debug = parse_nowpayments_ipn_payload()
+    payload = parse_nowpayments_ipn_payload()
     bypass_enabled = str(os.getenv("NOWPAYMENTS_IPN_TEST_BYPASS", "0")).strip().lower() in {"1", "true", "yes", "on"}
     bypass_requested = str(request.args.get("test_bypass") or "").strip().lower() in {"1", "true", "yes", "on"}
     has_identifier = any(normalize_text(payload.get(key), 120) for key in ("order_id", "invoice_id", "invoiceId", "payment_id", "id", "purchase_id"))
     payment_status_value = normalize_text(payload.get("payment_status") or payload.get("status"), 80)
     if not has_identifier or not payment_status_value:
-        details = {
-            "has_identifier": bool(has_identifier),
-            "has_payment_status": bool(payment_status_value),
-        }
-        if bypass_enabled and bypass_requested:
-            details["debug_payload"] = payload_debug
         raise ApiError(
             "NOWPayments IPN payload is missing required fields.",
             400,
             code="NOWPAYMENTS_IPN_PAYLOAD_INVALID",
-            details=details,
+            details={
+                "has_identifier": bool(has_identifier),
+                "has_payment_status": bool(payment_status_value),
+            },
         )
     if not (bypass_enabled and bypass_requested):
         signature = str(request.headers.get("x-nowpayments-sig") or request.headers.get("X-NOWPAYMENTS-SIG") or "").strip()
@@ -5016,8 +4951,6 @@ def nowpayments_ipn_receive():
             "invoice_id": normalize_text(payload.get("invoice_id") or payload.get("invoiceId"), 120),
             "payment_status": normalize_text(payload.get("payment_status") or payload.get("status"), 80),
             "payload_keys": sorted([str(k) for k in payload.keys()]),
-            "raw_len": payload_debug.get("raw_len", 0),
-            "content_type": payload_debug.get("content_type", ""),
             "app_version": APP_VERSION,
         }
     return jsonify(response_payload)
