@@ -2284,7 +2284,8 @@ def maybe_process_nowpayments_paid_order(order_id: str) -> Dict[str, Any]:
     customer_email = normalize_text(order.get("customer_email"), 200).lower()
     needs_admin = admin_status not in {"sent", "not_configured", "disabled"}
     needs_customer = bool(customer_email) and customer_status not in {"sent", "skipped", "not_configured", "disabled"}
-    needs_crm = crm_status not in {"sent", "not_configured", "disabled"}
+    crm_delivery_enabled = NOWPAYMENTS_POSTPAY_CRM_ENABLED and bool(NOWPAYMENTS_POSTPAY_CRM_URL)
+    needs_crm = crm_delivery_enabled and crm_status != "sent"
     if not needs_admin and not needs_customer and not needs_crm:
         return order
     admin_result = {
@@ -4849,46 +4850,29 @@ def nowpayments_order_status(order_id: str):
 
 
 def parse_nowpayments_ipn_payload() -> Dict[str, Any]:
-    payload: Dict[str, Any] = {}
-
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict) and payload:
+        return payload
     raw = request.get_data(cache=True, as_text=True) or ""
     if raw:
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                payload.update(parsed)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
         except Exception:
             pass
-
-    json_payload = request.get_json(silent=True)
-    if isinstance(json_payload, dict):
-        payload.update(json_payload)
-
+    payload = {}
     try:
         for key in request.form.keys():
-            field_key = str(key)
-            field_value = request.form.get(key)
-            if field_key in {"payload", "body", "data"} and isinstance(field_value, str) and field_value.strip():
-                try:
-                    nested = json.loads(field_value)
-                    if isinstance(nested, dict):
-                        payload.update(nested)
-                        continue
-                except Exception:
-                    pass
-            if field_key not in payload:
-                payload[field_key] = field_value
+            payload[str(key)] = request.form.get(key)
     except Exception:
         pass
-
-    try:
-        for key in request.args.keys():
-            arg_key = str(key)
-            if arg_key not in payload:
-                payload[arg_key] = request.args.get(key)
-    except Exception:
-        pass
-
+    if not payload:
+        try:
+            for key in request.args.keys():
+                payload[str(key)] = request.args.get(key)
+        except Exception:
+            pass
     return payload
 
 
@@ -4897,18 +4881,6 @@ def nowpayments_ipn_receive():
     payload = parse_nowpayments_ipn_payload()
     bypass_enabled = str(os.getenv("NOWPAYMENTS_IPN_TEST_BYPASS", "0")).strip().lower() in {"1", "true", "yes", "on"}
     bypass_requested = str(request.args.get("test_bypass") or "").strip().lower() in {"1", "true", "yes", "on"}
-    has_identifier = any(normalize_text(payload.get(key), 120) for key in ("order_id", "invoice_id", "invoiceId", "payment_id", "id", "purchase_id"))
-    payment_status_value = normalize_text(payload.get("payment_status") or payload.get("status"), 80)
-    if not has_identifier or not payment_status_value:
-        raise ApiError(
-            "NOWPayments IPN payload is missing required fields.",
-            400,
-            code="NOWPAYMENTS_IPN_PAYLOAD_INVALID",
-            details={
-                "has_identifier": bool(has_identifier),
-                "has_payment_status": bool(payment_status_value),
-            },
-        )
     if not (bypass_enabled and bypass_requested):
         signature = str(request.headers.get("x-nowpayments-sig") or request.headers.get("X-NOWPAYMENTS-SIG") or "").strip()
         if not signature:
