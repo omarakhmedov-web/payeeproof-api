@@ -3079,6 +3079,16 @@ def monerium_select_profile_id(context_payload: Dict[str, Any], requested_profil
     return ""
 
 
+def monerium_select_profile_stub(context_payload: Dict[str, Any], requested_profile_id: str = "") -> Dict[str, Any]:
+    target_id = monerium_select_profile_id(context_payload, requested_profile_id)
+    profiles = context_payload.get("profiles") if isinstance(context_payload, dict) else []
+    if isinstance(profiles, list):
+        for item in profiles:
+            if isinstance(item, dict) and normalize_text(item.get("id"), 120) == target_id:
+                return dict(item)
+    return {"id": target_id} if target_id else {}
+
+
 def monerium_select_account(profile_payload: Dict[str, Any], *, account_id: str = "", chain: str = "", currency: str = "eur") -> Dict[str, Any]:
     accounts = profile_payload.get("accounts") if isinstance(profile_payload, dict) else []
     if not isinstance(accounts, list):
@@ -5811,8 +5821,21 @@ def monerium_details():
     profile_id = monerium_select_profile_id(context_payload, requested_profile_id)
     if not profile_id:
         raise ApiError("No Monerium profile is available for this connection.", 404, code="MONERIUM_PROFILE_NOT_FOUND")
-    profile_payload = monerium_fetch_profile_detail(access_token, profile_id)
-    selected_account = monerium_select_account(profile_payload, chain=requested_chain, currency=requested_currency)
+
+    profile_stub = monerium_select_profile_stub(context_payload, requested_profile_id)
+    profile_payload: Dict[str, Any] = {}
+    profile_detail_available = False
+    profile_detail_error: Dict[str, Any] = {}
+    try:
+        profile_payload = monerium_fetch_profile_detail(access_token, profile_id)
+        profile_detail_available = True
+    except ApiError as exc:
+        if str(exc.code or "") != "MONERIUM_PROFILE_DETAIL_FAILED":
+            raise
+        profile_detail_error = exc.details or {}
+        profile_payload = {"id": profile_id, "name": profile_stub.get("name") or "", "kyc": {}}
+
+    selected_account = monerium_select_account(profile_payload, chain=requested_chain, currency=requested_currency) if profile_detail_available else {}
     accounts = profile_payload.get("accounts") if isinstance(profile_payload, dict) else []
     account_summaries: List[Dict[str, Any]] = []
     if isinstance(accounts, list):
@@ -5852,9 +5875,13 @@ def monerium_details():
         },
         "profile": {
             "id": profile_payload.get("id") or profile_id,
-            "name": profile_payload.get("name") or "",
+            "name": profile_payload.get("name") or profile_stub.get("name") or "",
+            "kind": profile_stub.get("kind") or "",
+            "perms": profile_stub.get("perms") or [],
             "kyc": profile_payload.get("kyc") or {},
         },
+        "profile_detail_available": profile_detail_available,
+        "profile_detail_error": profile_detail_error if not profile_detail_available else {},
         "accounts": account_summaries,
         "selected_account": {
             "id": normalize_text(selected_account.get("id"), 120),
@@ -5865,7 +5892,13 @@ def monerium_details():
             "iban": str(selected_account.get("iban") or "").strip(),
             "standard": str(selected_account.get("standard") or "").strip(),
         } if selected_account else None,
+        "requested_source": {
+            "chain": requested_chain,
+            "currency": requested_currency,
+            "token_symbol": monerium_token_symbol(requested_currency),
+        },
     })
+
 
 
 @app.post("/api/integrations/monerium/transfer-preview")
@@ -5886,13 +5919,22 @@ def monerium_transfer_preview():
     profile_id = monerium_select_profile_id(context_payload, requested_profile_id)
     if not profile_id:
         raise ApiError("No Monerium profile is available for this connection.", 404, code="MONERIUM_PROFILE_NOT_FOUND")
-    profile_payload = monerium_fetch_profile_detail(access_token, profile_id)
-    source_account = monerium_select_account(profile_payload, account_id=requested_account_id, chain=requested_chain, currency=requested_currency)
-    if not source_account:
-        raise ApiError("No matching Monerium source account found for the requested chain/currency.", 404, code="MONERIUM_ACCOUNT_NOT_FOUND")
+    profile_stub = monerium_select_profile_stub(context_payload, requested_profile_id)
 
-    token_symbol = monerium_token_symbol(source_account.get("currency") or requested_currency) or monerium_token_symbol(requested_currency)
-    derived_chain = normalize_monerium_chain(source_account.get("chain") or requested_chain)
+    profile_detail_available = False
+    profile_detail_error: Dict[str, Any] = {}
+    source_account: Dict[str, Any] = {}
+    try:
+        profile_payload = monerium_fetch_profile_detail(access_token, profile_id)
+        profile_detail_available = True
+        source_account = monerium_select_account(profile_payload, account_id=requested_account_id, chain=requested_chain, currency=requested_currency)
+    except ApiError as exc:
+        if str(exc.code or "") != "MONERIUM_PROFILE_DETAIL_FAILED":
+            raise
+        profile_detail_error = exc.details or {}
+
+    token_symbol = monerium_token_symbol((source_account or {}).get("currency") or requested_currency) or monerium_token_symbol(requested_currency)
+    derived_chain = normalize_monerium_chain((source_account or {}).get("chain") or requested_chain)
     provided = payload.get("provided") if isinstance(payload.get("provided"), dict) else {}
     expected = payload.get("expected") if isinstance(payload.get("expected"), dict) else {}
 
@@ -5924,15 +5966,23 @@ def monerium_transfer_preview():
         "ready_for_monerium": ready,
         "continue_to_monerium": ready,
         "gate": gate,
+        "profile": {
+            "id": profile_id,
+            "name": profile_stub.get("name") or "",
+            "kind": profile_stub.get("kind") or "",
+            "perms": profile_stub.get("perms") or [],
+        },
+        "profile_detail_available": profile_detail_available,
+        "profile_detail_error": profile_detail_error if not profile_detail_available else {},
         "source": {
             "connection_id": record.get("connection_id") or "",
             "profile_id": profile_id,
-            "account_id": normalize_text(source_account.get("id"), 120),
+            "account_id": normalize_text((source_account or {}).get("id"), 120),
             "chain": derived_chain,
-            "currency": str(source_account.get("currency") or requested_currency).strip().lower(),
+            "currency": str((source_account or {}).get("currency") or requested_currency).strip().lower(),
             "token_symbol": token_symbol,
-            "address": str(source_account.get("address") or "").strip(),
-            "iban": str(source_account.get("iban") or "").strip(),
+            "address": str((source_account or {}).get("address") or "").strip(),
+            "iban": str((source_account or {}).get("iban") or "").strip(),
         },
         "transfer": {
             "amount": amount,
@@ -5945,9 +5995,9 @@ def monerium_transfer_preview():
         "monerium_draft": {
             "mode": "preview_only",
             "profile_id": profile_id,
-            "source_account_id": normalize_text(source_account.get("id"), 120),
+            "source_account_id": normalize_text((source_account or {}).get("id"), 120),
             "source_chain": derived_chain,
-            "currency": str(source_account.get("currency") or requested_currency).strip().lower(),
+            "currency": str((source_account or {}).get("currency") or requested_currency).strip().lower(),
             "amount": amount,
             "destination": {
                 "address": provided.get("address") or "",
@@ -5957,6 +6007,7 @@ def monerium_transfer_preview():
             },
         },
     })
+
 
 
 @app.get("/api/integrations/monerium/status")
