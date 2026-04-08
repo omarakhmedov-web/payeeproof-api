@@ -20,6 +20,7 @@ except Exception:
     RealDictCursor = None
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +32,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.4.2-monerium-oauth-ttlfix"
+APP_VERSION = "2.5.0-monerium-v0-preview-gate"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -94,10 +95,10 @@ DEFAULT_RPC_URLS = {
 }
 
 SUPPORTED_ASSETS_BY_CHAIN = {
-    "ethereum": {"ETH", "USDC", "USDT", "DAI", "USDS", "PYUSD"},
-    "arbitrum": {"USDC", "USDT", "DAI", "USDS"},
-    "base": {"USDC", "USDT"},
-    "polygon": {"USDC", "USDT"},
+    "ethereum": {"ETH", "USDC", "USDT", "DAI", "USDS", "PYUSD", "EURE"},
+    "arbitrum": {"USDC", "USDT", "DAI", "USDS", "EURE"},
+    "base": {"USDC", "USDT", "EURE"},
+    "polygon": {"USDC", "USDT", "EURE"},
     "bsc": {"USDC", "USDT"},
     "solana": {"USDC", "USDT"},
 }
@@ -285,6 +286,8 @@ API_SCOPE_BY_PATH = {
     "/api/usage-summary": "records",
     "/api/weekly-summary": "records",
     "/api/weekly-summary/send": "records",
+    "/api/integrations/monerium/details": "records",
+    "/api/integrations/monerium/transfer-preview": "preflight",
 }
 
 ALLOWED_ENVIRONMENTS = {"live", "test", "sandbox", "staging", "production", "public-demo"}
@@ -2871,6 +2874,343 @@ def monerium_fetch_auth_context(access_token: str) -> Dict[str, Any]:
         )
     return payload if isinstance(payload, dict) else {"raw": payload}
 
+def monerium_api_headers(access_token: str) -> Dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+    }
+
+
+def monerium_api_get(path: str, access_token: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    response = requests.get(
+        f"{MONERIUM_API_BASE}{path}",
+        headers=monerium_api_headers(access_token),
+        params=params or None,
+        timeout=MONERIUM_HTTP_TIMEOUT_SEC,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text[:2000]}
+    if response.status_code >= 400:
+        raise ApiError(
+            "Monerium API request failed.",
+            502,
+            code="MONERIUM_API_REQUEST_FAILED",
+            details={
+                "path": path,
+                "status_code": response.status_code,
+                "response": payload,
+            },
+        )
+    return payload if isinstance(payload, dict) else {"raw": payload}
+
+
+def monerium_refresh_access_token(refresh_token: str) -> Dict[str, Any]:
+    token = normalize_text(refresh_token, 4096)
+    if not token:
+        raise ApiError("Monerium refresh token is missing.", 400, code="MONERIUM_REFRESH_TOKEN_MISSING")
+    form_data: Dict[str, Any] = {
+        "grant_type": "refresh_token",
+        "client_id": MONERIUM_AUTH_CLIENT_ID,
+        "refresh_token": token,
+    }
+    if MONERIUM_CLIENT_SECRET:
+        form_data["client_secret"] = MONERIUM_CLIENT_SECRET
+    response = requests.post(
+        f"{MONERIUM_API_BASE}/auth/token",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        },
+        data=form_data,
+        timeout=MONERIUM_HTTP_TIMEOUT_SEC,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text[:2000]}
+    if response.status_code >= 400:
+        raise ApiError(
+            "Monerium token refresh failed.",
+            502,
+            code="MONERIUM_REFRESH_FAILED",
+            details={
+                "status_code": response.status_code,
+                "response": payload,
+            },
+        )
+    return payload if isinstance(payload, dict) else {"raw": payload}
+
+
+def update_monerium_connection(connection_id: str, **fields: Any) -> None:
+    allowed = {
+        "updated_at", "status", "access_token", "refresh_token", "token_type", "expires_in", "expires_at",
+        "context_user_id", "context_auth_method", "context_profiles_json", "raw_token_json", "raw_context_json"
+    }
+    set_parts: List[str] = []
+    params: List[Any] = []
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        set_parts.append(f"{key} = ?")
+        params.append(value)
+    if not set_parts:
+        return
+    params.append(normalize_text(connection_id, 120))
+    conn = get_db()
+    try:
+        db_execute(conn, f"UPDATE monerium_connections SET {', '.join(set_parts)} WHERE connection_id = ?", tuple(params))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def monerium_connection_is_expired(record: Dict[str, Any], skew_sec: int = 60) -> bool:
+    expires_at = parse_iso_to_epoch(str(record.get("expires_at") or ""))
+    if not expires_at:
+        return False
+    return expires_at <= (now_epoch() + max(0, skew_sec))
+
+
+def monerium_ensure_live_connection(connection_id: str = "") -> Dict[str, Any]:
+    record = fetch_monerium_connection(connection_id)
+    if not record:
+        raise ApiError("No Monerium connection found.", 404, code="MONERIUM_NOT_CONNECTED")
+    access_token = normalize_text(record.get("access_token"), 4096)
+    refreshed = False
+    if not access_token or monerium_connection_is_expired(record):
+        refreshed_payload = monerium_refresh_access_token(str(record.get("refresh_token") or ""))
+        refreshed = True
+        expires_in = None
+        try:
+            expires_in = int(refreshed_payload.get("expires_in")) if refreshed_payload.get("expires_in") is not None else None
+        except Exception:
+            expires_in = None
+        expires_at = record.get("expires_at") or ""
+        if expires_in and expires_in > 0:
+            expires_at = iso_from_epoch(now_epoch() + expires_in)
+        access_token = normalize_text(refreshed_payload.get("access_token"), 4096)
+        refresh_token = normalize_text(refreshed_payload.get("refresh_token"), 4096) or normalize_text(record.get("refresh_token"), 4096)
+        update_monerium_connection(
+            str(record.get("connection_id") or ""),
+            updated_at=utc_now_iso(),
+            status="connected",
+            access_token=access_token,
+            refresh_token=refresh_token,
+            token_type=normalize_text(refreshed_payload.get("token_type"), 80) or normalize_text(record.get("token_type"), 80),
+            expires_in=expires_in,
+            expires_at=expires_at,
+            raw_token_json=json.dumps(refreshed_payload or {}, ensure_ascii=False),
+        )
+        record = fetch_monerium_connection(str(record.get("connection_id") or ""))
+    return {
+        "record": record,
+        "access_token": access_token,
+        "refreshed": refreshed,
+    }
+
+
+def monerium_fetch_profile_detail(access_token: str, profile_id: str) -> Dict[str, Any]:
+    return monerium_api_get(f"/profiles/{normalize_text(profile_id, 120)}", access_token)
+
+
+def monerium_token_symbol(currency: Any) -> str:
+    code = str(currency or "").strip().lower()
+    if code == "eur":
+        return "EURe"
+    if not code:
+        return ""
+    return code.upper()
+
+
+def monerium_select_profile_id(context_payload: Dict[str, Any], requested_profile_id: str = "") -> str:
+    explicit = normalize_text(requested_profile_id, 120)
+    if explicit:
+        return explicit
+    default_profile = normalize_text(context_payload.get("defaultProfile") or context_payload.get("default_profile"), 120)
+    if default_profile:
+        return default_profile
+    profiles = context_payload.get("profiles") if isinstance(context_payload, dict) else []
+    if isinstance(profiles, list):
+        for item in profiles:
+            if isinstance(item, dict):
+                candidate = normalize_text(item.get("id"), 120)
+                if candidate:
+                    return candidate
+    return ""
+
+
+def monerium_select_account(profile_payload: Dict[str, Any], *, account_id: str = "", chain: str = "", currency: str = "eur") -> Dict[str, Any]:
+    accounts = profile_payload.get("accounts") if isinstance(profile_payload, dict) else []
+    if not isinstance(accounts, list):
+        return {}
+    normalized_account_id = normalize_text(account_id, 120)
+    normalized_chain = normalize_monerium_chain(chain or MONERIUM_DEFAULT_CHAIN)
+    normalized_currency = str(currency or "eur").strip().lower() or "eur"
+    if normalized_account_id:
+        for account in accounts:
+            if isinstance(account, dict) and normalize_text(account.get("id"), 120) == normalized_account_id:
+                return dict(account)
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        if normalize_monerium_chain(account.get("chain")) == normalized_chain and str(account.get("currency") or "").strip().lower() == normalized_currency:
+            return dict(account)
+    return {}
+
+
+def normalize_money_amount(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise ApiError("Amount must be a valid decimal string.", 400, code="INVALID_AMOUNT")
+    if amount <= 0:
+        raise ApiError("Amount must be greater than zero.", 400, code="INVALID_AMOUNT")
+    quantized = amount.normalize()
+    return format(quantized, 'f')
+
+
+def build_preflight_preview(expected: Dict[str, Any], provided: Dict[str, Any], *, policy_profile: str = "payout_strict") -> Dict[str, Any]:
+    normalized_policy_profile = normalize_policy_profile(policy_profile)
+    expected_chain = normalize_chain(expected.get("network") or expected.get("chain"))
+    provided_chain = normalize_chain(provided.get("network") or provided.get("chain"))
+    expected_asset = str(expected.get("asset") or "").strip().upper()
+    provided_asset = str(provided.get("asset") or "").strip().upper()
+    expected_address = str(expected.get("address") or "").strip()
+    provided_address = str(provided.get("address") or "").strip()
+    expected_memo = str(expected.get("memo") or expected.get("tag") or "").strip()
+    provided_memo = str(provided.get("memo") or provided.get("tag") or "").strip()
+
+    if not expected_chain or not provided_chain:
+        raise ApiError("Both expected.network and provided.network are required.", 400)
+    if not expected_asset or not provided_asset:
+        raise ApiError("Both expected.asset and provided.asset are required.", 400)
+    if not expected_address or not provided_address:
+        raise ApiError("Both expected.address and provided.address are required.", 400)
+
+    expected_valid, expected_validation_note = validate_address(expected_chain, expected_address)
+    provided_valid, provided_validation_note = validate_address(provided_chain, provided_address)
+
+    checks = {
+        "network_match": expected_chain == provided_chain,
+        "asset_match": expected_asset == provided_asset,
+        "address_match": compare_addresses(expected_chain, expected_address, provided_chain, provided_address),
+        "memo_match": expected_memo == provided_memo if (expected_memo or provided_memo) else True,
+        "expected_address_valid": expected_valid,
+        "provided_address_valid": provided_valid,
+        "expected_network_supported": is_supported_chain(expected_chain),
+        "provided_network_supported": is_supported_chain(provided_chain),
+        "expected_asset_supported": is_supported_asset_for_chain(expected_chain, expected_asset),
+        "provided_asset_supported": is_supported_asset_for_chain(provided_chain, provided_asset),
+    }
+
+    if expected_valid:
+        expected_onchain = skipped_expected_onchain(expected_chain, "Skipped for preview. Expected destination classification is not required for the verification gate.")
+    else:
+        expected_onchain = {"chain": expected_chain, "address_type": "invalid", "rpc_used": False, "details": expected_validation_note}
+
+    if not provided_valid:
+        provided_onchain = {"chain": provided_chain, "address_type": "invalid", "rpc_used": False, "details": provided_validation_note}
+    elif not checks["provided_network_supported"]:
+        provided_onchain = {"chain": provided_chain, "address_type": "unsupported", "rpc_used": False, "details": f"Unsupported chain: {provided_chain}"}
+    elif not checks["provided_asset_supported"]:
+        provided_onchain = skipped_expected_onchain(provided_chain, f"Skipped live lookup because {provided_asset or 'asset'} is not currently supported on {provided_chain}.")
+    elif provided_chain in EVM_CHAINS and provided_address.lower() == ZERO_EVM:
+        provided_onchain = {"chain": provided_chain, "address_type": "invalid", "rpc_used": False, "details": "Zero address blocked before live lookup."}
+    else:
+        provided_onchain = classify_address(provided_chain, provided_address)
+
+    risk_flags: List[str] = []
+    if not checks["network_match"]:
+        risk_flags.append("NETWORK_MISMATCH")
+    if not checks["asset_match"]:
+        risk_flags.append("ASSET_MISMATCH")
+    if not checks["address_match"]:
+        risk_flags.append("ADDRESS_MISMATCH")
+    if not checks["memo_match"]:
+        risk_flags.append("MEMO_MISMATCH")
+    if not checks["expected_address_valid"] or not checks["provided_address_valid"]:
+        risk_flags.append("INVALID_ADDRESS")
+    if not checks["expected_network_supported"] or not checks["provided_network_supported"]:
+        risk_flags.append("UNSUPPORTED_NETWORK")
+    if not checks["expected_asset_supported"] or not checks["provided_asset_supported"]:
+        risk_flags.append("UNSUPPORTED_ASSET_OR_NETWORK")
+    if provided_chain in EVM_CHAINS and provided_address.lower() == ZERO_EVM:
+        risk_flags.append("ZERO_ADDRESS")
+
+    provided_destination = build_destination_profile(provided_chain, provided_address, provided_onchain)
+    expected_destination = build_destination_profile(expected_chain, expected_address, expected_onchain)
+
+    if provided_destination.get("classification") == "contract_or_app":
+        risk_flags.append("DESTINATION_IS_CONTRACT_OR_APP")
+    elif provided_destination.get("classification") == "exchange_like_deposit":
+        risk_flags.append("DESTINATION_REQUIRES_MEMO_OR_VENUE_CHECK")
+    elif provided_destination.get("classification") == "bridge_router":
+        risk_flags.append("DESTINATION_IS_BRIDGE_ROUTER")
+    elif provided_destination.get("source") == "unavailable":
+        risk_flags.append("DESTINATION_LOOKUP_UNAVAILABLE")
+    elif provided_destination.get("classification") in {"unknown", "not_found"}:
+        risk_flags.append("DESTINATION_NOT_CLASSIFIED")
+
+    outcome = derive_preflight_outcome(
+        checks=checks,
+        expected_chain=expected_chain,
+        provided_chain=provided_chain,
+        expected_asset=expected_asset,
+        provided_asset=provided_asset,
+        expected_address=expected_address,
+        provided_address=provided_address,
+        expected_valid=expected_valid,
+        provided_valid=provided_valid,
+        provided_destination=provided_destination,
+        risk_flags=risk_flags,
+        policy_profile=normalized_policy_profile,
+    )
+    checked_at = utc_now_iso()
+    return {
+        "checked_at": checked_at,
+        "policy_profile": normalized_policy_profile,
+        "policy_profile_label": policy_profile_label(normalized_policy_profile),
+        "status": outcome["status"],
+        "verdict": outcome["verdict"],
+        "reason_code": outcome["reason_code"],
+        "next_action": outcome["next_action"],
+        "next_action_label": preflight_next_step_label(outcome["next_action"]),
+        "confidence": outcome["confidence"],
+        "summary": outcome["summary"],
+        "why_this_verdict": outcome["why"],
+        "risk_flags": sorted(set(risk_flags)),
+        "checks": checks,
+        "expected": {"network": expected_chain, "asset": expected_asset, "address": expected_address, "memo": expected_memo},
+        "provided": {"network": provided_chain, "asset": provided_asset, "address": provided_address, "memo": provided_memo},
+        "destination": provided_destination,
+        "classification": {"expected": expected_destination, "provided": provided_destination},
+        "onchain": {"expected": expected_onchain, "provided": provided_onchain},
+        "supported_scope": {
+            "expected_network_supported": checks["expected_network_supported"],
+            "provided_network_supported": checks["provided_network_supported"],
+            "expected_asset_supported": checks["expected_asset_supported"],
+            "provided_asset_supported": checks["provided_asset_supported"],
+        },
+        "proof": {
+            "checked_at": checked_at,
+            "chain": provided_chain,
+            "trace_id": current_request_id(),
+            "verdict": outcome["verdict"],
+            "confidence": outcome["confidence"],
+            "reason_code": outcome["reason_code"],
+            "next_action": outcome["next_action"],
+            "next_action_label": preflight_next_step_label(outcome["next_action"]),
+            "policy_profile": normalized_policy_profile,
+        },
+    }
+
 
 def row_to_dict(row: Any) -> Dict[str, Any]:
     if row is None:
@@ -5416,6 +5756,171 @@ def monerium_callback():
             "trace_id": current_request_id(),
         },
     )
+
+
+@app.get("/api/integrations/monerium/details")
+def monerium_details():
+    connection_id = normalize_text(request.args.get("connection_id"), 120)
+    requested_profile_id = normalize_text(request.args.get("profile_id"), 120)
+    requested_chain = normalize_monerium_chain(request.args.get("chain") or MONERIUM_DEFAULT_CHAIN)
+    requested_currency = str(request.args.get("currency") or "eur").strip().lower() or "eur"
+
+    live = monerium_ensure_live_connection(connection_id)
+    record = live["record"]
+    access_token = str(live.get("access_token") or "")
+    context_payload = monerium_fetch_auth_context(access_token)
+    profiles = context_payload.get("profiles") if isinstance(context_payload, dict) else []
+    if not isinstance(profiles, list):
+        profiles = []
+    profile_id = monerium_select_profile_id(context_payload, requested_profile_id)
+    if not profile_id:
+        raise ApiError("No Monerium profile is available for this connection.", 404, code="MONERIUM_PROFILE_NOT_FOUND")
+    profile_payload = monerium_fetch_profile_detail(access_token, profile_id)
+    selected_account = monerium_select_account(profile_payload, chain=requested_chain, currency=requested_currency)
+    accounts = profile_payload.get("accounts") if isinstance(profile_payload, dict) else []
+    account_summaries: List[Dict[str, Any]] = []
+    if isinstance(accounts, list):
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            account_chain = normalize_monerium_chain(account.get("chain"))
+            currency = str(account.get("currency") or "").strip().lower()
+            account_summaries.append({
+                "id": normalize_text(account.get("id"), 120),
+                "chain": account_chain,
+                "currency": currency,
+                "token_symbol": monerium_token_symbol(currency),
+                "address": str(account.get("address") or "").strip(),
+                "iban": str(account.get("iban") or "").strip(),
+                "standard": str(account.get("standard") or "").strip(),
+            })
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "configured": bool(monerium_is_configured()),
+        "connected": True,
+        "connection": {
+            "connection_id": record.get("connection_id") or "",
+            "status": record.get("status") or "",
+            "chain": record.get("chain") or "",
+            "created_at": record.get("created_at") or "",
+            "updated_at": record.get("updated_at") or "",
+            "expires_at": record.get("expires_at") or "",
+            "profiles_total": len(profiles),
+            "refreshed": bool(live.get("refreshed")),
+        },
+        "auth_context": {
+            "user_id": context_payload.get("userId") or context_payload.get("user_id") or "",
+            "default_profile": context_payload.get("defaultProfile") or context_payload.get("default_profile") or "",
+            "profiles": profiles,
+        },
+        "profile": {
+            "id": profile_payload.get("id") or profile_id,
+            "name": profile_payload.get("name") or "",
+            "kyc": profile_payload.get("kyc") or {},
+        },
+        "accounts": account_summaries,
+        "selected_account": {
+            "id": normalize_text(selected_account.get("id"), 120),
+            "chain": normalize_monerium_chain(selected_account.get("chain")),
+            "currency": str(selected_account.get("currency") or "").strip().lower(),
+            "token_symbol": monerium_token_symbol(selected_account.get("currency")),
+            "address": str(selected_account.get("address") or "").strip(),
+            "iban": str(selected_account.get("iban") or "").strip(),
+            "standard": str(selected_account.get("standard") or "").strip(),
+        } if selected_account else None,
+    })
+
+
+@app.post("/api/integrations/monerium/transfer-preview")
+def monerium_transfer_preview():
+    payload = request.get_json(silent=True) or {}
+    connection_id = normalize_text(payload.get("connection_id") or request.args.get("connection_id"), 120)
+    requested_profile_id = normalize_text(payload.get("profile_id"), 120)
+    requested_account_id = normalize_text(payload.get("source_account_id"), 120)
+    requested_chain = normalize_monerium_chain(payload.get("chain") or MONERIUM_DEFAULT_CHAIN)
+    requested_currency = str(payload.get("currency") or "eur").strip().lower() or "eur"
+    amount = normalize_money_amount(payload.get("amount"))
+    recipient = payload.get("recipient") if isinstance(payload.get("recipient"), dict) else {}
+
+    live = monerium_ensure_live_connection(connection_id)
+    record = live["record"]
+    access_token = str(live.get("access_token") or "")
+    context_payload = monerium_fetch_auth_context(access_token)
+    profile_id = monerium_select_profile_id(context_payload, requested_profile_id)
+    if not profile_id:
+        raise ApiError("No Monerium profile is available for this connection.", 404, code="MONERIUM_PROFILE_NOT_FOUND")
+    profile_payload = monerium_fetch_profile_detail(access_token, profile_id)
+    source_account = monerium_select_account(profile_payload, account_id=requested_account_id, chain=requested_chain, currency=requested_currency)
+    if not source_account:
+        raise ApiError("No matching Monerium source account found for the requested chain/currency.", 404, code="MONERIUM_ACCOUNT_NOT_FOUND")
+
+    token_symbol = monerium_token_symbol(source_account.get("currency") or requested_currency) or monerium_token_symbol(requested_currency)
+    derived_chain = normalize_monerium_chain(source_account.get("chain") or requested_chain)
+    provided = payload.get("provided") if isinstance(payload.get("provided"), dict) else {}
+    expected = payload.get("expected") if isinstance(payload.get("expected"), dict) else {}
+
+    if not provided:
+        provided = {
+            "network": recipient.get("network") or derived_chain,
+            "asset": recipient.get("asset") or token_symbol,
+            "address": recipient.get("address") or "",
+            "memo": recipient.get("memo") or recipient.get("tag") or "",
+        }
+    if not expected:
+        expected = {
+            "network": payload.get("expected_network") or provided.get("network") or derived_chain,
+            "asset": payload.get("expected_asset") or provided.get("asset") or token_symbol,
+            "address": payload.get("expected_address") or provided.get("address") or "",
+            "memo": payload.get("expected_memo") or provided.get("memo") or "",
+        }
+
+    gate = build_preflight_preview(expected, provided, policy_profile=payload.get("policy_profile") or "payout_strict")
+    ready = str(gate.get("verdict") or "").upper() == "SAFE" and str(gate.get("next_action") or "").upper() == "SAFE_TO_PROCEED"
+    transfer_preview_id = f"mtp_{uuid.uuid4().hex[:20]}"
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "version": APP_VERSION,
+        "transfer_preview_id": transfer_preview_id,
+        "configured": bool(monerium_is_configured()),
+        "connected": True,
+        "ready_for_monerium": ready,
+        "continue_to_monerium": ready,
+        "gate": gate,
+        "source": {
+            "connection_id": record.get("connection_id") or "",
+            "profile_id": profile_id,
+            "account_id": normalize_text(source_account.get("id"), 120),
+            "chain": derived_chain,
+            "currency": str(source_account.get("currency") or requested_currency).strip().lower(),
+            "token_symbol": token_symbol,
+            "address": str(source_account.get("address") or "").strip(),
+            "iban": str(source_account.get("iban") or "").strip(),
+        },
+        "transfer": {
+            "amount": amount,
+            "network": provided.get("network") or derived_chain,
+            "asset": provided.get("asset") or token_symbol,
+            "destination_address": provided.get("address") or "",
+            "memo": provided.get("memo") or "",
+        },
+        "next_step": "continue_to_monerium" if ready else "stop_and_reverify",
+        "monerium_draft": {
+            "mode": "preview_only",
+            "profile_id": profile_id,
+            "source_account_id": normalize_text(source_account.get("id"), 120),
+            "source_chain": derived_chain,
+            "currency": str(source_account.get("currency") or requested_currency).strip().lower(),
+            "amount": amount,
+            "destination": {
+                "address": provided.get("address") or "",
+                "network": provided.get("network") or derived_chain,
+                "asset": provided.get("asset") or token_symbol,
+                "memo": provided.get("memo") or "",
+            },
+        },
+    })
 
 
 @app.get("/api/integrations/monerium/status")
