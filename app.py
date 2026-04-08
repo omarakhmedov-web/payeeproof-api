@@ -31,7 +31,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.4.1-monerium-oauth-fix1"
+APP_VERSION = "2.4.2-monerium-oauth-ttlfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -216,7 +216,7 @@ MONERIUM_REDIRECT_URI = os.getenv(
     f"{PUBLIC_API_BASE}/api/integrations/monerium/callback",
 ).strip()
 MONERIUM_HTTP_TIMEOUT_SEC = float(os.getenv("MONERIUM_HTTP_TIMEOUT_SEC", "15"))
-MONERIUM_OAUTH_STATE_TTL_SEC = int(os.getenv("MONERIUM_OAUTH_STATE_TTL_SEC", "1800"))
+MONERIUM_OAUTH_STATE_TTL_SEC = int(os.getenv("MONERIUM_OAUTH_STATE_TTL_SEC", "86400"))
 MONERIUM_DEFAULT_CHAIN = os.getenv("MONERIUM_DEFAULT_CHAIN", "ethereum").strip().lower() or "ethereum"
 MONERIUM_SKIP_KYC_DEFAULT = str(os.getenv("MONERIUM_SKIP_KYC_DEFAULT", "0")).strip().lower() in {"1", "true", "yes", "on"}
 MONERIUM_INCLUDE_RESPONSE_TYPE = str(os.getenv("MONERIUM_INCLUDE_RESPONSE_TYPE", "1")).strip().lower() not in {"0", "false", "no", "off"}
