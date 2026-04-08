@@ -3014,7 +3014,43 @@ def monerium_ensure_live_connection(connection_id: str = "") -> Dict[str, Any]:
 
 
 def monerium_fetch_profile_detail(access_token: str, profile_id: str) -> Dict[str, Any]:
-    return monerium_api_get(f"/profiles/{normalize_text(profile_id, 120)}", access_token)
+    pid = normalize_text(profile_id, 120)
+    if not pid:
+        raise ApiError("Monerium profile id is missing.", 400, code="MONERIUM_PROFILE_ID_MISSING")
+    candidate_paths = [
+        f"/profile/{pid}",
+        f"/profiles/{pid}",
+        f"/v2/profile/{pid}",
+        f"/v2/profiles/{pid}",
+    ]
+    last_error: Optional[ApiError] = None
+    tried: List[Dict[str, Any]] = []
+    for path in candidate_paths:
+        try:
+            payload = monerium_api_get(path, access_token)
+            if isinstance(payload, dict) and payload:
+                return payload
+        except ApiError as exc:
+            last_error = exc
+            status_code = int((exc.details or {}).get("status_code") or 0)
+            tried.append({
+                "path": path,
+                "status_code": status_code,
+                "response": (exc.details or {}).get("response") or {},
+            })
+            if status_code in {404, 410}:
+                continue
+            raise
+    raise ApiError(
+        "Monerium profile detail fetch failed.",
+        502,
+        code="MONERIUM_PROFILE_DETAIL_FAILED",
+        details={
+            "profile_id": pid,
+            "tried": tried,
+            "last_error": (last_error.details if isinstance(last_error, ApiError) else {}),
+        },
+    )
 
 
 def monerium_token_symbol(currency: Any) -> str:
