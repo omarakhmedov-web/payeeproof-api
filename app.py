@@ -32,7 +32,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.5.0-monerium-v0-preview-gate"
+APP_VERSION = "2.5.3-monerium-draft-submit"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -288,6 +288,8 @@ API_SCOPE_BY_PATH = {
     "/api/weekly-summary/send": "records",
     "/api/integrations/monerium/details": "records",
     "/api/integrations/monerium/transfer-preview": "preflight",
+    "/api/integrations/monerium/order-draft": "preflight",
+    "/api/integrations/monerium/place-order": "preflight",
 }
 
 ALLOWED_ENVIRONMENTS = {"live", "test", "sandbox", "staging", "production", "public-demo"}
@@ -2874,15 +2876,18 @@ def monerium_fetch_auth_context(access_token: str) -> Dict[str, Any]:
         )
     return payload if isinstance(payload, dict) else {"raw": payload}
 
-def monerium_api_headers(access_token: str) -> Dict[str, str]:
-    return {
-        "Accept": "application/json",
+def monerium_api_headers(access_token: str, *, json_body: bool = False) -> Dict[str, str]:
+    headers = {
+        "Accept": MONERIUM_V2_ACCEPT,
         "Authorization": f"Bearer {access_token}",
         "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
     }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
-def monerium_api_get(path: str, access_token: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def monerium_api_get(path: str, access_token: str, params: Optional[Dict[str, Any]] = None) -> Any:
     response = requests.get(
         f"{MONERIUM_API_BASE}{path}",
         headers=monerium_api_headers(access_token),
@@ -2904,7 +2909,33 @@ def monerium_api_get(path: str, access_token: str, params: Optional[Dict[str, An
                 "response": payload,
             },
         )
-    return payload if isinstance(payload, dict) else {"raw": payload}
+    return payload
+
+
+def monerium_api_post(path: str, access_token: str, payload: Dict[str, Any]) -> Any:
+    response = requests.post(
+        f"{MONERIUM_API_BASE}{path}",
+        headers=monerium_api_headers(access_token, json_body=True),
+        json=payload,
+        timeout=MONERIUM_HTTP_TIMEOUT_SEC,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:2000]}
+    if response.status_code >= 400:
+        raise ApiError(
+            "Monerium API request failed.",
+            502,
+            code="MONERIUM_API_REQUEST_FAILED",
+            details={
+                "path": path,
+                "status_code": response.status_code,
+                "response": body,
+                "request": payload,
+            },
+        )
+    return body
 
 
 def monerium_refresh_access_token(refresh_token: str) -> Dict[str, Any]:
@@ -3106,6 +3137,168 @@ def monerium_select_account(profile_payload: Dict[str, Any], *, account_id: str 
         if normalize_monerium_chain(account.get("chain")) == normalized_chain and str(account.get("currency") or "").strip().lower() == normalized_currency:
             return dict(account)
     return {}
+
+
+def monerium_fetch_addresses(access_token: str, *, profile_id: str = "", chain: str = "") -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {}
+    pid = normalize_text(profile_id, 120)
+    if pid:
+        params["profile"] = pid
+    normalized_chain = normalize_monerium_chain(chain)
+    if normalized_chain:
+        params["chain"] = normalized_chain
+    payload = monerium_api_get("/addresses", access_token, params=params or None)
+    items: Any = []
+    if isinstance(payload, dict):
+        items = payload.get("addresses") or payload.get("items") or []
+    elif isinstance(payload, list):
+        items = payload
+    if not isinstance(items, list):
+        return []
+    result: List[Dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            result.append(dict(item))
+    return result
+
+
+def monerium_select_linked_address(addresses: List[Dict[str, Any]], *, requested_address: str = "", chain: str = "", profile_id: str = "") -> Dict[str, Any]:
+    normalized_requested = str(requested_address or "").strip().lower()
+    normalized_chain = normalize_monerium_chain(chain or MONERIUM_DEFAULT_CHAIN)
+    normalized_profile = normalize_text(profile_id, 120)
+    selected: Dict[str, Any] = {}
+    for item in addresses:
+        if not isinstance(item, dict):
+            continue
+        item_address = str(item.get("address") or "").strip()
+        item_profile = normalize_text(item.get("profile"), 120)
+        chains = item.get("chains") if isinstance(item.get("chains"), list) else []
+        normalized_chains = {normalize_monerium_chain(v) for v in chains if normalize_monerium_chain(v)}
+        if normalized_profile and item_profile and item_profile != normalized_profile:
+            continue
+        if normalized_requested and item_address.lower() == normalized_requested:
+            if not normalized_chain or normalized_chain in normalized_chains or not normalized_chains:
+                return dict(item)
+        if not selected and (not normalized_chain or normalized_chain in normalized_chains or not normalized_chains):
+            selected = dict(item)
+    return selected
+
+
+def monerium_fetch_balances(access_token: str, *, chain: str, address: str) -> Dict[str, Any]:
+    normalized_chain = normalize_monerium_chain(chain)
+    normalized_address = str(address or "").strip()
+    if not normalized_chain or not normalized_address:
+        return {"address": normalized_address, "chain": normalized_chain, "balances": []}
+    payload = monerium_api_get(f"/balances/{normalized_chain}/{normalized_address}", access_token)
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {"address": normalized_address, "chain": normalized_chain, "balances": []}
+
+
+def monerium_pick_currency_balance(balances_payload: Dict[str, Any], currency: str) -> Dict[str, Any]:
+    items = balances_payload.get("balances") if isinstance(balances_payload, dict) else []
+    normalized_currency = str(currency or "eur").strip().lower() or "eur"
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and str(item.get("currency") or "").strip().lower() == normalized_currency:
+                return dict(item)
+    return {}
+
+
+def normalize_iban(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).upper()
+
+
+def is_valid_basic_iban(value: Any) -> bool:
+    iban = normalize_iban(value)
+    return bool(re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", iban))
+
+
+def monerium_place_order_message_hint(amount: str, iban: str) -> str:
+    amount_text = normalize_money_amount(amount)
+    iban_text = normalize_iban(iban)
+    now_hint = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%SZ")
+    display_amount = amount_text[:-3] if amount_text.endswith('.00') else amount_text
+    return f"Send EUR {display_amount} to {iban_text} at {now_hint}"
+
+
+def monerium_build_counterpart_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    recipient = payload.get("recipient") if isinstance(payload.get("recipient"), dict) else {}
+    counterpart = payload.get("counterpart") if isinstance(payload.get("counterpart"), dict) else {}
+    if counterpart:
+        return counterpart
+    iban = normalize_iban(recipient.get("iban") or payload.get("iban"))
+    details = recipient.get("details") if isinstance(recipient.get("details"), dict) else {}
+    name = str(recipient.get("name") or details.get("name") or "").strip()
+    first_name = str(recipient.get("first_name") or recipient.get("firstName") or details.get("firstName") or "").strip()
+    last_name = str(recipient.get("last_name") or recipient.get("lastName") or details.get("lastName") or "").strip()
+    country = str(recipient.get("country") or details.get("country") or "").strip().upper()
+    details_payload: Dict[str, Any] = {}
+    if name:
+        details_payload["name"] = name
+    if first_name:
+        details_payload["firstName"] = first_name
+    if last_name:
+        details_payload["lastName"] = last_name
+    if country:
+        details_payload["country"] = country
+    result: Dict[str, Any] = {"identifier": {"standard": "iban", "iban": iban}}
+    if details_payload:
+        result["details"] = details_payload
+    return result
+
+
+def monerium_counterpart_details_complete(counterpart: Dict[str, Any]) -> bool:
+    details = counterpart.get("details") if isinstance(counterpart.get("details"), dict) else {}
+    if not isinstance(details, dict):
+        return False
+    if str(details.get("name") or "").strip() and str(details.get("country") or "").strip():
+        return True
+    if str(details.get("firstName") or "").strip() and str(details.get("lastName") or "").strip() and str(details.get("country") or "").strip():
+        return True
+    return False
+
+
+def monerium_build_order_submit_gate(*, has_source: bool, iban_ok: bool, counterpart_ready: bool, balance_known: bool, balance_ok: bool) -> Dict[str, Any]:
+    if not has_source:
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": "SOURCE_ADDRESS_NOT_LINKED",
+            "next_action": "RECONNECT_SOURCE",
+            "summary": "No linked Monerium source address was found for the selected chain.",
+        }
+    if not iban_ok:
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": "INVALID_IBAN",
+            "next_action": "FIX_INPUT",
+            "summary": "Recipient IBAN is missing or invalid.",
+        }
+    if not counterpart_ready:
+        return {
+            "status": "review_needed",
+            "verdict": "REVERIFY",
+            "reason_code": "COUNTERPART_DETAILS_MISSING",
+            "next_action": "ADD_COUNTERPART_DETAILS",
+            "summary": "Recipient name and country details are still missing for Monerium order submission.",
+        }
+    if balance_known and not balance_ok:
+        return {
+            "status": "blocked",
+            "verdict": "BLOCK",
+            "reason_code": "INSUFFICIENT_FUNDS",
+            "next_action": "FUND_SOURCE",
+            "summary": "Linked Monerium source balance looks lower than the requested amount.",
+        }
+    return {
+        "status": "verified",
+        "verdict": "SAFE",
+        "reason_code": "OK",
+        "next_action": "SIGN_AND_SUBMIT_TO_MONERIUM",
+        "summary": "Source address, recipient details, and order inputs are ready for Monerium signature and submission.",
+    }
 
 
 def normalize_money_amount(value: Any) -> str:
@@ -5836,6 +6029,10 @@ def monerium_details():
         profile_payload = {"id": profile_id, "name": profile_stub.get("name") or "", "kyc": {}}
 
     selected_account = monerium_select_account(profile_payload, chain=requested_chain, currency=requested_currency) if profile_detail_available else {}
+    linked_addresses = monerium_fetch_addresses(access_token, profile_id=profile_id, chain=requested_chain)
+    selected_linked_address = monerium_select_linked_address(linked_addresses, chain=requested_chain, profile_id=profile_id)
+    selected_balances = monerium_fetch_balances(access_token, chain=requested_chain, address=str(selected_linked_address.get("address") or "")) if selected_linked_address else {"address": "", "chain": requested_chain, "balances": []}
+    selected_balance = monerium_pick_currency_balance(selected_balances, requested_currency)
     accounts = profile_payload.get("accounts") if isinstance(profile_payload, dict) else []
     account_summaries: List[Dict[str, Any]] = []
     if isinstance(accounts, list):
@@ -5883,6 +6080,12 @@ def monerium_details():
         "profile_detail_available": profile_detail_available,
         "profile_detail_error": profile_detail_error if not profile_detail_available else {},
         "accounts": account_summaries,
+        "linked_addresses": linked_addresses,
+        "selected_linked_address": selected_linked_address or None,
+        "selected_balance": {
+            "currency": str(selected_balance.get("currency") or requested_currency).strip().lower(),
+            "amount": str(selected_balance.get("amount") or ""),
+        } if selected_balance else None,
         "selected_account": {
             "id": normalize_text(selected_account.get("id"), 120),
             "chain": normalize_monerium_chain(selected_account.get("chain")),
@@ -6006,6 +6209,207 @@ def monerium_transfer_preview():
                 "memo": provided.get("memo") or "",
             },
         },
+    })
+
+
+@app.post("/api/integrations/monerium/order-draft")
+def monerium_order_draft():
+    payload = request.get_json(silent=True) or {}
+    connection_id = normalize_text(payload.get("connection_id") or request.args.get("connection_id"), 120)
+    requested_profile_id = normalize_text(payload.get("profile_id"), 120)
+    requested_chain = normalize_monerium_chain(payload.get("chain") or MONERIUM_DEFAULT_CHAIN)
+    requested_currency = str(payload.get("currency") or "eur").strip().lower() or "eur"
+    requested_source_address = str(payload.get("source_address") or payload.get("address") or "").strip()
+    amount = normalize_money_amount(payload.get("amount"))
+    counterpart = monerium_build_counterpart_from_payload(payload)
+    iban = normalize_iban(((counterpart.get("identifier") or {}) if isinstance(counterpart.get("identifier"), dict) else {}).get("iban"))
+
+    live = monerium_ensure_live_connection(connection_id)
+    record = live["record"]
+    access_token = str(live.get("access_token") or "")
+    context_payload = monerium_fetch_auth_context(access_token)
+    profile_id = monerium_select_profile_id(context_payload, requested_profile_id)
+    if not profile_id:
+        raise ApiError("No Monerium profile is available for this connection.", 404, code="MONERIUM_PROFILE_NOT_FOUND")
+    profile_stub = monerium_select_profile_stub(context_payload, requested_profile_id)
+
+    linked_addresses = monerium_fetch_addresses(access_token, profile_id=profile_id, chain=requested_chain)
+    source_address_record = monerium_select_linked_address(linked_addresses, requested_address=requested_source_address, chain=requested_chain, profile_id=profile_id)
+    source_address = str(source_address_record.get("address") or "").strip()
+    balances_payload = monerium_fetch_balances(access_token, chain=requested_chain, address=source_address) if source_address else {"address": "", "chain": requested_chain, "balances": []}
+    balance_item = monerium_pick_currency_balance(balances_payload, requested_currency)
+    balance_amount = str(balance_item.get("amount") or "").strip()
+    balance_known = bool(balance_amount)
+    balance_ok = True
+    if balance_known:
+        try:
+            balance_ok = Decimal(balance_amount) >= Decimal(amount)
+        except Exception:
+            balance_ok = True
+
+    counterpart_ready = monerium_counterpart_details_complete(counterpart)
+    iban_ok = is_valid_basic_iban(iban)
+    gate = monerium_build_order_submit_gate(
+        has_source=bool(source_address),
+        iban_ok=iban_ok,
+        counterpart_ready=counterpart_ready,
+        balance_known=balance_known,
+        balance_ok=balance_ok,
+    )
+    submit_ready = str(gate.get("verdict") or "").upper() == "SAFE"
+    message_hint = monerium_place_order_message_hint(amount, iban) if iban_ok else ""
+    memo = str(payload.get("memo") or "PayeeProof transfer").strip() or "PayeeProof transfer"
+    reference_number = str(payload.get("reference_number") or payload.get("referenceNumber") or "").strip()
+    order_payload = {
+        "address": source_address,
+        "currency": requested_currency,
+        "chain": requested_chain,
+        "kind": "redeem",
+        "amount": amount,
+        "counterpart": counterpart,
+        "memo": memo,
+    }
+    if reference_number:
+        order_payload["referenceNumber"] = reference_number
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "version": APP_VERSION,
+        "configured": bool(monerium_is_configured()),
+        "connected": True,
+        "draft_id": f"mod_{uuid.uuid4().hex[:20]}",
+        "profile": {
+            "id": profile_id,
+            "name": profile_stub.get("name") or "",
+            "kind": profile_stub.get("kind") or "",
+            "perms": profile_stub.get("perms") or [],
+        },
+        "source": {
+            "connection_id": record.get("connection_id") or "",
+            "profile_id": profile_id,
+            "chain": requested_chain,
+            "currency": requested_currency,
+            "token_symbol": monerium_token_symbol(requested_currency),
+            "linked_address": source_address,
+            "linked_addresses": linked_addresses,
+            "balance": {
+                "currency": str(balance_item.get("currency") or requested_currency).strip().lower(),
+                "amount": balance_amount,
+                "known": balance_known,
+                "sufficient": balance_ok if balance_known else None,
+            },
+        },
+        "recipient": {
+            "iban": iban,
+            "iban_valid": iban_ok,
+            "counterpart": counterpart,
+            "counterpart_ready": counterpart_ready,
+        },
+        "gate": gate,
+        "submit_ready": submit_ready,
+        "signing": {
+            "signature_required": True,
+            "message_hint": message_hint,
+            "sdk_hint": "Use Monerium SDK placeOrderMessage(amount, iban) on the frontend, sign it with the linked wallet, then call /api/integrations/monerium/place-order.",
+        },
+        "monerium_order_payload": order_payload,
+        "next_step": "sign_and_submit_to_monerium" if submit_ready else str(gate.get("next_action") or "fix_input").lower(),
+    })
+
+
+@app.post("/api/integrations/monerium/place-order")
+def monerium_place_order():
+    payload = request.get_json(silent=True) or {}
+    connection_id = normalize_text(payload.get("connection_id") or request.args.get("connection_id"), 120)
+    requested_profile_id = normalize_text(payload.get("profile_id"), 120)
+    requested_chain = normalize_monerium_chain(payload.get("chain") or MONERIUM_DEFAULT_CHAIN)
+    requested_currency = str(payload.get("currency") or "eur").strip().lower() or "eur"
+    requested_source_address = str(payload.get("source_address") or payload.get("address") or "").strip()
+    amount = normalize_money_amount(payload.get("amount"))
+    counterpart = monerium_build_counterpart_from_payload(payload)
+    iban = normalize_iban(((counterpart.get("identifier") or {}) if isinstance(counterpart.get("identifier"), dict) else {}).get("iban"))
+    signature = str(payload.get("signature") or "").strip()
+    message = str(payload.get("message") or "").strip()
+    if not signature:
+        raise ApiError("Monerium wallet signature is required.", 400, code="MONERIUM_SIGNATURE_REQUIRED")
+    if not message:
+        raise ApiError("Monerium signed message is required.", 400, code="MONERIUM_MESSAGE_REQUIRED")
+
+    live = monerium_ensure_live_connection(connection_id)
+    record = live["record"]
+    access_token = str(live.get("access_token") or "")
+    context_payload = monerium_fetch_auth_context(access_token)
+    profile_id = monerium_select_profile_id(context_payload, requested_profile_id)
+    if not profile_id:
+        raise ApiError("No Monerium profile is available for this connection.", 404, code="MONERIUM_PROFILE_NOT_FOUND")
+
+    linked_addresses = monerium_fetch_addresses(access_token, profile_id=profile_id, chain=requested_chain)
+    source_address_record = monerium_select_linked_address(linked_addresses, requested_address=requested_source_address, chain=requested_chain, profile_id=profile_id)
+    source_address = str(source_address_record.get("address") or "").strip()
+    balances_payload = monerium_fetch_balances(access_token, chain=requested_chain, address=source_address) if source_address else {"address": "", "chain": requested_chain, "balances": []}
+    balance_item = monerium_pick_currency_balance(balances_payload, requested_currency)
+    balance_amount = str(balance_item.get("amount") or "").strip()
+    balance_known = bool(balance_amount)
+    balance_ok = True
+    if balance_known:
+        try:
+            balance_ok = Decimal(balance_amount) >= Decimal(amount)
+        except Exception:
+            balance_ok = True
+
+    gate = monerium_build_order_submit_gate(
+        has_source=bool(source_address),
+        iban_ok=is_valid_basic_iban(iban),
+        counterpart_ready=monerium_counterpart_details_complete(counterpart),
+        balance_known=balance_known,
+        balance_ok=balance_ok,
+    )
+    if str(gate.get("verdict") or "").upper() != "SAFE":
+        raise ApiError(
+            str(gate.get("summary") or "Monerium order is not ready."),
+            400,
+            code=str(gate.get("reason_code") or "MONERIUM_ORDER_NOT_READY"),
+            details={"gate": gate},
+        )
+
+    memo = str(payload.get("memo") or "PayeeProof transfer").strip() or "PayeeProof transfer"
+    reference_number = str(payload.get("reference_number") or payload.get("referenceNumber") or "").strip()
+    order_request = {
+        "address": source_address,
+        "currency": requested_currency,
+        "chain": requested_chain,
+        "kind": "redeem",
+        "amount": amount,
+        "counterpart": counterpart,
+        "message": message,
+        "signature": signature,
+        "memo": memo,
+    }
+    if reference_number:
+        order_request["referenceNumber"] = reference_number
+    supporting_document_id = normalize_text(payload.get("supportingDocumentId") or payload.get("supporting_document_id"), 120)
+    if supporting_document_id:
+        order_request["supportingDocumentId"] = supporting_document_id
+
+    order_response = monerium_api_post("/orders", access_token, order_request)
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "version": APP_VERSION,
+        "configured": bool(monerium_is_configured()),
+        "connected": True,
+        "submitted": True,
+        "source": {
+            "connection_id": record.get("connection_id") or "",
+            "profile_id": profile_id,
+            "chain": requested_chain,
+            "currency": requested_currency,
+            "linked_address": source_address,
+        },
+        "gate": gate,
+        "monerium_order_request": order_request,
+        "monerium_order": order_response,
+        "next_step": "wait_for_monerium_processing",
     })
 
 
