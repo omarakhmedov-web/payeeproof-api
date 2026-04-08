@@ -210,6 +210,7 @@ ALERT_TIMEOUT_RATE_THRESHOLD = float(os.getenv("ALERT_TIMEOUT_RATE_THRESHOLD", "
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "600"))
 PUBLIC_API_BASE = os.getenv("PUBLIC_API_BASE", "https://payeeproof-api.onrender.com").rstrip("/")
 MONERIUM_API_BASE = os.getenv("MONERIUM_API_BASE", "https://api.monerium.dev").rstrip("/")
+MONERIUM_V2_ACCEPT = os.getenv("MONERIUM_V2_ACCEPT", "application/vnd.monerium.api-v2+json")
 MONERIUM_AUTH_CLIENT_ID = os.getenv("MONERIUM_AUTH_CLIENT_ID", "").strip()
 MONERIUM_CLIENT_SECRET = os.getenv("MONERIUM_CLIENT_SECRET", "").strip()
 MONERIUM_REDIRECT_URI = os.getenv(
