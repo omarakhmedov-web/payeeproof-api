@@ -32,7 +32,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.5.5-monerium-sandbox-chainfix"
+APP_VERSION = "2.5.6-monerium-variant-fallback"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -3199,15 +3199,30 @@ def monerium_fetch_addresses(access_token: str, *, profile_id: str = "", chain: 
     candidates = monerium_chain_variants(chain) if chain else [""]
     payloads: List[Any] = []
     seen_keys: set = set()
+
     for candidate_chain in candidates:
         params: Dict[str, Any] = {}
         if pid:
             params["profile"] = pid
         if candidate_chain:
             params["chain"] = candidate_chain
-        payloads.append(monerium_api_get("/addresses", access_token, params=params or None))
-    # Sandbox fallback: if filtered requests returned nothing, retry once without chain filter.
-    payloads.append(monerium_api_get("/addresses", access_token, params={"profile": pid} if pid else None))
+        try:
+            payload = monerium_api_get("/addresses", access_token, params=params or None)
+            payloads.append(payload)
+        except ApiError as exc:
+            if str(exc.code or "") != "MONERIUM_API_REQUEST_FAILED":
+                raise
+            continue
+
+    # Sandbox fallback: if filtered requests returned nothing or variant probes fail,
+    # retry once without chain filter and use whatever Monerium returns.
+    try:
+        payloads.append(monerium_api_get("/addresses", access_token, params={"profile": pid} if pid else None))
+    except ApiError as exc:
+        if str(exc.code or "") != "MONERIUM_API_REQUEST_FAILED":
+            raise
+        if not payloads:
+            raise
 
     result: List[Dict[str, Any]] = []
     for payload in payloads:
@@ -3262,16 +3277,25 @@ def monerium_fetch_balances(access_token: str, *, chain: str, address: str) -> D
     normalized_address = str(address or "").strip()
     if not normalized_address:
         return {"address": normalized_address, "chain": normalize_monerium_chain(chain), "balances": []}
+    last_error: Optional[ApiError] = None
     for candidate_chain in monerium_chain_variants(chain):
         if not candidate_chain:
             continue
-        payload = monerium_api_get(f"/balances/{candidate_chain}/{normalized_address}", access_token)
+        try:
+            payload = monerium_api_get(f"/balances/{candidate_chain}/{normalized_address}", access_token)
+        except ApiError as exc:
+            if str(exc.code or "") != "MONERIUM_API_REQUEST_FAILED":
+                raise
+            last_error = exc
+            continue
         if isinstance(payload, dict):
             balances = payload.get("balances")
             if isinstance(balances, list) and balances:
                 return dict(payload)
             if str(payload.get("address") or "").strip():
                 return dict(payload)
+    if last_error and not monerium_chain_variants(chain):
+        raise last_error
     return {"address": normalized_address, "chain": normalize_monerium_chain(chain), "balances": []}
 
 
