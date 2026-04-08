@@ -1,9 +1,11 @@
+import base64
 import hashlib
 import hmac
 import html
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 import uuid
@@ -26,10 +28,10 @@ from threading import Lock, Thread
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
-from flask import Flask, g, jsonify, request, has_request_context
+from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.3.1-nowpayments-ipnfix"
+APP_VERSION = "2.4.0-monerium-oauth-v0"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -206,6 +208,18 @@ ALERT_ERROR_RATE_THRESHOLD = float(os.getenv("ALERT_ERROR_RATE_THRESHOLD", "0.35
 ALERT_TIMEOUT_RATE_THRESHOLD = float(os.getenv("ALERT_TIMEOUT_RATE_THRESHOLD", "0.20"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "600"))
 PUBLIC_API_BASE = os.getenv("PUBLIC_API_BASE", "https://payeeproof-api.onrender.com").rstrip("/")
+MONERIUM_API_BASE = os.getenv("MONERIUM_API_BASE", "https://api.monerium.dev").rstrip("/")
+MONERIUM_AUTH_CLIENT_ID = os.getenv("MONERIUM_AUTH_CLIENT_ID", "").strip()
+MONERIUM_CLIENT_SECRET = os.getenv("MONERIUM_CLIENT_SECRET", "").strip()
+MONERIUM_REDIRECT_URI = os.getenv(
+    "MONERIUM_REDIRECT_URI",
+    f"{PUBLIC_API_BASE}/api/integrations/monerium/callback",
+).strip()
+MONERIUM_HTTP_TIMEOUT_SEC = float(os.getenv("MONERIUM_HTTP_TIMEOUT_SEC", "15"))
+MONERIUM_OAUTH_STATE_TTL_SEC = int(os.getenv("MONERIUM_OAUTH_STATE_TTL_SEC", "1800"))
+MONERIUM_DEFAULT_CHAIN = os.getenv("MONERIUM_DEFAULT_CHAIN", "ethereum").strip().lower() or "ethereum"
+MONERIUM_SKIP_KYC_DEFAULT = str(os.getenv("MONERIUM_SKIP_KYC_DEFAULT", "0")).strip().lower() in {"1", "true", "yes", "on"}
+MONERIUM_ALLOWED_CHAINS = {"ethereum", "arbitrum", "base", "polygon"}
 PLAN_LIMITS_JSON = os.getenv("PLAN_LIMITS_JSON", "").strip()
 DEFAULT_RECORDS_MAX_PAGE_SIZE = int(os.getenv("DEFAULT_RECORDS_MAX_PAGE_SIZE", "100"))
 WEBHOOK_DELIVERY_TIMEOUT_SEC = float(os.getenv("WEBHOOK_DELIVERY_TIMEOUT_SEC", "10"))
@@ -1881,6 +1895,98 @@ def append_url_query(url: str, params: Dict[str, Any]) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+def monerium_is_configured() -> bool:
+    return bool(MONERIUM_API_BASE and MONERIUM_AUTH_CLIENT_ID and MONERIUM_REDIRECT_URI)
+
+
+def parse_bool_flag(value: Any, default: bool = False) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
+def normalize_monerium_chain(value: Any) -> str:
+    candidate = str(value or MONERIUM_DEFAULT_CHAIN or "ethereum").strip().lower()
+    normalized = CHAIN_ALIASES.get(candidate, candidate)
+    if normalized not in MONERIUM_ALLOWED_CHAINS:
+        normalized = MONERIUM_DEFAULT_CHAIN if MONERIUM_DEFAULT_CHAIN in MONERIUM_ALLOWED_CHAINS else "ethereum"
+    return normalized
+
+
+def monerium_pkce_verifier() -> str:
+    return secrets.token_urlsafe(72)[:96]
+
+
+def monerium_pkce_challenge(code_verifier: str) -> str:
+    digest = hashlib.sha256(str(code_verifier or "").encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+
+def monerium_authorize_url(*, state: str, code_challenge: str, chain: str, skip_kyc: bool = False) -> str:
+    params: Dict[str, Any] = {
+        "client_id": MONERIUM_AUTH_CLIENT_ID,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "redirect_uri": MONERIUM_REDIRECT_URI,
+        "state": state,
+        "chain": normalize_monerium_chain(chain),
+    }
+    if skip_kyc:
+        params["skip_kyc"] = "true"
+    return append_url_query(f"{MONERIUM_API_BASE}/auth", params)
+
+
+def normalize_monerium_return_to(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    host = (parsed.hostname or "").strip().lower()
+    if not host or host not in set(PUBLIC_DEMO_HOSTS) | set(_split_origin_hosts(PUBLIC_DEMO_ORIGINS)) | set(_split_origin_hosts(",".join(allowed_origins))):
+        return ""
+    return raw
+
+
+def monerium_response_page(title: str, message: str, *, status_code: int = 200, details: Optional[Dict[str, Any]] = None) -> Tuple[str, int, Dict[str, str]]:
+    title_html = html.escape(str(title or "Monerium"))
+    message_html = html.escape(str(message or ""))
+    detail_html = ""
+    if isinstance(details, dict) and details:
+        items = []
+        for key, value in details.items():
+            if value in (None, "", [], {}):
+                continue
+            items.append(f"<li><strong>{html.escape(str(key))}:</strong> {html.escape(str(value))}</li>")
+        if items:
+            detail_html = '<ul style="margin-top:14px;line-height:1.6;">' + "".join(items) + "</ul>"
+    page = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>{title_html}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background:#0F172A; color:#E5E7EB; margin:0; padding:32px; }}
+    .card {{ max-width:720px; margin:48px auto; background:#111827; border:1px solid #1F2937; border-radius:16px; padding:28px; box-shadow:0 10px 30px rgba(0,0,0,.25); }}
+    h1 {{ margin:0 0 12px; font-size:30px; }}
+    p {{ margin:0; font-size:16px; line-height:1.6; color:#CBD5E1; }}
+    code {{ background:#0B1220; padding:2px 6px; border-radius:6px; }}
+  </style>
+</head>
+<body>
+  <div class=\"card\">
+    <h1>{title_html}</h1>
+    <p>{message_html}</p>
+    {detail_html}
+  </div>
+</body>
+</html>"""
+    return page, status_code, {"Content-Type": "text/html; charset=utf-8"}
+
+
 def nowpayments_redirect_urls(order_id: str) -> Tuple[str, str]:
     success_url = append_url_query(NOWPAYMENTS_SUCCESS_URL, {"order_id": order_id, "source": "nowpayments"})
     cancel_url = append_url_query(NOWPAYMENTS_CANCEL_URL, {"order_id": order_id, "source": "nowpayments"})
@@ -2518,6 +2624,235 @@ def safe_json_loads(value: Any, default: Any) -> Any:
 
 def normalize_text(value: Any, max_len: int = 300) -> str:
     return str(value or "").strip()[:max_len]
+
+
+def monerium_state_id() -> str:
+    return f"mnst_{uuid.uuid4().hex[:20]}"
+
+
+def monerium_connection_id() -> str:
+    return f"mnc_{uuid.uuid4().hex[:20]}"
+
+
+def monerium_context_user_id(context_payload: Dict[str, Any]) -> str:
+    if not isinstance(context_payload, dict):
+        return ""
+    for key in ("userId", "user_id", "sub", "id"):
+        value = context_payload.get(key)
+        if value:
+            return normalize_text(value, 120)
+    user_obj = context_payload.get("user")
+    if isinstance(user_obj, dict):
+        for key in ("id", "userId", "email"):
+            value = user_obj.get(key)
+            if value:
+                return normalize_text(value, 120)
+    return ""
+
+
+def monerium_context_auth_method(context_payload: Dict[str, Any]) -> str:
+    if not isinstance(context_payload, dict):
+        return ""
+    for key in ("authentication_method", "authenticationMethod", "method", "auth_method"):
+        value = context_payload.get(key)
+        if value:
+            return normalize_text(value, 80)
+    auth_obj = context_payload.get("authentication")
+    if isinstance(auth_obj, dict):
+        for key in ("method", "type"):
+            value = auth_obj.get(key)
+            if value:
+                return normalize_text(value, 80)
+    return ""
+
+
+def create_monerium_oauth_state(*, state: str, code_verifier: str, chain: str, return_to: str = "") -> None:
+    now = utc_now_iso()
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            INSERT INTO monerium_oauth_states(
+                state, created_at, updated_at, status, chain, code_verifier, return_to, request_ip
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (state, now, now, "pending", normalize_monerium_chain(chain), code_verifier, return_to, get_client_ip()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_monerium_oauth_state(state: str) -> Dict[str, Any]:
+    conn = get_db()
+    try:
+        row = db_fetchone(conn, "SELECT * FROM monerium_oauth_states WHERE state = ? LIMIT 1", (state,))
+        return row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def update_monerium_oauth_state(state: str, **fields: Any) -> None:
+    allowed = {
+        "updated_at", "status", "chain", "return_to", "request_ip",
+        "error_code", "error_description", "authorization_code", "connection_id"
+    }
+    set_parts = []
+    params: List[Any] = []
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        set_parts.append(f"{key} = ?")
+        params.append(value)
+    if not set_parts:
+        return
+    params.append(state)
+    conn = get_db()
+    try:
+        db_execute(conn, f"UPDATE monerium_oauth_states SET {', '.join(set_parts)} WHERE state = ?", tuple(params))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def store_monerium_connection(*, state: str, chain: str, token_payload: Dict[str, Any], context_payload: Dict[str, Any]) -> Dict[str, Any]:
+    now = utc_now_iso()
+    connection_id = monerium_connection_id()
+    expires_in = None
+    try:
+        expires_in = int(token_payload.get("expires_in")) if token_payload.get("expires_in") is not None else None
+    except Exception:
+        expires_in = None
+    expires_at = None
+    if expires_in and expires_in > 0:
+        expires_at = datetime.fromtimestamp(time.time() + expires_in, tz=timezone.utc).replace(microsecond=0).isoformat()
+    profiles = context_payload.get("profiles") if isinstance(context_payload, dict) else []
+    conn = get_db()
+    try:
+        db_execute(
+            conn,
+            """
+            INSERT INTO monerium_connections(
+                connection_id, created_at, updated_at, status, chain, state, access_token, refresh_token, token_type,
+                expires_in, expires_at, context_user_id, context_auth_method, context_profiles_json, raw_token_json, raw_context_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                connection_id,
+                now,
+                now,
+                "connected",
+                normalize_monerium_chain(chain),
+                state,
+                normalize_text(token_payload.get("access_token"), 4096),
+                normalize_text(token_payload.get("refresh_token"), 4096),
+                normalize_text(token_payload.get("token_type"), 80),
+                expires_in,
+                expires_at,
+                monerium_context_user_id(context_payload),
+                monerium_context_auth_method(context_payload),
+                json.dumps(profiles if isinstance(profiles, list) else [], ensure_ascii=False),
+                json.dumps(token_payload or {}, ensure_ascii=False),
+                json.dumps(context_payload or {}, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "connection_id": connection_id,
+        "created_at": now,
+        "updated_at": now,
+        "status": "connected",
+        "chain": normalize_monerium_chain(chain),
+        "state": state,
+        "expires_at": expires_at or "",
+        "context_user_id": monerium_context_user_id(context_payload),
+        "context_auth_method": monerium_context_auth_method(context_payload),
+        "profiles_total": len(profiles) if isinstance(profiles, list) else 0,
+    }
+
+
+def fetch_monerium_connection(connection_id: str = "") -> Dict[str, Any]:
+    conn = get_db()
+    try:
+        if connection_id:
+            row = db_fetchone(conn, "SELECT * FROM monerium_connections WHERE connection_id = ? LIMIT 1", (normalize_text(connection_id, 120),))
+        else:
+            row = db_fetchone(conn, "SELECT * FROM monerium_connections ORDER BY created_at DESC LIMIT 1")
+        data = row_to_dict(row)
+    finally:
+        conn.close()
+    if data.get("context_profiles_json"):
+        try:
+            data["context_profiles"] = json.loads(data.get("context_profiles_json") or "[]")
+        except Exception:
+            data["context_profiles"] = []
+    else:
+        data["context_profiles"] = []
+    return data
+
+
+def monerium_exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, Any]:
+    response = requests.post(
+        f"{MONERIUM_API_BASE}/auth/token",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        },
+        data={
+            "grant_type": "authorization_code",
+            "client_id": MONERIUM_AUTH_CLIENT_ID,
+            "code": code,
+            "code_verifier": code_verifier,
+            "redirect_uri": MONERIUM_REDIRECT_URI,
+        },
+        timeout=MONERIUM_HTTP_TIMEOUT_SEC,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text[:2000]}
+    if response.status_code >= 400:
+        raise ApiError(
+            "Monerium token exchange failed.",
+            502,
+            code="MONERIUM_TOKEN_EXCHANGE_FAILED",
+            details={
+                "status_code": response.status_code,
+                "response": payload,
+            },
+        )
+    return payload if isinstance(payload, dict) else {"raw": payload}
+
+
+def monerium_fetch_auth_context(access_token: str) -> Dict[str, Any]:
+    response = requests.get(
+        f"{MONERIUM_API_BASE}/auth/context",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
+        },
+        timeout=MONERIUM_HTTP_TIMEOUT_SEC,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text[:2000]}
+    if response.status_code >= 400:
+        raise ApiError(
+            "Monerium auth context fetch failed.",
+            502,
+            code="MONERIUM_CONTEXT_FAILED",
+            details={
+                "status_code": response.status_code,
+                "response": payload,
+            },
+        )
+    return payload if isinstance(payload, dict) else {"raw": payload}
 
 
 def row_to_dict(row: Any) -> Dict[str, Any]:
@@ -4455,6 +4790,128 @@ def ensure_db() -> None:
                 )
                 """
             )
+        if db_is_postgres():
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS monerium_oauth_states (
+                  id BIGSERIAL PRIMARY KEY,
+                  state TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  chain TEXT,
+                  code_verifier TEXT NOT NULL,
+                  return_to TEXT,
+                  request_ip TEXT,
+                  error_code TEXT,
+                  error_description TEXT,
+                  authorization_code TEXT,
+                  connection_id TEXT
+                )
+                """
+            )
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS monerium_connections (
+                  id BIGSERIAL PRIMARY KEY,
+                  connection_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  chain TEXT,
+                  state TEXT,
+                  access_token TEXT,
+                  refresh_token TEXT,
+                  token_type TEXT,
+                  expires_in INTEGER,
+                  expires_at TEXT,
+                  context_user_id TEXT,
+                  context_auth_method TEXT,
+                  context_profiles_json TEXT,
+                  raw_token_json TEXT,
+                  raw_context_json TEXT
+                )
+                """
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS monerium_oauth_states (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  state TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  chain TEXT,
+                  code_verifier TEXT NOT NULL,
+                  return_to TEXT,
+                  request_ip TEXT,
+                  error_code TEXT,
+                  error_description TEXT,
+                  authorization_code TEXT,
+                  connection_id TEXT
+                )
+                """
+            )
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS monerium_connections (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  connection_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  chain TEXT,
+                  state TEXT,
+                  access_token TEXT,
+                  refresh_token TEXT,
+                  token_type TEXT,
+                  expires_in INTEGER,
+                  expires_at TEXT,
+                  context_user_id TEXT,
+                  context_auth_method TEXT,
+                  context_profiles_json TEXT,
+                  raw_token_json TEXT,
+                  raw_context_json TEXT
+                )
+                """
+            )
+        ensure_column(conn, "monerium_oauth_states", "state", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "created_at", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "updated_at", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "status", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "chain", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "code_verifier", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "return_to", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "request_ip", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "error_code", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "error_description", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "authorization_code", "TEXT")
+        ensure_column(conn, "monerium_oauth_states", "connection_id", "TEXT")
+        ensure_column(conn, "monerium_connections", "connection_id", "TEXT")
+        ensure_column(conn, "monerium_connections", "created_at", "TEXT")
+        ensure_column(conn, "monerium_connections", "updated_at", "TEXT")
+        ensure_column(conn, "monerium_connections", "status", "TEXT")
+        ensure_column(conn, "monerium_connections", "chain", "TEXT")
+        ensure_column(conn, "monerium_connections", "state", "TEXT")
+        ensure_column(conn, "monerium_connections", "access_token", "TEXT")
+        ensure_column(conn, "monerium_connections", "refresh_token", "TEXT")
+        ensure_column(conn, "monerium_connections", "token_type", "TEXT")
+        ensure_column(conn, "monerium_connections", "expires_in", "INTEGER")
+        ensure_column(conn, "monerium_connections", "expires_at", "TEXT")
+        ensure_column(conn, "monerium_connections", "context_user_id", "TEXT")
+        ensure_column(conn, "monerium_connections", "context_auth_method", "TEXT")
+        ensure_column(conn, "monerium_connections", "context_profiles_json", "TEXT")
+        ensure_column(conn, "monerium_connections", "raw_token_json", "TEXT")
+        ensure_column(conn, "monerium_connections", "raw_context_json", "TEXT")
+        db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_monerium_oauth_states_state ON monerium_oauth_states(state)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_monerium_oauth_states_created_at ON monerium_oauth_states(created_at)")
+        db_execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_monerium_connections_connection_id ON monerium_connections(connection_id)")
+        db_execute(conn, "CREATE INDEX IF NOT EXISTS idx_monerium_connections_created_at ON monerium_connections(created_at)")
         ensure_column(conn, "nowpayments_orders", "order_id", "TEXT")
         ensure_column(conn, "nowpayments_orders", "created_at", "TEXT")
         ensure_column(conn, "nowpayments_orders", "updated_at", "TEXT")
@@ -4770,6 +5227,12 @@ def health():
             "nowpayments_configured": bool(nowpayments_is_configured()),
             "nowpayments_products": sorted(list(NOWPAYMENTS_PRODUCTS.keys())),
         },
+        "integrations": {
+            "monerium_configured": bool(monerium_is_configured()),
+            "monerium_api_base": MONERIUM_API_BASE,
+            "monerium_redirect_uri": MONERIUM_REDIRECT_URI,
+            "monerium_default_chain": normalize_monerium_chain(MONERIUM_DEFAULT_CHAIN),
+        },
         "trace_id": current_request_id(),
         "observability": {
             "request_id_header": "X-Request-ID",
@@ -4798,7 +5261,174 @@ def root():
             "/api/payments/nowpayments/invoice",
             "/api/payments/nowpayments/order/<order_id>",
             "/api/payments/nowpayments/ipn",
+            "/api/integrations/monerium/start",
+            "/api/integrations/monerium/callback",
+            "/api/integrations/monerium/status",
         ]
+    })
+
+
+@app.get("/api/integrations/monerium/start")
+def monerium_start():
+    enforce_public_origin_if_present()
+    if not monerium_is_configured():
+        raise ApiError("Monerium integration is not configured.", 503, code="MONERIUM_NOT_CONFIGURED")
+    chain = normalize_monerium_chain(request.args.get("chain") or MONERIUM_DEFAULT_CHAIN)
+    skip_kyc = parse_bool_flag(request.args.get("skip_kyc"), MONERIUM_SKIP_KYC_DEFAULT)
+    return_to = normalize_monerium_return_to(request.args.get("return_to"))
+    state = monerium_state_id()
+    code_verifier = monerium_pkce_verifier()
+    code_challenge = monerium_pkce_challenge(code_verifier)
+    create_monerium_oauth_state(state=state, code_verifier=code_verifier, chain=chain, return_to=return_to)
+    authorize_url = monerium_authorize_url(state=state, code_challenge=code_challenge, chain=chain, skip_kyc=skip_kyc)
+    record_request_event(
+        event_name="monerium_oauth_start",
+        endpoint="/api/integrations/monerium/start",
+        status="success",
+        reason_code="REDIRECT_CREATED",
+        network=chain,
+        http_status=302,
+        metadata={"state": state, "skip_kyc": skip_kyc, "return_to": return_to},
+    )
+    if str(request.args.get("mode") or "").strip().lower() == "json":
+        return jsonify({
+            "ok": True,
+            "trace_id": current_request_id(),
+            "state": state,
+            "chain": chain,
+            "authorize_url": authorize_url,
+            "redirect_uri": MONERIUM_REDIRECT_URI,
+        })
+    return redirect(authorize_url, code=302)
+
+
+@app.get("/api/integrations/monerium/callback")
+def monerium_callback():
+    if not monerium_is_configured():
+        raise ApiError("Monerium integration is not configured.", 503, code="MONERIUM_NOT_CONFIGURED")
+    state = normalize_text(request.args.get("state"), 200)
+    code = normalize_text(request.args.get("code"), 1000)
+    error_code = normalize_text(request.args.get("error"), 120)
+    error_description = normalize_text(request.args.get("error_description"), 500)
+    if not state:
+        return monerium_response_page("Monerium callback error", "Missing state parameter.", status_code=400, details={"trace_id": current_request_id()})
+    oauth_state = fetch_monerium_oauth_state(state)
+    if not oauth_state:
+        return monerium_response_page("Monerium callback error", "Unknown or expired state.", status_code=400, details={"trace_id": current_request_id(), "state": state})
+    created_ts = oauth_state.get("created_at") or ""
+    try:
+        created_dt = datetime.fromisoformat(str(created_ts).replace("Z", "+00:00"))
+        age_sec = max(0, int((datetime.now(timezone.utc) - created_dt).total_seconds()))
+    except Exception:
+        age_sec = 0
+    if age_sec and age_sec > MONERIUM_OAUTH_STATE_TTL_SEC:
+        update_monerium_oauth_state(state, updated_at=utc_now_iso(), status="expired", error_code="STATE_EXPIRED", error_description="OAuth state expired.")
+        return monerium_response_page("Monerium callback expired", "The connection attempt expired. Start again.", status_code=400, details={"trace_id": current_request_id(), "state": state})
+    if str(oauth_state.get("status") or "").strip().lower() not in {"pending", "started"}:
+        return monerium_response_page("Monerium callback already used", "This connection attempt has already been completed.", status_code=400, details={"trace_id": current_request_id(), "state": state})
+    if error_code:
+        update_monerium_oauth_state(state, updated_at=utc_now_iso(), status="error", error_code=error_code, error_description=error_description)
+        record_request_event(
+            event_name="monerium_oauth_callback",
+            endpoint="/api/integrations/monerium/callback",
+            status="rejected",
+            reason_code=error_code or "AUTH_ERROR",
+            network=normalize_monerium_chain(oauth_state.get("chain") or MONERIUM_DEFAULT_CHAIN),
+            http_status=400,
+            metadata={"state": state, "error_description": error_description},
+        )
+        return monerium_response_page("Monerium authorization error", error_description or error_code or "Authorization was not completed.", status_code=400, details={"trace_id": current_request_id(), "state": state})
+    if not code:
+        update_monerium_oauth_state(state, updated_at=utc_now_iso(), status="error", error_code="CODE_MISSING", error_description="Missing authorization code.")
+        return monerium_response_page("Monerium callback error", "Missing authorization code.", status_code=400, details={"trace_id": current_request_id(), "state": state})
+    try:
+        token_payload = monerium_exchange_code_for_token(code, str(oauth_state.get("code_verifier") or ""))
+        access_token = normalize_text(token_payload.get("access_token"), 4096)
+        if not access_token:
+            raise ApiError("Monerium access token missing in response.", 502, code="MONERIUM_ACCESS_TOKEN_MISSING")
+        context_payload = monerium_fetch_auth_context(access_token)
+        stored = store_monerium_connection(
+            state=state,
+            chain=normalize_monerium_chain(oauth_state.get("chain") or MONERIUM_DEFAULT_CHAIN),
+            token_payload=token_payload,
+            context_payload=context_payload,
+        )
+        update_monerium_oauth_state(
+            state,
+            updated_at=utc_now_iso(),
+            status="connected",
+            authorization_code=code,
+            connection_id=stored.get("connection_id"),
+        )
+        record_request_event(
+            event_name="monerium_oauth_callback",
+            endpoint="/api/integrations/monerium/callback",
+            status="success",
+            reason_code="CONNECTED",
+            network=stored.get("chain") or normalize_monerium_chain(MONERIUM_DEFAULT_CHAIN),
+            http_status=200,
+            metadata={
+                "state": state,
+                "connection_id": stored.get("connection_id"),
+                "profiles_total": stored.get("profiles_total"),
+            },
+        )
+    except ApiError as exc:
+        update_monerium_oauth_state(state, updated_at=utc_now_iso(), status="error", error_code=exc.code or exc.message, error_description=exc.message)
+        return monerium_response_page("Monerium connection failed", exc.message, status_code=exc.status_code, details={"trace_id": current_request_id(), "state": state})
+    except requests.RequestException as exc:
+        update_monerium_oauth_state(state, updated_at=utc_now_iso(), status="error", error_code="NETWORK_ERROR", error_description=str(exc))
+        return monerium_response_page("Monerium network error", "Could not reach Monerium.", status_code=502, details={"trace_id": current_request_id(), "state": state})
+    return_to = normalize_monerium_return_to(oauth_state.get("return_to"))
+    if return_to:
+        return redirect(append_url_query(return_to, {
+            "source": "monerium",
+            "status": "connected",
+            "connection_id": stored.get("connection_id"),
+        }), code=302)
+    return monerium_response_page(
+        "Monerium connected",
+        "Authorization completed and connection data was stored successfully.",
+        details={
+            "connection_id": stored.get("connection_id"),
+            "chain": stored.get("chain"),
+            "profiles_total": stored.get("profiles_total"),
+            "trace_id": current_request_id(),
+        },
+    )
+
+
+@app.get("/api/integrations/monerium/status")
+def monerium_status():
+    connection_id = normalize_text(request.args.get("connection_id"), 120)
+    record = fetch_monerium_connection(connection_id)
+    if not record:
+        return jsonify({
+            "ok": True,
+            "trace_id": current_request_id(),
+            "configured": bool(monerium_is_configured()),
+            "connected": False,
+            "connection": None,
+        })
+    profiles = record.get("context_profiles") if isinstance(record.get("context_profiles"), list) else []
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "configured": bool(monerium_is_configured()),
+        "connected": str(record.get("status") or "").strip().lower() == "connected",
+        "connection": {
+            "connection_id": record.get("connection_id") or "",
+            "status": record.get("status") or "",
+            "chain": record.get("chain") or "",
+            "created_at": record.get("created_at") or "",
+            "updated_at": record.get("updated_at") or "",
+            "expires_at": record.get("expires_at") or "",
+            "context_user_id": record.get("context_user_id") or "",
+            "context_auth_method": record.get("context_auth_method") or "",
+            "profiles_total": len(profiles),
+            "token_present": bool(record.get("access_token")),
+            "refresh_token_present": bool(record.get("refresh_token")),
+        },
     })
 
 
