@@ -31,7 +31,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.4.0-monerium-oauth-v0"
+APP_VERSION = "2.4.1-monerium-oauth-fix1"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -219,6 +219,9 @@ MONERIUM_HTTP_TIMEOUT_SEC = float(os.getenv("MONERIUM_HTTP_TIMEOUT_SEC", "15"))
 MONERIUM_OAUTH_STATE_TTL_SEC = int(os.getenv("MONERIUM_OAUTH_STATE_TTL_SEC", "1800"))
 MONERIUM_DEFAULT_CHAIN = os.getenv("MONERIUM_DEFAULT_CHAIN", "ethereum").strip().lower() or "ethereum"
 MONERIUM_SKIP_KYC_DEFAULT = str(os.getenv("MONERIUM_SKIP_KYC_DEFAULT", "0")).strip().lower() in {"1", "true", "yes", "on"}
+MONERIUM_INCLUDE_RESPONSE_TYPE = str(os.getenv("MONERIUM_INCLUDE_RESPONSE_TYPE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL = str(os.getenv("MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL", "0")).strip().lower() in {"1", "true", "yes", "on"}
+MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE = str(os.getenv("MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE", "0")).strip().lower() in {"1", "true", "yes", "on"}
 MONERIUM_ALLOWED_CHAINS = {"ethereum", "arbitrum", "base", "polygon"}
 PLAN_LIMITS_JSON = os.getenv("PLAN_LIMITS_JSON", "").strip()
 DEFAULT_RECORDS_MAX_PAGE_SIZE = int(os.getenv("DEFAULT_RECORDS_MAX_PAGE_SIZE", "100"))
@@ -1930,8 +1933,12 @@ def monerium_authorize_url(*, state: str, code_challenge: str, chain: str, skip_
         "code_challenge_method": "S256",
         "redirect_uri": MONERIUM_REDIRECT_URI,
         "state": state,
-        "chain": normalize_monerium_chain(chain),
     }
+    if MONERIUM_INCLUDE_RESPONSE_TYPE:
+        params["response_type"] = "code"
+    normalized_chain = normalize_monerium_chain(chain)
+    if MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL and normalized_chain:
+        params["chain"] = normalized_chain
     if skip_kyc:
         params["skip_kyc"] = "true"
     return append_url_query(f"{MONERIUM_API_BASE}/auth", params)
@@ -2795,6 +2802,15 @@ def fetch_monerium_connection(connection_id: str = "") -> Dict[str, Any]:
 
 
 def monerium_exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, Any]:
+    form_data: Dict[str, Any] = {
+        "grant_type": "authorization_code",
+        "client_id": MONERIUM_AUTH_CLIENT_ID,
+        "code": code,
+        "code_verifier": code_verifier,
+        "redirect_uri": MONERIUM_REDIRECT_URI,
+    }
+    if MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE and MONERIUM_CLIENT_SECRET:
+        form_data["client_secret"] = MONERIUM_CLIENT_SECRET
     response = requests.post(
         f"{MONERIUM_API_BASE}/auth/token",
         headers={
@@ -2802,13 +2818,7 @@ def monerium_exchange_code_for_token(code: str, code_verifier: str) -> Dict[str,
             "Accept": "application/json",
             "User-Agent": "PayeeProof/1.0 (+https://payeeproof.com)",
         },
-        data={
-            "grant_type": "authorization_code",
-            "client_id": MONERIUM_AUTH_CLIENT_ID,
-            "code": code,
-            "code_verifier": code_verifier,
-            "redirect_uri": MONERIUM_REDIRECT_URI,
-        },
+        data=form_data,
         timeout=MONERIUM_HTTP_TIMEOUT_SEC,
     )
     try:
@@ -2816,13 +2826,20 @@ def monerium_exchange_code_for_token(code: str, code_verifier: str) -> Dict[str,
     except Exception:
         payload = {"raw": response.text[:2000]}
     if response.status_code >= 400:
+        error_description = ""
+        error_code = ""
+        if isinstance(payload, dict):
+            error_code = str(payload.get("error") or payload.get("code") or "").strip()
+            error_description = str(payload.get("error_description") or payload.get("message") or "").strip()
+        detail_message = error_description or error_code or "Monerium token exchange failed."
         raise ApiError(
-            "Monerium token exchange failed.",
+            detail_message,
             502,
             code="MONERIUM_TOKEN_EXCHANGE_FAILED",
             details={
                 "status_code": response.status_code,
                 "response": payload,
+                "used_client_secret": bool(MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE and MONERIUM_CLIENT_SECRET),
             },
         )
     return payload if isinstance(payload, dict) else {"raw": payload}
@@ -5232,6 +5249,9 @@ def health():
             "monerium_api_base": MONERIUM_API_BASE,
             "monerium_redirect_uri": MONERIUM_REDIRECT_URI,
             "monerium_default_chain": normalize_monerium_chain(MONERIUM_DEFAULT_CHAIN),
+            "monerium_include_response_type": bool(MONERIUM_INCLUDE_RESPONSE_TYPE),
+            "monerium_include_chain_in_auth_url": bool(MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL),
+            "monerium_use_client_secret_for_auth_code": bool(MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE and MONERIUM_CLIENT_SECRET),
         },
         "trace_id": current_request_id(),
         "observability": {
