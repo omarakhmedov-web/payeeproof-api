@@ -32,7 +32,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.5.3-monerium-draft-submit"
+APP_VERSION = "2.5.5-monerium-sandbox-chainfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -41,11 +41,22 @@ CHAIN_ALIASES = {
     "eth": "ethereum",
     "ethereum": "ethereum",
     "mainnet": "ethereum",
+    "ethereum mainnet": "ethereum",
+    "eth mainnet": "ethereum",
+    "sepolia": "sepolia",
+    "ethereum sepolia": "sepolia",
+    "eth sepolia": "sepolia",
     "arb": "arbitrum",
     "arbitrum": "arbitrum",
+    "arbitrum sepolia": "arbitrum sepolia",
     "base": "base",
+    "base sepolia": "base sepolia",
     "polygon": "polygon",
     "matic": "polygon",
+    "amoy": "amoy",
+    "polygon amoy": "amoy",
+    "chiado": "chiado",
+    "gnosis chiado": "chiado",
     "bsc": "bsc",
     "bnb": "bsc",
     "bnb chain": "bsc",
@@ -224,7 +235,7 @@ MONERIUM_SKIP_KYC_DEFAULT = str(os.getenv("MONERIUM_SKIP_KYC_DEFAULT", "0")).str
 MONERIUM_INCLUDE_RESPONSE_TYPE = str(os.getenv("MONERIUM_INCLUDE_RESPONSE_TYPE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL = str(os.getenv("MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL", "0")).strip().lower() in {"1", "true", "yes", "on"}
 MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE = str(os.getenv("MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE", "0")).strip().lower() in {"1", "true", "yes", "on"}
-MONERIUM_ALLOWED_CHAINS = {"ethereum", "arbitrum", "base", "polygon"}
+MONERIUM_ALLOWED_CHAINS = {"ethereum", "arbitrum", "base", "polygon", "sepolia", "arbitrum sepolia", "base sepolia", "amoy", "chiado"}
 PLAN_LIMITS_JSON = os.getenv("PLAN_LIMITS_JSON", "").strip()
 DEFAULT_RECORDS_MAX_PAGE_SIZE = int(os.getenv("DEFAULT_RECORDS_MAX_PAGE_SIZE", "100"))
 WEBHOOK_DELIVERY_TIMEOUT_SEC = float(os.getenv("WEBHOOK_DELIVERY_TIMEOUT_SEC", "10"))
@@ -1922,6 +1933,49 @@ def normalize_monerium_chain(value: Any) -> str:
         normalized = MONERIUM_DEFAULT_CHAIN if MONERIUM_DEFAULT_CHAIN in MONERIUM_ALLOWED_CHAINS else "ethereum"
     return normalized
 
+def monerium_is_sandbox_env() -> bool:
+    return ".dev" in str(MONERIUM_API_BASE or "").strip().lower()
+
+
+def monerium_chain_variants(chain: Any) -> List[str]:
+    normalized = normalize_monerium_chain(chain or MONERIUM_DEFAULT_CHAIN)
+    variants: List[str] = []
+    def _add(v: Any) -> None:
+        vv = normalize_monerium_chain(v)
+        if vv and vv not in variants:
+            variants.append(vv)
+    _add(normalized)
+    if monerium_is_sandbox_env():
+        if normalized == "ethereum":
+            _add("sepolia")
+        elif normalized == "sepolia":
+            _add("ethereum")
+        elif normalized == "polygon":
+            _add("amoy")
+        elif normalized == "amoy":
+            _add("polygon")
+        elif normalized == "arbitrum":
+            _add("arbitrum sepolia")
+        elif normalized == "arbitrum sepolia":
+            _add("arbitrum")
+        elif normalized == "base":
+            _add("base sepolia")
+        elif normalized == "base sepolia":
+            _add("base")
+    return variants
+
+
+def monerium_effective_source_chain(source_address_record: Dict[str, Any], requested_chain: Any) -> str:
+    item_chain = normalize_monerium_chain(source_address_record.get("chain"))
+    if item_chain:
+        return item_chain
+    chains = source_address_record.get("chains") if isinstance(source_address_record.get("chains"), list) else []
+    for chain in chains:
+        normalized = normalize_monerium_chain(chain)
+        if normalized:
+            return normalized
+    return normalize_monerium_chain(requested_chain)
+
 
 def monerium_pkce_verifier() -> str:
     return secrets.token_urlsafe(72)[:96]
@@ -3141,31 +3195,47 @@ def monerium_select_account(profile_payload: Dict[str, Any], *, account_id: str 
 
 
 def monerium_fetch_addresses(access_token: str, *, profile_id: str = "", chain: str = "") -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {}
     pid = normalize_text(profile_id, 120)
-    if pid:
-        params["profile"] = pid
-    normalized_chain = normalize_monerium_chain(chain)
-    if normalized_chain:
-        params["chain"] = normalized_chain
-    payload = monerium_api_get("/addresses", access_token, params=params or None)
-    items: Any = []
-    if isinstance(payload, dict):
-        items = payload.get("addresses") or payload.get("items") or []
-    elif isinstance(payload, list):
-        items = payload
-    if not isinstance(items, list):
-        return []
+    candidates = monerium_chain_variants(chain) if chain else [""]
+    payloads: List[Any] = []
+    seen_keys: set = set()
+    for candidate_chain in candidates:
+        params: Dict[str, Any] = {}
+        if pid:
+            params["profile"] = pid
+        if candidate_chain:
+            params["chain"] = candidate_chain
+        payloads.append(monerium_api_get("/addresses", access_token, params=params or None))
+    # Sandbox fallback: if filtered requests returned nothing, retry once without chain filter.
+    payloads.append(monerium_api_get("/addresses", access_token, params={"profile": pid} if pid else None))
+
     result: List[Dict[str, Any]] = []
-    for item in items:
-        if isinstance(item, dict):
+    for payload in payloads:
+        items: Any = []
+        if isinstance(payload, dict):
+            items = payload.get("addresses") or payload.get("items") or []
+        elif isinstance(payload, list):
+            items = payload
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            dedupe_key = (
+                str(item.get("id") or "").strip(),
+                str(item.get("address") or "").strip().lower(),
+                normalize_text(item.get("profile"), 120),
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
             result.append(dict(item))
     return result
 
 
 def monerium_select_linked_address(addresses: List[Dict[str, Any]], *, requested_address: str = "", chain: str = "", profile_id: str = "") -> Dict[str, Any]:
     normalized_requested = str(requested_address or "").strip().lower()
-    normalized_chain = normalize_monerium_chain(chain or MONERIUM_DEFAULT_CHAIN)
+    requested_variants = set(monerium_chain_variants(chain or MONERIUM_DEFAULT_CHAIN))
     normalized_profile = normalize_text(profile_id, 120)
     selected: Dict[str, Any] = {}
     for item in addresses:
@@ -3173,27 +3243,36 @@ def monerium_select_linked_address(addresses: List[Dict[str, Any]], *, requested
             continue
         item_address = str(item.get("address") or "").strip()
         item_profile = normalize_text(item.get("profile"), 120)
-        chains = item.get("chains") if isinstance(item.get("chains"), list) else []
-        normalized_chains = {normalize_monerium_chain(v) for v in chains if normalize_monerium_chain(v)}
+        chains_raw = item.get("chains") if isinstance(item.get("chains"), list) else []
+        item_chain = normalize_monerium_chain(item.get("chain"))
+        normalized_chains = {normalize_monerium_chain(v) for v in chains_raw if normalize_monerium_chain(v)}
+        if item_chain:
+            normalized_chains.add(item_chain)
         if normalized_profile and item_profile and item_profile != normalized_profile:
             continue
-        if normalized_requested and item_address.lower() == normalized_requested:
-            if not normalized_chain or normalized_chain in normalized_chains or not normalized_chains:
-                return dict(item)
-        if not selected and (not normalized_chain or normalized_chain in normalized_chains or not normalized_chains):
+        chain_match = (not requested_variants) or bool(normalized_chains & requested_variants) or not normalized_chains
+        if normalized_requested and item_address.lower() == normalized_requested and chain_match:
+            return dict(item)
+        if not selected and chain_match:
             selected = dict(item)
     return selected
 
 
 def monerium_fetch_balances(access_token: str, *, chain: str, address: str) -> Dict[str, Any]:
-    normalized_chain = normalize_monerium_chain(chain)
     normalized_address = str(address or "").strip()
-    if not normalized_chain or not normalized_address:
-        return {"address": normalized_address, "chain": normalized_chain, "balances": []}
-    payload = monerium_api_get(f"/balances/{normalized_chain}/{normalized_address}", access_token)
-    if isinstance(payload, dict):
-        return dict(payload)
-    return {"address": normalized_address, "chain": normalized_chain, "balances": []}
+    if not normalized_address:
+        return {"address": normalized_address, "chain": normalize_monerium_chain(chain), "balances": []}
+    for candidate_chain in monerium_chain_variants(chain):
+        if not candidate_chain:
+            continue
+        payload = monerium_api_get(f"/balances/{candidate_chain}/{normalized_address}", access_token)
+        if isinstance(payload, dict):
+            balances = payload.get("balances")
+            if isinstance(balances, list) and balances:
+                return dict(payload)
+            if str(payload.get("address") or "").strip():
+                return dict(payload)
+    return {"address": normalized_address, "chain": normalize_monerium_chain(chain), "balances": []}
 
 
 def monerium_pick_currency_balance(balances_payload: Dict[str, Any], currency: str) -> Dict[str, Any]:
@@ -6097,7 +6176,7 @@ def monerium_details():
             "standard": str(selected_account.get("standard") or "").strip(),
         } if selected_account else None,
         "requested_source": {
-            "chain": requested_chain,
+            "chain": source_chain,
             "currency": requested_currency,
             "token_symbol": monerium_token_symbol(requested_currency),
         },
@@ -6237,7 +6316,8 @@ def monerium_order_draft():
     linked_addresses = monerium_fetch_addresses(access_token, profile_id=profile_id, chain=requested_chain)
     source_address_record = monerium_select_linked_address(linked_addresses, requested_address=requested_source_address, chain=requested_chain, profile_id=profile_id)
     source_address = str(source_address_record.get("address") or "").strip()
-    balances_payload = monerium_fetch_balances(access_token, chain=requested_chain, address=source_address) if source_address else {"address": "", "chain": requested_chain, "balances": []}
+    source_chain = monerium_effective_source_chain(source_address_record, requested_chain)
+    balances_payload = monerium_fetch_balances(access_token, chain=source_chain, address=source_address) if source_address else {"address": "", "chain": source_chain, "balances": []}
     balance_item = monerium_pick_currency_balance(balances_payload, requested_currency)
     balance_amount = str(balance_item.get("amount") or "").strip()
     balance_known = bool(balance_amount)
@@ -6264,7 +6344,7 @@ def monerium_order_draft():
     order_payload = {
         "address": source_address,
         "currency": requested_currency,
-        "chain": requested_chain,
+        "chain": source_chain,
         "kind": "redeem",
         "amount": amount,
         "counterpart": counterpart,
@@ -6347,7 +6427,8 @@ def monerium_place_order():
     linked_addresses = monerium_fetch_addresses(access_token, profile_id=profile_id, chain=requested_chain)
     source_address_record = monerium_select_linked_address(linked_addresses, requested_address=requested_source_address, chain=requested_chain, profile_id=profile_id)
     source_address = str(source_address_record.get("address") or "").strip()
-    balances_payload = monerium_fetch_balances(access_token, chain=requested_chain, address=source_address) if source_address else {"address": "", "chain": requested_chain, "balances": []}
+    source_chain = monerium_effective_source_chain(source_address_record, requested_chain)
+    balances_payload = monerium_fetch_balances(access_token, chain=source_chain, address=source_address) if source_address else {"address": "", "chain": source_chain, "balances": []}
     balance_item = monerium_pick_currency_balance(balances_payload, requested_currency)
     balance_amount = str(balance_item.get("amount") or "").strip()
     balance_known = bool(balance_amount)
@@ -6378,7 +6459,7 @@ def monerium_place_order():
     order_request = {
         "address": source_address,
         "currency": requested_currency,
-        "chain": requested_chain,
+        "chain": source_chain,
         "kind": "redeem",
         "amount": amount,
         "counterpart": counterpart,
