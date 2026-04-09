@@ -32,7 +32,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.5.8-monerium-counterpart-namefix"
+APP_VERSION = "2.6.0-monerium-status-demo"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -357,6 +357,8 @@ def resolve_required_api_scope(path: str) -> str:
         return API_SCOPE_BY_PATH[normalized]
     if normalized == "/api/verification-records" or normalized.startswith("/api/verification-records/"):
         return "records"
+    if normalized.startswith("/api/integrations/monerium/order-status/"):
+        return "preflight"
     return ""
 
 
@@ -3001,6 +3003,93 @@ def monerium_api_post(path: str, access_token: str, payload: Dict[str, Any]) -> 
             },
         )
     return body
+
+
+def monerium_extract_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("items", "orders", "data", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if payload.get("id"):
+            return [payload]
+    return []
+
+
+def monerium_order_state_text(order: Dict[str, Any]) -> str:
+    return str(order.get("state") or order.get("status") or "").strip().lower()
+
+
+def monerium_order_phase(order: Dict[str, Any]) -> str:
+    state = monerium_order_state_text(order)
+    if state in {"processed", "completed", "credited", "settled", "executed", "confirmed", "succeeded", "paid", "done"}:
+        return "credited"
+    if state in {"failed", "rejected", "cancelled", "canceled", "expired"}:
+        return "failed"
+    if state in {"pending", "created", "submitted", "queued", "processing", "in_progress", "initiated"}:
+        return "processing"
+    return state or "unknown"
+
+
+def monerium_order_phase_label(phase: str) -> str:
+    normalized = str(phase or "").strip().lower()
+    if normalized == "credited":
+        return "Funds credited"
+    if normalized == "failed":
+        return "Order failed"
+    if normalized == "processing":
+        return "Processing"
+    return normalized.replace("_", " ").title() if normalized else "Unknown"
+
+
+def monerium_order_summary(order: Dict[str, Any]) -> Dict[str, Any]:
+    counterpart = order.get("counterpart") if isinstance(order.get("counterpart"), dict) else {}
+    details = counterpart.get("details") if isinstance(counterpart.get("details"), dict) else {}
+    identifier = counterpart.get("identifier") if isinstance(counterpart.get("identifier"), dict) else {}
+    meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+    phase = monerium_order_phase(order)
+    recipient_name = str(details.get("name") or "").strip()
+    if not recipient_name:
+        recipient_name = " ".join(part for part in [str(details.get("firstName") or "").strip(), str(details.get("lastName") or "").strip()] if part).strip()
+    return {
+        "order_id": normalize_text(order.get("id"), 120),
+        "state": monerium_order_state_text(order) or "unknown",
+        "phase": phase,
+        "phase_label": monerium_order_phase_label(phase),
+        "amount": normalize_money_amount(order.get("amount")),
+        "currency": str(order.get("currency") or "").strip().lower(),
+        "chain": normalize_monerium_chain(order.get("chain")),
+        "wallet_address": str(order.get("address") or "").strip(),
+        "recipient_iban": normalize_iban(identifier.get("iban")),
+        "recipient_name": recipient_name,
+        "recipient_country": str(details.get("country") or "").strip().upper(),
+        "memo": str(order.get("memo") or "").strip(),
+        "kind": str(order.get("kind") or "").strip().lower(),
+        "placed_at": str(meta.get("placedAt") or order.get("createdAt") or order.get("placedAt") or "").strip(),
+        "updated_at": str(meta.get("updatedAt") or order.get("updatedAt") or order.get("processedAt") or order.get("completedAt") or "").strip(),
+    }
+
+
+def monerium_fetch_order_by_id(access_token: str, order_id: str) -> Dict[str, Any]:
+    target = normalize_text(order_id, 120)
+    if not target:
+        raise ApiError("Monerium order_id is required.", 400, code="MONERIUM_ORDER_ID_REQUIRED")
+    payload = monerium_api_get("/orders", access_token)
+    items = monerium_extract_items(payload)
+    for item in items:
+        if normalize_text(item.get("id"), 120) == target:
+            return item
+    raise ApiError(
+        "Monerium order was not found for this connection.",
+        404,
+        code="MONERIUM_ORDER_NOT_FOUND",
+        details={
+            "order_id": target,
+            "items_scanned": len(items),
+        },
+    )
 
 
 def monerium_refresh_access_token(refresh_token: str) -> Dict[str, Any]:
@@ -6522,6 +6611,7 @@ def monerium_place_order():
         order_request["supportingDocumentId"] = supporting_document_id
 
     order_response = monerium_api_post("/orders", access_token, order_request)
+    order_summary = monerium_order_summary(order_response if isinstance(order_response, dict) else {})
     return jsonify({
         "ok": True,
         "trace_id": current_request_id(),
@@ -6539,9 +6629,50 @@ def monerium_place_order():
         "gate": gate,
         "monerium_order_request": order_request,
         "monerium_order": order_response,
+        "order_status": {
+            "state": order_summary.get("state") or "unknown",
+            "phase": order_summary.get("phase") or "unknown",
+            "phase_label": order_summary.get("phase_label") or "Unknown",
+        },
+        "order_summary": order_summary,
+        "refresh_path": f"/api/integrations/monerium/order-status/{order_summary.get('order_id')}",
         "next_step": "wait_for_monerium_processing",
     })
 
+
+@app.get("/api/integrations/monerium/order-status/<order_id>")
+def monerium_order_status(order_id: str):
+    requested_order_id = normalize_text(order_id, 120)
+    connection_id = normalize_text(request.args.get("connection_id"), 120)
+    if not requested_order_id:
+        raise ApiError("Monerium order_id is required.", 400, code="MONERIUM_ORDER_ID_REQUIRED")
+    live = monerium_ensure_live_connection(connection_id)
+    record = live["record"]
+    access_token = str(live.get("access_token") or "")
+    order = monerium_fetch_order_by_id(access_token, requested_order_id)
+    order_summary = monerium_order_summary(order)
+    phase = str(order_summary.get("phase") or "unknown")
+    next_step = "wait_for_monerium_processing" if phase == "processing" else ("done" if phase == "credited" else "review_order_status")
+    return jsonify({
+        "ok": True,
+        "trace_id": current_request_id(),
+        "version": APP_VERSION,
+        "configured": bool(monerium_is_configured()),
+        "connected": True,
+        "source": {
+            "connection_id": record.get("connection_id") or "",
+            "chain": record.get("chain") or "",
+        },
+        "order": order,
+        "order_summary": order_summary,
+        "order_status": {
+            "state": order_summary.get("state") or "unknown",
+            "phase": phase,
+            "phase_label": order_summary.get("phase_label") or "Unknown",
+        },
+        "refresh_path": f"/api/integrations/monerium/order-status/{requested_order_id}",
+        "next_step": next_step,
+    })
 
 
 @app.get("/api/integrations/monerium/status")
