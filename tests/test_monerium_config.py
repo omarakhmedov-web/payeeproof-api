@@ -14,7 +14,6 @@ def test_normalize_monerium_chain_uses_alias_and_fallback():
 
 def test_monerium_chain_variants_expand_only_in_dev_sandbox():
     assert monerium_chain_variants("ethereum", api_base="https://api.monerium.dev") == ["ethereum", "sepolia"]
-    assert monerium_chain_variants("arbitrum", api_base="https://api.monerium.dev") == ["arbitrum", "arbitrum sepolia"]
     assert monerium_chain_variants("polygon", api_base="https://api.monerium.dev") == ["polygon", "amoy"]
     assert monerium_chain_variants("ethereum", api_base="https://api.monerium.com") == ["ethereum"]
 
@@ -24,3 +23,9 @@ def test_effective_source_chain_prefers_precise_linked_variant():
     source = {"chain": "ethereum", "chains": ["sepolia"]}
     resolved = monerium_effective_source_chain(source, "ethereum", api_base="https://api.monerium.dev")
     assert resolved == "sepolia"
+
+
+def test_normalize_monerium_chain_compact_sandbox_aliases() -> None:
+    assert normalize_monerium_chain("arbitrumsepolia") == "arbitrum sepolia"
+    assert normalize_monerium_chain("basesepolia") == "base sepolia"
+    assert normalize_monerium_chain("polygonamoy") == "amoy"
