@@ -8,9 +8,14 @@ import threading
 import pytest
 
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 @pytest.fixture(scope='session')
 def app_module(tmp_path_factory):
-    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    repo_root = REPO_ROOT
     db_dir = tmp_path_factory.mktemp('db')
     db_path = db_dir / 'payeeproof_test.db'
 
