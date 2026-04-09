@@ -32,7 +32,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.5.6-monerium-variant-fallback"
+APP_VERSION = "2.5.7-monerium-submit-chainfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1966,15 +1966,25 @@ def monerium_chain_variants(chain: Any) -> List[str]:
 
 
 def monerium_effective_source_chain(source_address_record: Dict[str, Any], requested_chain: Any) -> str:
+    requested = normalize_monerium_chain(requested_chain)
+    requested_variants = monerium_chain_variants(requested)
+    chains = source_address_record.get("chains") if isinstance(source_address_record.get("chains"), list) else []
+    normalized_chains = [normalize_monerium_chain(chain) for chain in chains if normalize_monerium_chain(chain)]
+
+    # In sandbox Monerium may expose a generic top-level chain like "ethereum"
+    # while the actual linked/testnet chain is carried in `chains` as "sepolia".
+    # For submit paths we must prefer the precise linked chain variant, otherwise
+    # /orders can fail with "<address> not linked on ethereum".
+    if normalized_chains:
+        for candidate in normalized_chains:
+            if candidate in requested_variants:
+                return candidate
+        return normalized_chains[0]
+
     item_chain = normalize_monerium_chain(source_address_record.get("chain"))
     if item_chain:
         return item_chain
-    chains = source_address_record.get("chains") if isinstance(source_address_record.get("chains"), list) else []
-    for chain in chains:
-        normalized = normalize_monerium_chain(chain)
-        if normalized:
-            return normalized
-    return normalize_monerium_chain(requested_chain)
+    return requested
 
 
 def monerium_pkce_verifier() -> str:
