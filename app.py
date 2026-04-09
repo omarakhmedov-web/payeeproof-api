@@ -57,7 +57,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.6.1-monerium-modular-foundation"
+APP_VERSION = "2.6.2-monerium-arbitrum-accountfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -3187,17 +3187,26 @@ def monerium_select_account(profile_payload: Dict[str, Any], *, account_id: str 
         return {}
     normalized_account_id = normalize_text(account_id, 120)
     normalized_chain = normalize_monerium_chain(chain or MONERIUM_DEFAULT_CHAIN)
+    requested_variants = set(monerium_chain_variants(normalized_chain))
     normalized_currency = str(currency or "eur").strip().lower() or "eur"
     if normalized_account_id:
         for account in accounts:
             if isinstance(account, dict) and normalize_text(account.get("id"), 120) == normalized_account_id:
                 return dict(account)
+    selected: Dict[str, Any] = {}
     for account in accounts:
         if not isinstance(account, dict):
             continue
-        if normalize_monerium_chain(account.get("chain")) == normalized_chain and str(account.get("currency") or "").strip().lower() == normalized_currency:
+        account_chain = normalize_monerium_chain(account.get("chain"))
+        account_currency = str(account.get("currency") or "").strip().lower()
+        if account_currency != normalized_currency:
+            continue
+        chain_match = (not requested_variants) or (account_chain in requested_variants) or (not account_chain)
+        if chain_match:
             return dict(account)
-    return {}
+        if not selected and account_chain == normalized_chain:
+            selected = dict(account)
+    return selected
 
 
 def monerium_fetch_addresses(access_token: str, *, profile_id: str = "", chain: str = "") -> List[Dict[str, Any]]:
