@@ -14,6 +14,7 @@ def test_normalize_monerium_chain_uses_alias_and_fallback():
 
 def test_monerium_chain_variants_expand_only_in_dev_sandbox():
     assert monerium_chain_variants("ethereum", api_base="https://api.monerium.dev") == ["ethereum", "sepolia"]
+    assert monerium_chain_variants("arbitrum", api_base="https://api.monerium.dev") == ["arbitrum", "arbitrum sepolia"]
     assert monerium_chain_variants("polygon", api_base="https://api.monerium.dev") == ["polygon", "amoy"]
     assert monerium_chain_variants("ethereum", api_base="https://api.monerium.com") == ["ethereum"]
 
