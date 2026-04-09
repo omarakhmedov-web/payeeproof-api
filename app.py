@@ -32,7 +32,7 @@ import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
 
-APP_VERSION = "2.5.7-monerium-submit-chainfix"
+APP_VERSION = "2.5.8-monerium-counterpart-namefix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -3347,6 +3347,20 @@ def monerium_build_counterpart_from_payload(payload: Dict[str, Any]) -> Dict[str
     first_name = str(recipient.get("first_name") or recipient.get("firstName") or details.get("firstName") or "").strip()
     last_name = str(recipient.get("last_name") or recipient.get("lastName") or details.get("lastName") or "").strip()
     country = str(recipient.get("country") or details.get("country") or "").strip().upper()
+
+    if name and (not first_name or not last_name):
+        parts = [part for part in name.split() if part]
+        if len(parts) >= 2:
+            if not first_name:
+                first_name = parts[0]
+            if not last_name:
+                last_name = " ".join(parts[1:])
+        elif len(parts) == 1:
+            if not first_name:
+                first_name = parts[0]
+            if not last_name:
+                last_name = parts[0]
+
     details_payload: Dict[str, Any] = {}
     if name:
         details_payload["name"] = name
