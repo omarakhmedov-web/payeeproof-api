@@ -57,7 +57,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.6.9-monerium-polygon-amoy-fix"
+APP_VERSION = "2.6.9-monerium-polygon-amoy-submitfix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -80,6 +80,9 @@ CHAIN_ALIASES = {
     "matic": "polygon",
     "amoy": "amoy",
     "polygon amoy": "amoy",
+    "polygon-amoy": "amoy",
+    "polygon_amoy": "amoy",
+    "polygonamoy": "amoy",
     "chiado": "chiado",
     "gnosis chiado": "chiado",
     "bsc": "bsc",
@@ -1981,12 +1984,22 @@ def monerium_effective_source_chain(source_address_record: Dict[str, Any], reque
 
 
 def monerium_api_chain_value(chain: Any) -> str:
+    raw = str(chain or "").strip().lower()
+    if raw in {"polygonamoy", "polygon amoy", "polygon-amoy", "polygon_amoy"}:
+        return "amoy"
     normalized = normalize_monerium_chain(chain or MONERIUM_DEFAULT_CHAIN)
     return {
         "arbitrum sepolia": "arbitrumsepolia",
         "base sepolia": "basesepolia",
         "amoy": "amoy",
     }.get(normalized, normalized)
+
+
+def monerium_order_api_chain_value(chain: Any) -> str:
+    value = monerium_api_chain_value(chain)
+    if str(value or "").strip().lower() in {"polygonamoy", "polygon amoy", "polygon-amoy", "polygon_amoy"}:
+        return "amoy"
+    return value
 
 
 def monerium_api_chain_variants(chain: Any) -> List[str]:
@@ -6173,7 +6186,7 @@ def monerium_details():
             "standard": str(selected_account.get("standard") or "").strip(),
         } if selected_account else None,
         "requested_source": {
-            "chain": monerium_api_chain_value(source_chain),
+            "chain": monerium_order_api_chain_value(source_chain),
             "currency": requested_currency,
             "token_symbol": monerium_token_symbol(requested_currency),
         },
@@ -6341,7 +6354,7 @@ def monerium_order_draft():
     order_payload = {
         "address": source_address,
         "currency": requested_currency,
-        "chain": monerium_api_chain_value(source_chain),
+        "chain": monerium_order_api_chain_value(source_chain),
         "kind": "redeem",
         "amount": amount,
         "counterpart": counterpart,
@@ -6456,7 +6469,7 @@ def monerium_place_order():
     order_request = {
         "address": source_address,
         "currency": requested_currency,
-        "chain": monerium_api_chain_value(source_chain),
+        "chain": monerium_order_api_chain_value(source_chain),
         "kind": "redeem",
         "amount": amount,
         "counterpart": counterpart,
