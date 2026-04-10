@@ -59,3 +59,18 @@ def test_monerium_select_account_keeps_exact_match_outside_sandbox():
 
     assert selected['id'] == 'acc_arb'
     assert selected['chain'] == 'arbitrum'
+
+
+def test_monerium_select_account_matches_base_sandbox_variant():
+    select_account = load_select_account('https://api.monerium.dev')
+    profile_payload = {
+        'accounts': [
+            {'id': 'acc_eth', 'chain': 'ethereum', 'currency': 'eur', 'address': '0xeth'},
+            {'id': 'acc_base_sep', 'chain': 'basesepolia', 'currency': 'eur', 'address': '0xbase'},
+        ]
+    }
+
+    selected = select_account(profile_payload, chain='base', currency='eur')
+
+    assert selected['id'] == 'acc_base_sep'
+    assert selected['address'] == '0xbase'
