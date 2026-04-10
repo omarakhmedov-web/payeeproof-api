@@ -57,7 +57,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.6.4-monerium-arbitrum-orderchainfix"
+APP_VERSION = "2.6.5-monerium-arbitrum-submit-chain-livefix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -6446,7 +6446,7 @@ def monerium_place_order():
     order_request = {
         "address": source_address,
         "currency": requested_currency,
-        "chain": source_chain,
+        "chain": monerium_api_chain_value(source_chain),
         "kind": "redeem",
         "amount": amount,
         "counterpart": counterpart,
