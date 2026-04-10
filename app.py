@@ -57,7 +57,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.6.5-monerium-arbitrum-submit-chain-livefix"
+APP_VERSION = "2.6.6-monerium-chain-label-cleanup"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -6511,7 +6511,7 @@ def monerium_order_status(order_id: str):
         "connected": True,
         "source": {
             "connection_id": record.get("connection_id") or "",
-            "chain": record.get("chain") or "",
+            "chain": normalize_monerium_chain(order.get("chain") or record.get("chain") or ""),
         },
         "order": order,
         "order_summary": order_summary,
