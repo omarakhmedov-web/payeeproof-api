@@ -57,7 +57,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.6.8-monerium-polygon-sandbox-variants"
+APP_VERSION = "2.6.9-monerium-polygon-amoy-fix"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -74,21 +74,12 @@ CHAIN_ALIASES = {
     "arb": "arbitrum",
     "arbitrum": "arbitrum",
     "arbitrum sepolia": "arbitrum sepolia",
-    "arbitrum-sepolia": "arbitrum sepolia",
-    "arbitrum_sepolia": "arbitrum sepolia",
-    "arbitrumsepolia": "arbitrum sepolia",
     "base": "base",
     "base sepolia": "base sepolia",
-    "base-sepolia": "base sepolia",
-    "base_sepolia": "base sepolia",
-    "basesepolia": "base sepolia",
     "polygon": "polygon",
     "matic": "polygon",
     "amoy": "amoy",
     "polygon amoy": "amoy",
-    "polygon-amoy": "amoy",
-    "polygon_amoy": "amoy",
-    "polygonamoy": "amoy",
     "chiado": "chiado",
     "gnosis chiado": "chiado",
     "bsc": "bsc",
@@ -1994,7 +1985,7 @@ def monerium_api_chain_value(chain: Any) -> str:
     return {
         "arbitrum sepolia": "arbitrumsepolia",
         "base sepolia": "basesepolia",
-        "amoy": "polygonamoy",
+        "amoy": "amoy",
     }.get(normalized, normalized)
 
 
