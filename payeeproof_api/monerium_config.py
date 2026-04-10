@@ -9,7 +9,7 @@ MONERIUM_CHAIN_REGISTRY: Dict[str, Dict[str, str]] = {
         "sandbox_partner": "sepolia",
     },
     "sepolia": {
-        "label": "Sepolia",
+        "label": "Ethereum Sepolia",
         "wallet_chain_id_hex": "0xaa36a7",
         "sandbox_partner": "ethereum",
     },
