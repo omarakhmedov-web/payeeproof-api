@@ -6124,6 +6124,7 @@ def monerium_details():
     selected_balances = monerium_fetch_balances(access_token, chain=requested_chain, address=str(selected_linked_address.get("address") or "")) if selected_linked_address else {"address": "", "chain": requested_chain, "balances": []}
     selected_balance = monerium_pick_currency_balance(selected_balances, requested_currency)
     accounts = profile_payload.get("accounts") if isinstance(profile_payload, dict) else []
+    source_chain = monerium_effective_source_chain(selected_linked_address or {}, requested_chain)
     account_summaries: List[Dict[str, Any]] = []
     if isinstance(accounts, list):
         for account in accounts:
