@@ -24,6 +24,7 @@ class _FakeResponse:
 
 def test_successful_webhook_delivery_marks_acknowledged(client, api_headers, app_module, monkeypatch):
     monkeypatch.setattr(app_module, 'classify_address', _wallet_stub)
+    monkeypatch.setattr(app_module, 'kick_webhook_processor', lambda force=False: None)
 
     api_key_record = app_module.API_KEYS['pp_test_suite_key']
     api_key_record['webhook_active'] = True
@@ -58,6 +59,9 @@ def test_successful_webhook_delivery_marks_acknowledged(client, api_headers, app
     response = client.post('/api/preflight-check', json=payload, headers=api_headers)
     body = response.get_json()
     record_id = body['record_id']
+
+    assert body['webhook']['delivery_mode'] == 'background'
+    app_module.dispatch_webhook_delivery_now(body['webhook']['delivery_id'])
 
     details_response = client.get(f'/api/verification-records/{record_id}', headers=api_headers)
     details_body = details_response.get_json()
