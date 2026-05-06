@@ -57,7 +57,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.7.0-ai-risk-control-output"
+APP_VERSION = "2.7.1-ai-risk-context-polish"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1509,6 +1509,47 @@ def build_ai_risk_context(verdict: Any, risk_level: str, next_action: Any) -> Di
     }
 
 
+def build_preflight_why_this_verdict(outcome: Dict[str, Any], risk_flags: List[str]) -> str:
+    existing = str((outcome or {}).get("why") or (outcome or {}).get("explanation") or "").strip()
+    reason_code = str((outcome or {}).get("reason_code") or "").strip().upper()
+    verdict = preflight_public_verdict((outcome or {}).get("verdict"))
+    risk_level = str((outcome or {}).get("risk_level") or "MEDIUM").strip().upper()
+
+    reason_explanations = {
+        "OK": "Core payout details match and the destination looks like a normal wallet route.",
+        "NETWORK_MISMATCH": "The submitted payout uses a different network than the approved instructions. This should be blocked and reverified before funds move.",
+        "ASSET_MISMATCH": "The submitted payout asset does not match the approved instructions. This should be blocked and reverified before funds move.",
+        "ADDRESS_MISMATCH": "The provided payout address does not match the approved destination. This should be blocked and reverified before funds move.",
+        "MEMO_MISMATCH": "The memo or destination tag does not match the approved instructions. For venue-style destinations, this can prevent the recipient from being credited.",
+        "INVALID_ADDRESS": "At least one address failed network-specific validation. This should be corrected before any transfer is attempted.",
+        "ZERO_ADDRESS": "The provided destination is the zero address, which is not a valid payout destination.",
+        "UNSUPPORTED_NETWORK": "The selected network is outside the current supported scope, so the payout cannot be verified reliably.",
+        "UNSUPPORTED_ASSET_OR_NETWORK": "The asset and network combination is outside the current supported scope, so the payout cannot be verified reliably.",
+        "DESTINATION_IS_CONTRACT_OR_APP": "The details match, but the destination looks like a contract or app rather than a simple wallet. A small test amount reduces irreversible routing mistakes.",
+        "DESTINATION_IS_BRIDGE_ROUTER": "The details match, but the destination looks like bridge or router infrastructure. A small test amount reduces irreversible routing mistakes.",
+        "DESTINATION_REQUIRES_MEMO_OR_VENUE_CHECK": "The destination looks like a venue-style deposit route. Reconfirm the venue, network, asset, and memo or tag before release.",
+        "DESTINATION_NOT_CLASSIFIED": "The core details match, but the destination could not be classified confidently enough for an automatic green light.",
+        "DESTINATION_LOOKUP_UNAVAILABLE": "The service compared the transfer fields, but live destination classification was unavailable. Retry or route this payout for manual review.",
+    }
+    base = existing or reason_explanations.get(reason_code)
+    if not base:
+        if verdict == "SAFE_TO_SEND":
+            base = "The payout details passed the available checks and are low risk enough to proceed."
+        elif verdict == "DO_NOT_SEND":
+            base = "The payout details triggered a blocking control and should be reverified before release."
+        elif verdict == "SEND_SMALL_AMOUNT":
+            base = "The payout details are not blocked, but the destination profile calls for a small test amount first."
+        else:
+            base = "The payout details require confirmation before release."
+
+    ai_suffix = "In AI-assisted or lean payout operations, PayeeProof acts as the final control before funds move."
+    if "AI-assisted" in base or "final control" in base:
+        return base
+    if risk_level == "LOW" and verdict == "SAFE_TO_SEND":
+        return f"{base} {ai_suffix}"
+    return f"{base} {ai_suffix}"
+
+
 def enrich_preflight_outcome(outcome: Dict[str, Any], risk_flags: List[str]) -> Dict[str, Any]:
     enriched = dict(outcome or {})
     legacy_verdict = preflight_legacy_verdict(enriched.get("verdict"))
@@ -1520,6 +1561,7 @@ def enrich_preflight_outcome(outcome: Dict[str, Any], risk_flags: List[str]) -> 
     enriched["risk_level"] = risk_level
     enriched["confidence_score"] = confidence_score
     enriched["ai_risk_context"] = build_ai_risk_context(public_verdict, risk_level, enriched.get("next_action"))
+    enriched["why"] = build_preflight_why_this_verdict(enriched, risk_flags or [])
     return enriched
 
 
