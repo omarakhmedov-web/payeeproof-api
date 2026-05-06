@@ -57,7 +57,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.6.9-monerium-polygon-amoy-submitfix"
+APP_VERSION = "2.7.0-ai-risk-control-output"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1402,10 +1402,12 @@ def build_destination_profile(chain: str, address: str, onchain: Optional[Dict[s
 
 def preflight_next_step_label(action: str) -> str:
     labels = {
+        "SAFE_TO_SEND": "Safe to send",
         "SAFE_TO_PROCEED": "Proceed with the payment",
         "BLOCK_AND_REVERIFY": "Stop and re-check the details",
         "RECHECK_MEMO_OR_TAG": "Re-check the memo or destination tag",
         "TEST_FIRST": "Send a small test first",
+        "SEND_SMALL_AMOUNT": "Send a small amount first",
         "CHECK_BACKEND": "Retry when the live service is available",
         "MANUAL_REVIEW": "Escalate for manual review",
         "DO_NOT_SEND": "Do not send",
@@ -1414,6 +1416,111 @@ def preflight_next_step_label(action: str) -> str:
         "CONFIRM_DESTINATION": "Confirm the destination before approval",
     }
     return labels.get(str(action or "").upper(), str(action or "").replace("_", " ").title() or "Review required")
+
+
+def preflight_public_verdict(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace(" ", "_")
+    aliases = {
+        "SAFE": "SAFE_TO_SEND",
+        "SAFE_TO_SEND": "SAFE_TO_SEND",
+        "BLOCK": "DO_NOT_SEND",
+        "DO_NOT_SEND": "DO_NOT_SEND",
+        "TEST_FIRST": "SEND_SMALL_AMOUNT",
+        "SEND_SMALL_AMOUNT": "SEND_SMALL_AMOUNT",
+        "REVERIFY": "REVERIFY",
+        "UNAVAILABLE": "UNAVAILABLE",
+    }
+    return aliases.get(normalized, normalized or "REVERIFY")
+
+
+def preflight_legacy_verdict(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace(" ", "_")
+    aliases = {
+        "SAFE_TO_SEND": "SAFE",
+        "SAFE": "SAFE",
+        "DO_NOT_SEND": "BLOCK",
+        "BLOCK": "BLOCK",
+        "SEND_SMALL_AMOUNT": "TEST FIRST",
+        "TEST_FIRST": "TEST FIRST",
+        "REVERIFY": "REVERIFY",
+        "UNAVAILABLE": "UNAVAILABLE",
+    }
+    return aliases.get(normalized, str(value or "").strip() or "REVERIFY")
+
+
+def preflight_is_safe_to_send(value: Any) -> bool:
+    return preflight_public_verdict(value) == "SAFE_TO_SEND"
+
+
+def preflight_risk_level(verdict: Any, risk_flags: List[str], confidence: Any) -> str:
+    public_verdict = preflight_public_verdict(verdict)
+    flags = {str(flag or "").upper() for flag in (risk_flags or [])}
+    if public_verdict == "DO_NOT_SEND" or any(flag in flags for flag in {
+        "NETWORK_MISMATCH",
+        "ASSET_MISMATCH",
+        "ADDRESS_MISMATCH",
+        "MEMO_MISMATCH",
+        "INVALID_ADDRESS",
+        "ZERO_ADDRESS",
+        "UNSUPPORTED_NETWORK",
+        "UNSUPPORTED_ASSET_OR_NETWORK",
+    }):
+        return "HIGH"
+    if public_verdict in {"SEND_SMALL_AMOUNT", "REVERIFY", "UNAVAILABLE"} or flags:
+        return "MEDIUM"
+    if str(confidence or "").strip().lower() in {"limited", "low"}:
+        return "MEDIUM"
+    return "LOW"
+
+
+def preflight_confidence_score(confidence: Any, risk_level: str, risk_flags: List[str]) -> int:
+    base_by_confidence = {
+        "high": 92,
+        "medium": 72,
+        "limited": 42,
+        "low": 35,
+    }
+    base = base_by_confidence.get(str(confidence or "").strip().lower(), 65)
+    risk_penalty = {"LOW": 0, "MEDIUM": 10, "HIGH": 22}.get(str(risk_level or "").upper(), 8)
+    flag_penalty = min(len(set(risk_flags or [])) * 3, 12)
+    return max(1, min(99, base - risk_penalty - flag_penalty))
+
+
+def build_ai_risk_context(verdict: Any, risk_level: str, next_action: Any) -> Dict[str, Any]:
+    public_verdict = preflight_public_verdict(verdict)
+    recommended_by_verdict = {
+        "SAFE_TO_SEND": "SAFE_TO_SEND",
+        "DO_NOT_SEND": "DO_NOT_SEND",
+        "SEND_SMALL_AMOUNT": "SEND_SMALL_AMOUNT",
+        "REVERIFY": "REVERIFY",
+        "UNAVAILABLE": "REVERIFY",
+    }
+    recommendation = recommended_by_verdict.get(public_verdict, str(next_action or "REVERIFY").strip().upper() or "REVERIFY")
+    return {
+        "title": "AI risk context",
+        "signals": [
+            "Fast execution environment detected",
+            "Human verification reduced",
+        ],
+        "risk_level": str(risk_level or "MEDIUM").upper(),
+        "recommended_action": recommendation,
+        "recommendation_label": preflight_next_step_label("TEST_FIRST" if recommendation == "SEND_SMALL_AMOUNT" else recommendation),
+        "summary": "AI-assisted and lean payout teams can move faster than manual review processes. PayeeProof adds the final control before funds move.",
+    }
+
+
+def enrich_preflight_outcome(outcome: Dict[str, Any], risk_flags: List[str]) -> Dict[str, Any]:
+    enriched = dict(outcome or {})
+    legacy_verdict = preflight_legacy_verdict(enriched.get("verdict"))
+    public_verdict = preflight_public_verdict(enriched.get("verdict"))
+    risk_level = preflight_risk_level(public_verdict, risk_flags or [], enriched.get("confidence"))
+    confidence_score = preflight_confidence_score(enriched.get("confidence"), risk_level, risk_flags or [])
+    enriched["legacy_verdict"] = legacy_verdict
+    enriched["verdict"] = public_verdict
+    enriched["risk_level"] = risk_level
+    enriched["confidence_score"] = confidence_score
+    enriched["ai_risk_context"] = build_ai_risk_context(public_verdict, risk_level, enriched.get("next_action"))
+    return enriched
 
 
 POLICY_PROFILE_ALIASES = {
@@ -3501,6 +3608,7 @@ def build_preflight_preview(expected: Dict[str, Any], provided: Dict[str, Any], 
         risk_flags=risk_flags,
         policy_profile=normalized_policy_profile,
     )
+    outcome = enrich_preflight_outcome(outcome, risk_flags)
     checked_at = utc_now_iso()
     return {
         "checked_at": checked_at,
@@ -3508,12 +3616,16 @@ def build_preflight_preview(expected: Dict[str, Any], provided: Dict[str, Any], 
         "policy_profile_label": policy_profile_label(normalized_policy_profile),
         "status": outcome["status"],
         "verdict": outcome["verdict"],
+        "legacy_verdict": outcome["legacy_verdict"],
         "reason_code": outcome["reason_code"],
         "next_action": outcome["next_action"],
         "next_action_label": preflight_next_step_label(outcome["next_action"]),
         "confidence": outcome["confidence"],
+        "confidence_score": outcome["confidence_score"],
+        "risk_level": outcome["risk_level"],
         "summary": outcome["summary"],
         "why_this_verdict": outcome["why"],
+        "ai_risk_context": outcome["ai_risk_context"],
         "risk_flags": sorted(set(risk_flags)),
         "checks": checks,
         "expected": {"network": expected_chain, "asset": expected_asset, "address": expected_address, "memo": expected_memo},
@@ -3532,7 +3644,10 @@ def build_preflight_preview(expected: Dict[str, Any], provided: Dict[str, Any], 
             "chain": provided_chain,
             "trace_id": current_request_id(),
             "verdict": outcome["verdict"],
+            "legacy_verdict": outcome["legacy_verdict"],
             "confidence": outcome["confidence"],
+            "confidence_score": outcome["confidence_score"],
+            "risk_level": outcome["risk_level"],
             "reason_code": outcome["reason_code"],
             "next_action": outcome["next_action"],
             "next_action_label": preflight_next_step_label(outcome["next_action"]),
@@ -6248,7 +6363,7 @@ def monerium_transfer_preview():
         }
 
     gate = build_preflight_preview(expected, provided, policy_profile=payload.get("policy_profile") or "payout_strict")
-    ready = str(gate.get("verdict") or "").upper() == "SAFE" and str(gate.get("next_action") or "").upper() == "SAFE_TO_PROCEED"
+    ready = preflight_is_safe_to_send(gate.get("verdict")) and str(gate.get("next_action") or "").upper() == "SAFE_TO_PROCEED"
     transfer_preview_id = f"mtp_{uuid.uuid4().hex[:20]}"
     return jsonify({
         "ok": True,
@@ -6937,6 +7052,7 @@ def preflight_check():
         risk_flags=risk_flags,
         policy_profile=policy_profile,
     )
+    outcome = enrich_preflight_outcome(outcome, risk_flags)
 
     checked_at = utc_now_iso()
     log_api_access("/api/preflight-check")
@@ -6950,7 +7066,10 @@ def preflight_check():
         timeout_flag=looks_like_timeout(provided_onchain.get("details")) or looks_like_timeout(expected_onchain.get("details")),
         metadata={
             "verdict": outcome["verdict"],
+            "legacy_verdict": outcome["legacy_verdict"],
             "next_action": outcome["next_action"],
+            "risk_level": outcome["risk_level"],
+            "confidence_score": outcome["confidence_score"],
             "risk_flags": sorted(set(risk_flags)),
             "policy_profile": policy_profile,
         },
@@ -6966,13 +7085,17 @@ def preflight_check():
         "policy_profile_label": policy_profile_label(policy_profile),
         "status": outcome["status"],
         "verdict": outcome["verdict"],
+        "legacy_verdict": outcome["legacy_verdict"],
         "reason_code": outcome["reason_code"],
         "next_action": outcome["next_action"],
         "next_action_label": preflight_next_step_label(outcome["next_action"]),
         "confidence": outcome["confidence"],
+        "confidence_score": outcome["confidence_score"],
+        "risk_level": outcome["risk_level"],
         "summary": outcome["summary"],
         "why_this_verdict": outcome["why"],
         "explanation": outcome["why"],
+        "ai_risk_context": outcome["ai_risk_context"],
         "risk_flags": sorted(set(risk_flags)),
         "checks": checks,
         "proof": {
@@ -6980,7 +7103,10 @@ def preflight_check():
             "chain": provided_chain,
             "trace_id": current_request_id(),
             "verdict": outcome["verdict"],
+            "legacy_verdict": outcome["legacy_verdict"],
             "confidence": outcome["confidence"],
+            "confidence_score": outcome["confidence_score"],
+            "risk_level": outcome["risk_level"],
             "reason_code": outcome["reason_code"],
             "next_action": outcome["next_action"],
             "next_action_label": preflight_next_step_label(outcome["next_action"]),
@@ -7040,6 +7166,9 @@ def preflight_check():
         metadata={
             "next_action": outcome["next_action"],
             "confidence": outcome["confidence"],
+            "confidence_score": outcome["confidence_score"],
+            "risk_level": outcome["risk_level"],
+            "legacy_verdict": outcome["legacy_verdict"],
             "policy_profile": policy_profile,
         },
     )
@@ -7379,7 +7508,7 @@ def fetch_recent_summary_examples(access: Dict[str, Any], since_iso: str, limit:
             SELECT created_at, service, network, verdict, reason_code, reference_id
             FROM verification_records
             WHERE tenant_id = ? AND environment = ? AND created_at >= ?
-              AND UPPER(REPLACE(COALESCE(verdict, ''), ' ', '_')) IN ('BLOCK', 'REVERIFY', 'TEST_FIRST')
+              AND UPPER(REPLACE(COALESCE(verdict, ''), ' ', '_')) IN ('BLOCK', 'DO_NOT_SEND', 'REVERIFY', 'TEST_FIRST', 'SEND_SMALL_AMOUNT')
             ORDER BY created_at DESC
             LIMIT ?
             """,
@@ -7412,9 +7541,9 @@ def build_weekly_summary_report(access: Dict[str, Any], period: str = "7d") -> D
     display_name = str(access.get("label") or access.get("client") or access.get("tenant_id") or "Client").strip()
 
     checks_count = int(totals.get("checks") or 0)
-    safe_count = _summary_counter_value(verdicts, "SAFE")
-    review_count = _summary_counter_value(verdicts, "REVERIFY", "TEST_FIRST")
-    blocked_count = _summary_counter_value(verdicts, "BLOCK")
+    safe_count = _summary_counter_value(verdicts, "SAFE", "SAFE_TO_SEND")
+    review_count = _summary_counter_value(verdicts, "REVERIFY", "TEST_FIRST", "SEND_SMALL_AMOUNT")
+    blocked_count = _summary_counter_value(verdicts, "BLOCK", "DO_NOT_SEND")
     risky_count = blocked_count + review_count
     timeout_count = int(totals.get("timeouts") or 0)
     avg_duration_ms = float(totals.get("avg_duration_ms") or 0)
@@ -7439,9 +7568,9 @@ def build_weekly_summary_report(access: Dict[str, Any], period: str = "7d") -> D
     top_reason_line = ", ".join(f"{item['label']} ({item['count']})" for item in top_reasons) or "No repeated risk pattern detected."
     top_network_line = ", ".join(f"{item['label']} ({item['count']})" for item in top_networks) or "No active network signal yet."
     verdict_line_parts = [
-        f"SAFE: {safe_count}",
-        f"BLOCK: {blocked_count}",
-        f"REVERIFY / TEST FIRST: {review_count}",
+        f"SAFE_TO_SEND: {safe_count}",
+        f"DO_NOT_SEND: {blocked_count}",
+        f"REVERIFY / SEND_SMALL_AMOUNT: {review_count}",
     ]
     verdict_line = " | ".join(verdict_line_parts)
 
