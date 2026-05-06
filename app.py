@@ -31,6 +31,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import requests
 from flask import Flask, g, jsonify, request, has_request_context, redirect
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 from payeeproof_api.monerium_config import (
     MONERIUM_CHAIN_ALIASES as MONERIUM_REGISTRY_ALIASES,
@@ -57,7 +58,7 @@ from payeeproof_api.monerium_helpers import (
     parse_bool_flag,
 )
 
-APP_VERSION = "2.7.1-ai-risk-context-polish"
+APP_VERSION = "2.7.2-api-log-cleanup"
 TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
 ZERO_EVM = "0x0000000000000000000000000000000000000000"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -267,6 +268,7 @@ MONERIUM_ALLOWED_CHAINS = {"ethereum", "arbitrum", "base", "polygon", "sepolia",
 PLAN_LIMITS_JSON = os.getenv("PLAN_LIMITS_JSON", "").strip()
 DEFAULT_RECORDS_MAX_PAGE_SIZE = int(os.getenv("DEFAULT_RECORDS_MAX_PAGE_SIZE", "100"))
 WEBHOOK_DELIVERY_TIMEOUT_SEC = float(os.getenv("WEBHOOK_DELIVERY_TIMEOUT_SEC", "10"))
+WEBHOOK_INLINE_FIRST_ATTEMPT_ENABLED = str(os.getenv("WEBHOOK_INLINE_FIRST_ATTEMPT_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
 WEBHOOK_RETRY_SCHEDULE_SEC = [
     max(1, int(part.strip()))
     for part in str(os.getenv("WEBHOOK_RETRY_SCHEDULE_SEC", "60,300,1800,7200")).split(",")
@@ -6041,6 +6043,20 @@ def handle_api_error(err: ApiError):
     return jsonify(payload), err.status_code
 
 
+@app.errorhandler(HTTPException)
+def handle_http_exception(err: HTTPException):
+    status_code = int(getattr(err, "code", 500) or 500)
+    reason = str(getattr(err, "name", "HTTP error") or "HTTP error").replace(" ", "_").upper()
+    if not getattr(g, "event_logged", False):
+        record_request_failure(request.path, status_code, reason)
+    return jsonify({
+        "ok": False,
+        "error": reason,
+        "message": str(getattr(err, "description", "HTTP error") or "HTTP error"),
+        "trace_id": current_request_id(),
+    }), status_code
+
+
 @app.errorhandler(Exception)
 def handle_unexpected_error(err: Exception):
     message = f"Unexpected server error: {type(err).__name__}"
@@ -6087,6 +6103,14 @@ def health():
             "alerts": alerts,
         },
     })
+
+
+@app.get("/robots.txt")
+def robots_txt():
+    body = "User-agent: *\nDisallow: /\n"
+    response = app.response_class(body, mimetype="text/plain; charset=utf-8")
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
 
 
 @app.get("/")
@@ -7222,9 +7246,13 @@ def preflight_check():
             "queued": True,
             "delivery_id": delivery_id,
             "event": "preflight_run",
+            "delivery_mode": "inline" if WEBHOOK_INLINE_FIRST_ATTEMPT_ENABLED else "background",
         }
-        delivery_state = dispatch_webhook_delivery_now(delivery_id)
-        if str(delivery_state.get("delivery_status") or "") in {"pending", "retry_scheduled"}:
+        if WEBHOOK_INLINE_FIRST_ATTEMPT_ENABLED:
+            delivery_state = dispatch_webhook_delivery_now(delivery_id)
+            if str(delivery_state.get("delivery_status") or "") in {"pending", "retry_scheduled"}:
+                kick_webhook_processor(force=True)
+        else:
             kick_webhook_processor(force=True)
     return jsonify(response_payload)
 
@@ -7493,9 +7521,13 @@ def recovery_copilot():
             "queued": True,
             "delivery_id": delivery_id,
             "event": "recovery_run",
+            "delivery_mode": "inline" if WEBHOOK_INLINE_FIRST_ATTEMPT_ENABLED else "background",
         }
-        delivery_state = dispatch_webhook_delivery_now(delivery_id)
-        if str(delivery_state.get("delivery_status") or "") in {"pending", "retry_scheduled"}:
+        if WEBHOOK_INLINE_FIRST_ATTEMPT_ENABLED:
+            delivery_state = dispatch_webhook_delivery_now(delivery_id)
+            if str(delivery_state.get("delivery_status") or "") in {"pending", "retry_scheduled"}:
+                kick_webhook_processor(force=True)
+        else:
             kick_webhook_processor(force=True)
     return jsonify(response_payload)
 
