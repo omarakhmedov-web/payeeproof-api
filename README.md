@@ -1,3 +1,4 @@
+[README.md](https://github.com/user-attachments/files/27726740/README.md)
 # PayeeProof API
 
 Backend service for **PayeeProof**.
@@ -19,6 +20,11 @@ The service also supports:
 - account and usage endpoints,
 - webhook delivery for authenticated clients,
 - pilot request intake.
+
+Production-oriented Monerium endpoints require an explicit `connection_id`.
+The older "use latest stored connection" behavior is disabled by default and
+should only be enabled for local sandbox work with
+`MONERIUM_ALLOW_LATEST_CONNECTION_FALLBACK=1`.
 
 ## Current endpoint surface
 ### Core
