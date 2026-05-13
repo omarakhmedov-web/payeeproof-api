@@ -264,6 +264,7 @@ MONERIUM_SKIP_KYC_DEFAULT = str(os.getenv("MONERIUM_SKIP_KYC_DEFAULT", "0")).str
 MONERIUM_INCLUDE_RESPONSE_TYPE = str(os.getenv("MONERIUM_INCLUDE_RESPONSE_TYPE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL = str(os.getenv("MONERIUM_INCLUDE_CHAIN_IN_AUTH_URL", "0")).strip().lower() in {"1", "true", "yes", "on"}
 MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE = str(os.getenv("MONERIUM_USE_CLIENT_SECRET_FOR_AUTH_CODE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+MONERIUM_ALLOW_LATEST_CONNECTION_FALLBACK = str(os.getenv("MONERIUM_ALLOW_LATEST_CONNECTION_FALLBACK", "0")).strip().lower() in {"1", "true", "yes", "on"}
 MONERIUM_ALLOWED_CHAINS = {"ethereum", "arbitrum", "base", "polygon", "sepolia", "arbitrum sepolia", "base sepolia", "amoy", "chiado"}
 PLAN_LIMITS_JSON = os.getenv("PLAN_LIMITS_JSON", "").strip()
 DEFAULT_RECORDS_MAX_PAGE_SIZE = int(os.getenv("DEFAULT_RECORDS_MAX_PAGE_SIZE", "100"))
@@ -332,6 +333,7 @@ API_SCOPE_BY_PATH = {
     "/api/integrations/monerium/transfer-preview": "preflight",
     "/api/integrations/monerium/order-draft": "preflight",
     "/api/integrations/monerium/place-order": "preflight",
+    "/api/integrations/monerium/status": "records",
 }
 
 ALLOWED_ENVIRONMENTS = {"live", "test", "sandbox", "staging", "production", "public-demo"}
@@ -2984,8 +2986,10 @@ def fetch_monerium_connection(connection_id: str = "") -> Dict[str, Any]:
     try:
         if connection_id:
             row = db_fetchone(conn, "SELECT * FROM monerium_connections WHERE connection_id = ? LIMIT 1", (normalize_text(connection_id, 120),))
-        else:
+        elif MONERIUM_ALLOW_LATEST_CONNECTION_FALLBACK:
             row = db_fetchone(conn, "SELECT * FROM monerium_connections ORDER BY created_at DESC LIMIT 1")
+        else:
+            row = None
         data = row_to_dict(row)
     finally:
         conn.close()
@@ -3255,6 +3259,8 @@ def monerium_connection_is_expired(record: Dict[str, Any], skew_sec: int = 60) -
 
 
 def monerium_ensure_live_connection(connection_id: str = "") -> Dict[str, Any]:
+    if not normalize_text(connection_id, 120) and not MONERIUM_ALLOW_LATEST_CONNECTION_FALLBACK:
+        raise ApiError("Monerium connection_id is required.", 400, code="MONERIUM_CONNECTION_ID_REQUIRED")
     record = fetch_monerium_connection(connection_id)
     if not record:
         raise ApiError("No Monerium connection found.", 404, code="MONERIUM_NOT_CONNECTED")
@@ -6733,6 +6739,8 @@ def monerium_order_status(order_id: str):
 @app.get("/api/integrations/monerium/status")
 def monerium_status():
     connection_id = normalize_text(request.args.get("connection_id"), 120)
+    if not connection_id and not MONERIUM_ALLOW_LATEST_CONNECTION_FALLBACK:
+        raise ApiError("Monerium connection_id is required.", 400, code="MONERIUM_CONNECTION_ID_REQUIRED")
     record = fetch_monerium_connection(connection_id)
     if not record:
         return jsonify({
