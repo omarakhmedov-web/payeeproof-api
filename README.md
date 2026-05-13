@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/27726740/README.md)
 # PayeeProof API
 
 Backend service for **PayeeProof**.
