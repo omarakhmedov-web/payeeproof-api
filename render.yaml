@@ -29,3 +29,5 @@ services:
         value: 60,300,1800,7200
       - key: WEBHOOK_PROCESS_BATCH_SIZE
         value: 5
+      - key: MONERIUM_ALLOW_LATEST_CONNECTION_FALLBACK
+        value: 0
